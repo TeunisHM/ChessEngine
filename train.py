@@ -4,14 +4,14 @@ import torch.optim as optim
 import chess
 import chess.pgn
 import random
+from helper import move_to_index, index_to_move
 
-# === 1. Define Policy Network ===
-
+#Define Policy Network
 class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(773, 256),  # board state input size
+            nn.Linear(769, 256),  # board state input size
             nn.ReLU(),
             nn.Linear(256, 4672)  # total legal UCI moves in chess (e.g., e2e4)
         )
@@ -19,8 +19,7 @@ class PolicyNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# === 2. Helper Functions ===
-
+# === 2. Helper Functions
 def board_to_tensor(board):
     """Encode board into a flat vector (simplified)."""
     piece_map = board.piece_map()
@@ -39,28 +38,6 @@ def legal_moves_mask(board):
         if idx is not None:
             mask[idx] = 1
     return mask
-
-# === 3. Move Encoding (UCI indexing) ===
-
-uci_to_index = {}
-index_to_uci = []
-for from_sq in chess.SQUARES:
-    for to_sq in chess.SQUARES:
-        for promo in [None, 'q', 'r', 'b', 'n']:
-            try:
-                move = chess.Move(from_sq, to_sq, promotion=chess.Piece.from_symbol(promo).piece_type if promo else None)
-                uci = move.uci()
-                if uci not in uci_to_index:
-                    uci_to_index[uci] = len(index_to_uci)
-                    index_to_uci.append(uci)
-            except:
-                continue
-
-def move_to_index(move):
-    return uci_to_index.get(move.uci(), None)
-
-def index_to_move(idx):
-    return chess.Move.from_uci(index_to_uci[idx])
 
 # === 4. Play a Self-Game and Store Trajectory ===
 
