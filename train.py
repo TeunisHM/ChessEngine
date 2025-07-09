@@ -87,7 +87,7 @@ def train(policy_net, optimizer, num_games=100):
 
 #Run Training
 policy_net = PolicyNet()
-optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
 
 train(policy_net, optimizer, num_games=1000)
 torch.save(policy_net.state_dict(), "policy.pt")
