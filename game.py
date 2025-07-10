@@ -19,9 +19,10 @@ def play_vs_random(policy_net, num_games=10):
             if board.turn == is_white:
                 # Policy plays
                 state = helper.board_to_tensor(board)
-                logits, _ = policy_net(state)
+                logits = policy_net(state)
                 mask = helper.legal_moves_mask(board)
                 if mask.sum() == 0:
+                    print(f"aborting game do to no legal moves available")
                     break
                 probs = torch.softmax(logits.masked_fill(mask == 0, -1e9), dim=0)
                 dist = torch.distributions.Categorical(probs)
@@ -42,6 +43,7 @@ def play_vs_random(policy_net, num_games=10):
         else:
             outcome = 0
         results.append(outcome)
+        print(f"game finished, result: {result}")
 
     wins = results.count(1)
     draws = results.count(0)
@@ -51,6 +53,6 @@ def play_vs_random(policy_net, num_games=10):
 
 if __name__ == '__main__':
     policy_net = PolicyNet() 
-    #policy = policy_net.load_state_dict(torch.load("policy.pt"))
-    #wins, draws, losses = play_vs_random(policy)
-    #print(f"wins: {wins}, draws: {draws}, losses: {losses}")
+    policy_net.load_state_dict(torch.load("policy.pt"))
+    wins, draws, losses = play_vs_random(policy_net)
+    print(f"wins: {wins}, draws: {draws}, losses: {losses}")
