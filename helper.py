@@ -1,4 +1,5 @@
 import chess
+import torch
 
 # Mapping directions for queen/pawn-like movement
 DIRECTIONS = [
@@ -97,3 +98,20 @@ def index_to_move(index: int) -> chess.Move:
             return None
         promo_piece = chess.Piece.from_symbol(PROMOTION_PIECES[promo_idx])
         return chess.Move(from_sq, to_sq, promotion=promo_piece.piece_type)
+    
+def board_to_tensor(board):
+    piece_map = board.piece_map()
+    board_tensor = torch.zeros(64 * 12)
+    for square, piece in piece_map.items():
+        offset = "PNBRQKpnbrqk".index(piece.symbol())
+        board_tensor[64 * offset + square] = 1
+    turn_tensor = torch.tensor([board.turn], dtype=torch.float32)
+    return torch.cat([board_tensor, turn_tensor])
+
+def legal_moves_mask(board):
+    mask = torch.zeros(4672)
+    for move in board.legal_moves:
+        idx = move_to_index(move)
+        if idx is not None:
+            mask[idx] = 1
+    return mask

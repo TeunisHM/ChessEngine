@@ -4,7 +4,7 @@ import torch.optim as optim
 import chess
 import chess.pgn
 import random
-from helper import move_to_index, index_to_move
+from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask
 
 #Define Policy Network
 class PolicyNet(nn.Module):
@@ -18,26 +18,6 @@ class PolicyNet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-#Helper Functions
-def board_to_tensor(board):
-    """Encode board into a flat vector (simplified)."""
-    piece_map = board.piece_map()
-    board_tensor = torch.zeros(64 * 12)
-    for square, piece in piece_map.items():
-        offset = "PNBRQKpnbrqk".index(piece.symbol())
-        board_tensor[64 * offset + square] = 1
-    turn_tensor = torch.tensor([board.turn], dtype=torch.float32)
-    return torch.cat([board_tensor, turn_tensor])
-
-def legal_moves_mask(board):
-    """Binary mask over all possible UCI moves."""
-    mask = torch.zeros(4672)
-    for move in board.legal_moves:
-        idx = move_to_index(move)
-        if idx is not None:
-            mask[idx] = 1
-    return mask
 
 #Play a Self-Game and Store Trajectory ===
 def self_play_game(policy_net):
@@ -88,9 +68,9 @@ def train(policy_net, optimizer, num_games=100):
         optimizer.step()
         print(f"Game {game+1}, reward: {reward}, moves: {len(trajectory)}")
 
-#Run Training
-policy_net = PolicyNet()
-optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
+if __name__ == "__main__":
+    policy_net = PolicyNet()
+    optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
 
-train(policy_net, optimizer, num_games=1000)
-torch.save(policy_net.state_dict(), "policy.pt")
+    train(policy_net, optimizer, num_games=10)
+    torch.save(policy_net.state_dict(), "policy.pt")
