@@ -51,7 +51,51 @@ def self_play_game(policy_net):
         reward = 0
     return trajectory, reward
 
-def train(policy_net, optimizer, num_games=100):
+def play_vs_random(policy_net, num_games=50):
+    policy_net.eval()
+    results = []
+
+    for i in range(num_games):
+        board = chess.Board()
+        is_white = i % 2 == 0  # alternate colors
+
+        while not board.is_game_over():
+            if board.turn == is_white:
+                # Policy plays
+                state = board_to_tensor(board)
+                logits = policy_net(state)
+                mask = legal_moves_mask(board)
+                if mask.sum() == 0:
+                    print(f"aborting game do to no legal moves available")
+                    break
+                probs = torch.softmax(logits.masked_fill(mask == 0, -1e9), dim=0)
+                dist = torch.distributions.Categorical(probs)
+                move_idx = dist.sample().item()
+                move = index_to_move(move_idx)
+                if move is None or move not in board.legal_moves:
+                    move = random.choice(list(board.legal_moves))
+            else:
+                # Random bot
+                move = random.choice(list(board.legal_moves))
+            board.push(move)
+
+        result = board.result()
+        if result == "1-0":
+            outcome = 1 if is_white else -1
+        elif result == "0-1":
+            outcome = -1 if is_white else 1
+        else:
+            outcome = 0
+        results.append(outcome)
+        print(f"game finished, result: {result}")
+
+    wins = results.count(1)
+    draws = results.count(0)
+    losses = results.count(-1)
+    print(f"Policy vs Random — {wins} Wins / {draws} Draws / {losses} Losses")
+    return wins, draws, losses
+
+def train(policy_net, optimizer, num_games=10000, eval_interval=5):
     for game in range(num_games):
         trajectory, reward = self_play_game(policy_net)
         loss = 0
@@ -61,16 +105,21 @@ def train(policy_net, optimizer, num_games=100):
 
             # Alternate reward: even = player who won, odd = opponent
             signed_reward = reward if i % 2 == 0 else -reward
-
             loss -= log_prob * signed_reward  # REINFORCE update
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        if game % eval_interval == 0:
+            wins, draws, losses = play_vs_random(policy_net)
+            print(f"[Eval at game {game}] Wins: {wins}, Draws: {draws}, Losses: {losses}")
+            torch.save(policy_net.state_dict(), f"policy_checkpoint_{game}.pt")
+
         print(f"Game {game+1}, reward: {reward}, moves: {len(trajectory)}")
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
     optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
-
-    train(policy_net, optimizer, num_games=10)
-    torch.save(policy_net.state_dict(), "policy.pt")
+    train(policy_net, optimizer, num_games=2500, eval_interval=500)
+    torch.save(policy_net.state_dict(), "policy_final.pt")
