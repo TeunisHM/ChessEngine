@@ -71,15 +71,18 @@ def self_play_game(policy_net):
         reward = 0
     return trajectory, reward
 
-#Train with REINFORCE 
 def train(policy_net, optimizer, num_games=100):
     for game in range(num_games):
         trajectory, reward = self_play_game(policy_net)
         loss = 0
-        for state, move_idx in trajectory:
+        for i, (state, move_idx) in enumerate(trajectory):
             logits = policy_net(state)
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
-            loss -= log_prob * reward  # REINFORCE update
+
+            # Alternate reward: even = player who won, odd = opponent
+            signed_reward = reward if i % 2 == 0 else -reward
+
+            loss -= log_prob * signed_reward  # REINFORCE update
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
