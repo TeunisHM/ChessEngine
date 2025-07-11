@@ -1,103 +1,116 @@
 import chess
 import torch
+import random
 
-# Mapping directions for queen/pawn-like movement
 DIRECTIONS = [
-    (1, 0),    # right
-    (-1, 0),   # left
     (0, 1),    # up
-    (0, -1),   # down
     (1, 1),    # up-right
+    (1, 0),    # right
     (1, -1),   # down-right
-    (-1, 1),   # up-left
+    (0, -1),   # down
     (-1, -1),  # down-left
+    (-1, 0),   # left
+    (-1, 1)    # up-left
 ]
 
-PROMOTION_PIECES = ['n', 'r', 'b', 'q']  # can tweak which ones you include
+KNIGHT_DIRS = [
+    (1, 2), (2, 1), (2, -1), (1, -2),
+    (-1, -2), (-2, -1), (-2, 1), (-1, 2)
+]
 
-def square_to_coords(sq):
-    return sq % 8, sq // 8
+PROMOTION_PIECES = ['n', 'b', 'r', 'q']  # Promotion piece order (standard)
 
-def coords_to_square(x, y):
-    if 0 <= x < 8 and 0 <= y < 8:
-        return y * 8 + x
-    return None
+def square_to_coords(square):
+    return chess.square_file(square), chess.square_rank(square)
 
 def move_to_index(move: chess.Move) -> int:
     from_sq = move.from_square
     to_sq = move.to_square
     fx, fy = square_to_coords(from_sq)
     tx, ty = square_to_coords(to_sq)
-
     dx = tx - fx
     dy = ty - fy
 
-    # Handle promotions first
+    # 1. Handle promotions
     if move.promotion:
-        # Map to 0–15 index space (4 directions × 4 promotion pieces)
-        if dx == 0 and dy == 1:
-            dir_idx = 0
-        elif dx == 1 and dy == 1:
-            dir_idx = 1
-        elif dx == -1 and dy == 1:
-            dir_idx = 2
-        elif dx == 0 and dy == -1:  # black promotion
-            dir_idx = 3
+        # Pawn promotions must be one rank forward
+        if dy not in [1, -1]:
+            return None
+        color = 1 if dy > 0 else -1
+        offset_x = dx
+
+        promo_piece = chess.piece_symbol(move.promotion).lower()
+        if promo_piece not in PROMOTION_PIECES:
+            return None
+        promo_idx = PROMOTION_PIECES.index(promo_piece)
+
+        if offset_x == 0:     # Forward
+            direction = 0
+        elif offset_x == -1:  # Left capture
+            direction = 1
+        elif offset_x == 1:   # Right capture
+            direction = 2
         else:
-            return None  # unsupported
-        promo_idx = PROMOTION_PIECES.index(chess.piece_symbol(move.promotion))
-        move_type = 56 + dir_idx * 4 + promo_idx
+            return None
+
+        move_type = 56 + direction * 3 + promo_idx  # 56–64
         return from_sq * 73 + move_type
 
-    # Handle standard queen-like moves
+    # 2. Handle sliding (queen-like) moves
     for dir_idx, (dx_step, dy_step) in enumerate(DIRECTIONS):
         for dist in range(1, 8):
-            nx, ny = fx + dx_step * dist, fy + dy_step * dist
-            if (nx, ny) == (tx, ty):
+            if fx + dx_step * dist == tx and fy + dy_step * dist == ty:
                 move_type = dir_idx * 7 + (dist - 1)  # 0–55
                 return from_sq * 73 + move_type
+
+    # 3. Handle knight moves
+    for i, (kx, ky) in enumerate(KNIGHT_DIRS):
+        if fx + kx == tx and fy + ky == ty:
+            move_type = 65 + i  # 65–72
+            return from_sq * 73 + move_type
     return None  # unsupported move
 
 def index_to_move(index: int) -> chess.Move:
     from_sq = index // 73
     move_type = index % 73
+    fx, fy = square_to_coords(from_sq)
 
+    # 0–55: queen-like sliding moves
     if move_type < 56:
         dir_idx = move_type // 7
         dist = (move_type % 7) + 1
-        fx, fy = square_to_coords(from_sq)
         dx, dy = DIRECTIONS[dir_idx]
         tx = fx + dx * dist
         ty = fy + dy * dist
-        to_sq = coords_to_square(tx, ty)
-        if to_sq is None:
-            return None
-        return chess.Move(from_sq, to_sq)
+        if 0 <= tx < 8 and 0 <= ty < 8:
+            to_sq = chess.square(tx, ty)
+            return chess.Move(from_sq, to_sq)
 
-    else:
-        promo_section = move_type - 56
-        dir_idx = promo_section // 4
-        promo_idx = promo_section % 4
-        fx, fy = square_to_coords(from_sq)
-
-        if dir_idx == 0:  # straight
-            dx, dy = 0, 1
-        elif dir_idx == 1:  # up-right
-            dx, dy = 1, 1
-        elif dir_idx == 2:  # up-left
-            dx, dy = -1, 1
-        elif dir_idx == 3:  # black promotion down
-            dx, dy = 0, -1
-        else:
-            return None
-
+    # 56–64: promotions (3 directions × 3 pieces)
+    elif 56 <= move_type < 65:
+        promo_offset = move_type - 56
+        direction = promo_offset // 3
+        piece_idx = promo_offset % 3
+        dx = [0, -1, 1][direction]  # forward, left, right
+        dy = 1 if fy == 6 else -1   # guess color by rank (white promotes from rank 6)
         tx = fx + dx
         ty = fy + dy
-        to_sq = coords_to_square(tx, ty)
-        if to_sq is None:
-            return None
-        promo_piece = chess.Piece.from_symbol(PROMOTION_PIECES[promo_idx])
-        return chess.Move(from_sq, to_sq, promotion=promo_piece.piece_type)
+        if 0 <= tx < 8 and 0 <= ty < 8:
+            to_sq = chess.square(tx, ty)
+            promo_piece = PROMOTION_PIECES[piece_idx]
+            return chess.Move(from_sq, to_sq, promotion=chess.PIECE_SYMBOLS.index(promo_piece))
+
+    # 65–72: knight moves
+    elif 65 <= move_type < 73:
+        knight_idx = move_type - 65
+        dx, dy = KNIGHT_DIRS[knight_idx]
+        tx = fx + dx
+        ty = fy + dy
+        if 0 <= tx < 8 and 0 <= ty < 8:
+            to_sq = chess.square(tx, ty)
+            return chess.Move(from_sq, to_sq)
+
+    return None  # unsupported or out of bounds
     
 def board_to_tensor(board):
     piece_map = board.piece_map()
@@ -115,3 +128,11 @@ def legal_moves_mask(board):
         if idx is not None:
             mask[idx] = 1
     return mask
+
+if __name__ == "__main__":
+    board = chess.Board()
+    while not board.is_game_over():
+        if None in [move_to_index(move) for move in board.legal_moves]:
+            print (board.legal_moves)
+        move = random.choice(list(board.legal_moves))
+        board.push(move)    

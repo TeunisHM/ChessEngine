@@ -59,7 +59,7 @@ def self_play_game(policy_net):
         black_reward = 0
     return white_trajectory, white_reward, black_trajectory, black_reward
 
-def play_vs_random(policy_net, num_games=50):
+def play_vs_random(policy_net, num_games=100):
     entropies = []
     policy_net.eval()
     results = []
@@ -72,6 +72,8 @@ def play_vs_random(policy_net, num_games=50):
         move_count = 0
 
         while not board.is_game_over():
+            if None in [move_to_index(move) for move in board.legal_moves]:
+                print (board.legal_moves)
             if board.turn == is_white:
                 #print(f"turn: {board.turn}, policy plays")
                 # Policy plays
@@ -87,7 +89,6 @@ def play_vs_random(policy_net, num_games=50):
                 entropies.append(entropy)
                 move_idx = dist.sample().item()
                 move = index_to_move(move_idx)
-                print(move)
                 if move is None or move not in board.legal_moves:
                     move = random.choice(list(board.legal_moves))
             else:
@@ -164,17 +165,17 @@ def train(policy_net, optimizer, num_games=10000, eval_interval=500):
         if game % eval_interval == 0:
             eval_stats = play_vs_random(policy_net)
             print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
-            torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
+            #torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
 
         print(f"Game {game+1}, white_reward: {white_reward}, moves: {len(white_traj)+len(black_traj)}")
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
     """
-    policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711.pt"))
+    policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))
     optimizer = optim.Adam(policy_net.parameters(), lr=1.2e-3)
-    train(policy_net, optimizer, num_games=1500, eval_interval=300)
-    torch.save(policy_net.state_dict(), "policy_seperate_colors_20250711.pt")
+    train(policy_net, optimizer, num_games=100, eval_interval=100)
+    torch.save(policy_net.state_dict(), "policy_seperate_colors_20250711_knights.pt")
     """
     policy_net.load_state_dict(torch.load("policy_final.pt"))
     play_vs_random(policy_net, 100)
