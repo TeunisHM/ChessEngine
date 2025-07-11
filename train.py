@@ -87,6 +87,7 @@ def play_vs_random(policy_net, num_games=50):
                 entropies.append(entropy)
                 move_idx = dist.sample().item()
                 move = index_to_move(move_idx)
+                print(move)
                 if move is None or move not in board.legal_moves:
                     move = random.choice(list(board.legal_moves))
             else:
@@ -169,9 +170,11 @@ def train(policy_net, optimizer, num_games=10000, eval_interval=500):
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
+    """
     policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711.pt"))
     optimizer = optim.Adam(policy_net.parameters(), lr=1.2e-3)
     train(policy_net, optimizer, num_games=1500, eval_interval=300)
     torch.save(policy_net.state_dict(), "policy_seperate_colors_20250711.pt")
-    #policy_net.load_state_dict(torch.load("policy_final.pt"))
-    #play_vs_random(policy_net, 100)
+    """
+    policy_net.load_state_dict(torch.load("policy_final.pt"))
+    play_vs_random(policy_net, 100)
