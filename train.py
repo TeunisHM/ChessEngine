@@ -54,13 +54,16 @@ def self_play_game(policy_net):
 def play_vs_random(policy_net, num_games=50):
     policy_net.eval()
     results = []
+    white_wins, black_wins, ties = 0,0,0
 
     for i in range(num_games):
         board = chess.Board()
         is_white = i % 2 == 0  # alternate colors
+        print(is_white)
 
         while not board.is_game_over():
             if board.turn == is_white:
+                print(f"turn: {board.turn}, policy plays")
                 # Policy plays
                 state = board_to_tensor(board)
                 logits = policy_net(state)
@@ -82,12 +85,16 @@ def play_vs_random(policy_net, num_games=50):
         result = board.result()
         if result == "1-0":
             outcome = 1 if is_white else -1
+            white_wins +=1
         elif result == "0-1":
             outcome = -1 if is_white else 1
+            black_wins += 1
         else:
             outcome = 0
+            ties += 1
         results.append(outcome)
         print(f"game finished, result: {result}")
+        print(f"white wins: {white_wins}, black wins: {black_wins}, ties: {ties}")
 
     wins = results.count(1)
     draws = results.count(0)
@@ -120,6 +127,8 @@ def train(policy_net, optimizer, num_games=10000, eval_interval=5):
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
-    optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
-    train(policy_net, optimizer, num_games=2500, eval_interval=500)
-    torch.save(policy_net.state_dict(), "policy_final.pt")
+    #optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
+    #train(policy_net, optimizer, num_games=2500, eval_interval=500)
+    #torch.save(policy_net.state_dict(), "policy_final.pt")
+    policy_net.load_state_dict(torch.load("policy_final.pt"))
+    print(play_vs_random(policy_net, 10))
