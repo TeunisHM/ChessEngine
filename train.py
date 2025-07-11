@@ -22,7 +22,8 @@ class PolicyNet(nn.Module):
 #Play a Self-Game and Store Trajectory ===
 def self_play_game(policy_net):
     board = chess.Board()
-    trajectory = []
+    white_trajectory = []
+    black_trajectory = []
 
     while not board.is_game_over():
         state = board_to_tensor(board)
@@ -37,21 +38,29 @@ def self_play_game(policy_net):
 
         move = index_to_move(move_idx)
         if move is None or move not in board.legal_moves:
-            print("Illegal move detected, skipping")
-            continue
-        trajectory.append((state, move_idx, board.turn))  # board.turn is True for white, False for black
+            move = random.choice(list(board.legal_moves))
+        
+        if board.turn == chess.WHITE:
+            white_trajectory.append((state, move_idx))
+        else:
+            black_trajectory.append((state, move_idx))
+
         board.push(move)
 
     result = board.result()
     if result == "1-0":
-        reward = 1
+        white_reward = 1
+        black_reward = -1
     elif result == "0-1":
-        reward = -1
+        white_reward = -1
+        black_reward = 1
     else:
-        reward = 0
-    return trajectory, reward
+        white_reward = 0
+        black_reward = 0
+    return white_trajectory, white_reward, black_trajectory, black_reward
 
 def play_vs_random(policy_net, num_games=50):
+    entropies = []
     policy_net.eval()
     results = []
     white_wins, black_wins, ties, policy_white_wins, policy_black_wins = 0,0,0,0,0
@@ -74,6 +83,8 @@ def play_vs_random(policy_net, num_games=50):
                     break
                 probs = torch.softmax(logits.masked_fill(mask == 0, -1e9), dim=0)
                 dist = torch.distributions.Categorical(probs)
+                entropy = dist.entropy().item()
+                entropies.append(entropy)
                 move_idx = dist.sample().item()
                 move = index_to_move(move_idx)
                 if move is None or move not in board.legal_moves:
@@ -108,7 +119,6 @@ def play_vs_random(policy_net, num_games=50):
             ties += 1
         results.append(outcome)
         print(f"game finished, result: {result}")
-        print(f"white wins: {white_wins}, black wins: {black_wins}, ties: {ties}")
 
     wins = results.count(1)
     draws = results.count(0)
@@ -122,36 +132,46 @@ def play_vs_random(policy_net, num_games=50):
         "losses": losses,
         "policy_white_wins": policy_white_wins,
         "policy_black_wins": policy_black_wins,
-        "avg_game_length": game_lengths.mean()
+        "avg_game_length": sum(game_lengths) / len(game_lengths),
+        "avg_entropy": sum(entropies) / len(entropies)
     }
 
 def train(policy_net, optimizer, num_games=10000, eval_interval=500):
     for game in range(num_games):
-        trajectory, reward = self_play_game(policy_net)
-        loss = 0
-        for (state, move_idx, white_move) in trajectory:
+        white_traj, white_reward, black_traj, black_reward = self_play_game(policy_net)
+
+        white_loss = 0
+        for (state, move_idx) in white_traj:
             logits = policy_net(state)
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
-
-            # Alternate reward: even = player who won, odd = opponent
-            signed_reward = reward if white_move else -reward
-            loss -= log_prob * signed_reward  # REINFORCE update
+            white_loss -= log_prob * white_reward
 
         optimizer.zero_grad()
-        loss.backward()
+        white_loss.backward()
+        optimizer.step()
+
+        black_loss = 0
+        for (state, move_idx) in black_traj:
+            logits = policy_net(state)
+            log_prob = torch.log_softmax(logits, dim=0)[move_idx]
+            black_loss -= log_prob * black_reward
+            
+        optimizer.zero_grad()
+        black_loss.backward()
         optimizer.step()
 
         if game % eval_interval == 0:
-            wins, draws, losses = play_vs_random(policy_net)
-            print(f"[Eval at game {game}] Wins: {wins}, Draws: {draws}, Losses: {losses}")
-            torch.save(policy_net.state_dict(), f"policy_checkpoint_{game}.pt")
+            eval_stats = play_vs_random(policy_net)
+            print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
+            torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
 
-        print(f"Game {game+1}, reward: {reward}, moves: {len(trajectory)}")
+        print(f"Game {game+1}, white_reward: {white_reward}, moves: {len(white_traj)+len(black_traj)}")
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
-    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    train(policy_net, optimizer, num_games=5000, eval_interval=500)
-    torch.save(policy_net.state_dict(), "policy_final_20250711.pt")
+    policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711.pt"))
+    optimizer = optim.Adam(policy_net.parameters(), lr=1.2e-3)
+    train(policy_net, optimizer, num_games=1500, eval_interval=300)
+    torch.save(policy_net.state_dict(), "policy_seperate_colors_20250711.pt")
     #policy_net.load_state_dict(torch.load("policy_final.pt"))
     #play_vs_random(policy_net, 100)
