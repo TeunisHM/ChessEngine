@@ -39,7 +39,7 @@ def self_play_game(policy_net):
         if move is None or move not in board.legal_moves:
             print("Illegal move detected, skipping")
             continue
-        trajectory.append((state, move_idx))
+        trajectory.append((state, move_idx, board.turn))  # board.turn is True for white, False for black
         board.push(move)
 
     result = board.result()
@@ -54,16 +54,17 @@ def self_play_game(policy_net):
 def play_vs_random(policy_net, num_games=50):
     policy_net.eval()
     results = []
-    white_wins, black_wins, ties = 0,0,0
+    white_wins, black_wins, ties, policy_white_wins, policy_black_wins = 0,0,0,0,0
+    game_lengths = []
 
     for i in range(num_games):
         board = chess.Board()
         is_white = i % 2 == 0  # alternate colors
-        print(is_white)
+        move_count = 0
 
         while not board.is_game_over():
             if board.turn == is_white:
-                print(f"turn: {board.turn}, policy plays")
+                #print(f"turn: {board.turn}, policy plays")
                 # Policy plays
                 state = board_to_tensor(board)
                 logits = policy_net(state)
@@ -81,14 +82,27 @@ def play_vs_random(policy_net, num_games=50):
                 # Random bot
                 move = random.choice(list(board.legal_moves))
             board.push(move)
+            move_count += 1
 
+        game_lengths.append(move_count)
         result = board.result()
         if result == "1-0":
-            outcome = 1 if is_white else -1
             white_wins +=1
+    
+            if is_white:
+                outcome = 1
+                policy_white_wins += 1
+            else:
+                outcome = -1
+
         elif result == "0-1":
-            outcome = -1 if is_white else 1
             black_wins += 1
+
+            if is_white:
+                outcome = -1
+                policy_black_wins += 1
+            else:
+                outcome = 1
         else:
             outcome = 0
             ties += 1
@@ -100,18 +114,27 @@ def play_vs_random(policy_net, num_games=50):
     draws = results.count(0)
     losses = results.count(-1)
     print(f"Policy vs Random — {wins} Wins / {draws} Draws / {losses} Losses")
-    return wins, draws, losses
+    return {
+        "white_wins": white_wins,
+        "black_wins": black_wins,
+        "draws": draws,
+        "wins": wins,
+        "losses": losses,
+        "policy_white_wins": policy_white_wins,
+        "policy_black_wins": policy_black_wins,
+        "avg_game_length": game_lengths.mean()
+    }
 
-def train(policy_net, optimizer, num_games=10000, eval_interval=5):
+def train(policy_net, optimizer, num_games=10000, eval_interval=500):
     for game in range(num_games):
         trajectory, reward = self_play_game(policy_net)
         loss = 0
-        for i, (state, move_idx) in enumerate(trajectory):
+        for (state, move_idx, white_move) in trajectory:
             logits = policy_net(state)
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
 
             # Alternate reward: even = player who won, odd = opponent
-            signed_reward = reward if i % 2 == 0 else -reward
+            signed_reward = reward if white_move else -reward
             loss -= log_prob * signed_reward  # REINFORCE update
 
         optimizer.zero_grad()
@@ -127,8 +150,8 @@ def train(policy_net, optimizer, num_games=10000, eval_interval=5):
 
 if __name__ == "__main__":
     policy_net = PolicyNet()
-    #optimizer = optim.Adam(policy_net.parameters(), lr=1.5e-3)
-    #train(policy_net, optimizer, num_games=2500, eval_interval=500)
-    #torch.save(policy_net.state_dict(), "policy_final.pt")
-    policy_net.load_state_dict(torch.load("policy_final.pt"))
-    print(play_vs_random(policy_net, 10))
+    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+    train(policy_net, optimizer, num_games=5000, eval_interval=500)
+    torch.save(policy_net.state_dict(), "policy_final_20250711.pt")
+    #policy_net.load_state_dict(torch.load("policy_final.pt"))
+    #play_vs_random(policy_net, 100)
