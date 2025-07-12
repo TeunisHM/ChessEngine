@@ -138,9 +138,18 @@ def play_vs_random(policy_net, num_games=100):
         "avg_entropy": sum(entropies) / len(entropies)
     }
 
-def train(policy_net, optimizer, num_games=10000, eval_interval=500):
+def train(policy_net, optimizer, num_games=1500, eval_interval=500):
     for game in range(num_games):
+
+        if game % eval_interval == 0:
+            eval_stats = play_vs_random(policy_net)
+            print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
+            #torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
+            
         white_traj, white_reward, black_traj, black_reward = self_play_game(policy_net)
+        print(f"Game {game+1}, white_reward: {white_reward}, moves: {len(white_traj)+len(black_traj)}")
+        if white_reward == 0:
+            continue
 
         white_loss = 0
         for (state, move_idx) in white_traj:
@@ -162,20 +171,13 @@ def train(policy_net, optimizer, num_games=10000, eval_interval=500):
         black_loss.backward()
         optimizer.step()
 
-        if game % eval_interval == 0:
-            eval_stats = play_vs_random(policy_net)
-            print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
-            #torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
-
-        print(f"Game {game+1}, white_reward: {white_reward}, moves: {len(white_traj)+len(black_traj)}")
-
 if __name__ == "__main__":
     policy_net = PolicyNet()
-    """
+    #"""
     policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=1.2e-3)
-    train(policy_net, optimizer, num_games=100, eval_interval=100)
+    optimizer = optim.Adam(policy_net.parameters(), lr=0.5e-2)
+    train(policy_net, optimizer, num_games=1500, eval_interval=300)
     torch.save(policy_net.state_dict(), "policy_seperate_colors_20250711_knights.pt")
-    """
-    policy_net.load_state_dict(torch.load("policy_final.pt"))
-    play_vs_random(policy_net, 100)
+    #"""
+    #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))
+    #play_vs_random(policy_net, 100)

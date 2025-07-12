@@ -130,9 +130,11 @@ def legal_moves_mask(board):
     return mask
 
 if __name__ == "__main__":
-    board = chess.Board()
-    while not board.is_game_over():
-        if None in [move_to_index(move) for move in board.legal_moves]:
-            print (board.legal_moves)
-        move = random.choice(list(board.legal_moves))
-        board.push(move)    
+    for i in range(100):
+        print(i)
+        board = chess.Board()
+        while not board.is_game_over():
+            if None in [move_to_index(move) for move in board.legal_moves]:
+                print (board.legal_moves)
+            move = random.choice(list(board.legal_moves))
+            board.push(move)    
