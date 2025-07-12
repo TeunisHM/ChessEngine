@@ -2,6 +2,15 @@ import chess
 import torch
 import random
 
+PIECE_VALUES = {
+    chess.PAWN: 1.0,
+    chess.KNIGHT: 3.0,
+    chess.BISHOP: 3.0,
+    chess.ROOK: 5.0,
+    chess.QUEEN: 9.0,
+    chess.KING: 0.0  # not used since game ends before king capture
+}
+
 DIRECTIONS = [
     (0, 1),    # up
     (1, 1),    # up-right
@@ -18,7 +27,7 @@ KNIGHT_DIRS = [
     (-1, -2), (-2, -1), (-2, 1), (-1, 2)
 ]
 
-PROMOTION_PIECES = ['n', 'b', 'r', 'q']  # Promotion piece order (standard)
+PROMOTION_PIECES = ['n', 'r', 'q']  # Promotion piece order (standard)
 
 def square_to_coords(square):
     return chess.square_file(square), chess.square_rank(square)
@@ -71,6 +80,9 @@ def move_to_index(move: chess.Move) -> int:
     return None  # unsupported move
 
 def index_to_move(index: int) -> chess.Move:
+    if index < 0 or index >= 4672:
+        return None
+    
     from_sq = index // 73
     move_type = index % 73
     fx, fy = square_to_coords(from_sq)
@@ -127,9 +139,14 @@ def legal_moves_mask(board):
         idx = move_to_index(move)
         if idx is not None:
             mask[idx] = 1
+    #assert mask.sum().item() == len(legal_moves), "Mismatch between mask and legal moves"
     return mask
 
 if __name__ == "__main__":
+    idx = move_to_index(chess.Move.from_uci("g2h4"))
+    print(idx)
+    print(index_to_move(idx))  # should give back Move(g2, h4)
+    """
     for i in range(100):
         print(i)
         board = chess.Board()
@@ -137,4 +154,5 @@ if __name__ == "__main__":
             if None in [move_to_index(move) for move in board.legal_moves]:
                 print (board.legal_moves)
             move = random.choice(list(board.legal_moves))
-            board.push(move)    
+            board.push(move)
+    """
