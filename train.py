@@ -79,7 +79,7 @@ def self_play_game(policy_net):
         black_reward = -len(black_trajectory)/1000
     return white_trajectory, white_reward, black_trajectory, black_reward
 
-def play_vs_random(policy_net, num_games=50):
+def play_vs_random(policy_net, num_games=100):
     entropies = []
     policy_net.eval()
     results = []
@@ -93,8 +93,6 @@ def play_vs_random(policy_net, num_games=50):
         move_count = 0
 
         while not board.is_game_over():
-            if None in [move_to_index(move) for move in board.legal_moves]:
-                print (board.legal_moves)
             if board.turn == is_white:
                 #print(f"turn: {board.turn}, policy plays")
                 # Policy plays
@@ -210,9 +208,9 @@ def log_evaluation(results, out_dir="eval_logs"):
 if __name__ == "__main__":
     policy_net = PolicyNet()
     #"""
-    #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250712_only_white.pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=1.25e-3)
-    train(policy_net, optimizer, num_games=101, eval_interval=50)
+    policy_net.load_state_dict(torch.load("policy_seperate_colors_20250712_only_white.pt"))
+    optimizer = optim.Adam(policy_net.parameters(), lr=0.8e-3)
+    train(policy_net, optimizer, num_games=5001, eval_interval=1000)
     torch.save(policy_net.state_dict(), "policy_seperate_colors_20250712_only_white.pt")
     #"""
     #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))

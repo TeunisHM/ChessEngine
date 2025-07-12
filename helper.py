@@ -143,10 +143,10 @@ def legal_moves_mask(board):
     return mask
 
 if __name__ == "__main__":
+    """
     idx = move_to_index(chess.Move.from_uci("g2h4"))
     print(idx)
     print(index_to_move(idx))  # should give back Move(g2, h4)
-    """
     for i in range(100):
         print(i)
         board = chess.Board()

@@ -17,6 +17,8 @@ def plot_metric(logs, key, label=None):
     plt.plot(values, label=label or key)
 
 def main():
+    import matplotlib
+    matplotlib.use("Agg")  # Use non-GUI backend (no X required)
     logs = load_logs()
     if not logs:
         print("No logs found.")
@@ -25,8 +27,7 @@ def main():
     # Plotting
     plt.figure(figsize=(10, 6))
     plot_metric(logs, "policy_white_wins", label="White Wins (Policy)")
-    plot_metric(logs, "policy_black_wins", label="Black Wins (Policy)")
-    plot_metric(logs, "avg_game_length", label="Avg Game Length")
+    #plot_metric(logs, "avg_game_length", label="Avg Game Length")
     plot_metric(logs, "avg_entropy", label="Avg Entropy")
     plt.title("Evaluation Over Time")
     plt.xlabel("Evaluation Step")
@@ -34,7 +35,7 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("eval_plot.png")
 
 if __name__ == "__main__":
     main()
