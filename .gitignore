@@ -4,3 +4,4 @@ policy.pt
 suggestions.txt
 *.json
 *.png
+eval_log*

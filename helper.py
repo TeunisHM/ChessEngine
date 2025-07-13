@@ -11,6 +11,17 @@ PIECE_VALUES = {
     chess.KING: 0.0  # not used since game ends before king capture
 }
 
+def piece_plane_index(piece):
+    offset = 0 if piece.color == chess.WHITE else 6
+    return offset + {
+        chess.PAWN: 0,
+        chess.KNIGHT: 1,
+        chess.BISHOP: 2,
+        chess.ROOK: 3,
+        chess.QUEEN: 4,
+        chess.KING: 5
+    }[piece.piece_type]
+
 DIRECTIONS = [
     (0, 1),    # up
     (1, 1),    # up-right
@@ -124,7 +135,7 @@ def index_to_move(index: int) -> chess.Move:
 
     return None  # unsupported or out of bounds
     
-def board_to_tensor(board):
+def board_to_tensor_flat(board):
     piece_map = board.piece_map()
     board_tensor = torch.zeros(64 * 12)
     for square, piece in piece_map.items():
@@ -132,6 +143,20 @@ def board_to_tensor(board):
         board_tensor[64 * offset + square] = 1
     turn_tensor = torch.tensor([board.turn], dtype=torch.float32)
     return torch.cat([board_tensor, turn_tensor])
+
+def board_to_tensor(board):
+    tensor = torch.zeros((13, 8, 8), dtype=torch.float32)
+
+    piece_map = board.piece_map()
+    for square, piece in piece_map.items():
+        row = 7 - chess.square_rank(square)
+        col = chess.square_file(square)
+        plane = piece_plane_index(piece)
+        tensor[plane, row, col] = 1.0
+
+    tensor[12, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    #print(tensor.shape)
+    return tensor
 
 def legal_moves_mask(board):
     mask = torch.zeros(4672)
