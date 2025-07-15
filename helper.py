@@ -168,16 +168,6 @@ def legal_moves_mask(board):
     return mask
 
 if __name__ == "__main__":
-    """
-    idx = move_to_index(chess.Move.from_uci("g2h4"))
+    idx = move_to_index(chess.Move.from_uci("B1a3"))
     print(idx)
     print(index_to_move(idx))  # should give back Move(g2, h4)
-    for i in range(100):
-        print(i)
-        board = chess.Board()
-        while not board.is_game_over():
-            if None in [move_to_index(move) for move in board.legal_moves]:
-                print (board.legal_moves)
-            move = random.choice(list(board.legal_moves))
-            board.push(move)
-    """

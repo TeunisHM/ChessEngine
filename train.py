@@ -92,17 +92,25 @@ def self_play_game(policy_net):
 
     result = board.result()
     if result == "1-0":
-        white_reward = 2 + white_capture_reward
-        black_reward = -1 - white_capture_reward #+ length_penalty
+        white_reward = 100/len(white_trajectory)# + white_capture_reward
+        black_reward = -100/len(black_trajectory)# - white_capture_reward #+ length_penalty
     elif result == "0-1":
-        white_reward = -1 - black_capture_reward# + length_penalty
-        black_reward = 2 + black_capture_reward
+        white_reward = -100/len(white_trajectory)# - black_capture_reward# + length_penalty
+        black_reward = 100/len(black_trajectory)# + black_capture_reward
     else:
-        white_reward = 0 + white_capture_reward - black_capture_reward #+ length_penalty 
-        black_reward = 0 - white_capture_reward + black_capture_reward #+ length_penalty
+        white_reward = 0 # + white_capture_reward - black_capture_reward #+ length_penalty 
+        black_reward = 0 #- white_capture_reward + black_capture_reward #+ length_penalty
+    
+    outcome = board.outcome()
+    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+        black_reward -= 0.1
+        white_reward -= -0.1
+    elif outcome.termination == chess.Termination.FIFTY_MOVES:
+        white_reward -= 0.2
+        black_reward -= 0.2
     return white_trajectory, white_reward, black_trajectory, black_reward
 
-def play_vs_random(policy_net, num_games=50):
+def evaluate_vs_random(policy_net, num_games=50):
     entropies = []
     policy_net.eval()
     results = []
@@ -184,39 +192,41 @@ def play_vs_random(policy_net, num_games=50):
     }
 
 def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
-    reward_history = []
+    white_reward_history = []
+    black_reward_history = []
     for game in range(num_games):
 
         if game % eval_interval == 0 and game != 0:
-            eval_stats = play_vs_random(policy_net)
+            eval_stats = evaluate_vs_random(policy_net)
             print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
             log_evaluation(eval_stats, model_name)
             #torch.save(policy_net.state_dict(), f"policy_seperate_colors_checkpoint_{game}.pt")
 
         white_traj, white_reward, black_traj, black_reward = self_play_game(policy_net)
-        move_list = []
-        for pair in zip(white_traj, black_traj):
-            for item in pair:
-                move_list.append(index_to_move(item[1]))
-                print(move_list)
-        visualize_game_ascii(move_list)
+
+        # move_list = []
+        # for pair in zip(white_traj, black_traj):
+        #     for item in pair:
+        #         move_list.append(index_to_move(item[1]))
+        #         print(move_list)
+        # visualize_game_ascii(move_list)
         
         print(f"Game {game+1}, white_reward: {white_reward}, moves: {len(white_traj)+len(black_traj)}")
 
         # Add rewards to history for baseline calculation
-        reward_history.append(white_reward)
-        reward_history.append(black_reward)
-        if len(reward_history) > 1000: # Keep the last 500 games (1000 rewards)
-            reward_history.pop(0)
+        white_reward_history.append(white_reward)
+        black_reward_history.append(black_reward)
+        if len(black_reward_history) > 500: 
+            black_reward_history.pop(0)
+        if len(white_reward_history) > 500: 
+            white_reward_history.pop(0)
 
-        baseline = sum(reward_history) / len(reward_history) if reward_history else 0
+        white_baseline = sum(white_reward_history) / len(white_reward_history) if white_reward_history else 0
+        black_baseline = sum(black_reward_history) / len(black_reward_history) if black_reward_history else 0
 
         # --- ADJUST REWARDS ---
-        adjusted_white_reward = white_reward - baseline
-        adjusted_black_reward = black_reward - baseline
-
-        if adjusted_white_reward == 0:
-            continue
+        adjusted_white_reward = white_reward - white_baseline
+        adjusted_black_reward = black_reward - black_baseline
 
         white_loss = 0
         for (state, move_idx) in white_traj:
@@ -227,17 +237,78 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
         optimizer.zero_grad()
         white_loss.backward()
         optimizer.step()
-"""
+
         black_loss = 0
         for (state, move_idx) in black_traj:
             logits = policy_net(state)
+            logits = logits.squeeze(0)
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
             black_loss -= log_prob * adjusted_black_reward
           
         optimizer.zero_grad()
         black_loss.backward()
         optimizer.step()
-"""
+
+def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=1000, eval_interval=500):
+    for game in range(num_games):
+        
+        move_list = []
+        if game % eval_interval == 0 and game != 0:
+            eval_stats = evaluate_vs_random(policy_net)
+            print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
+            log_evaluation(eval_stats, model_name)
+
+        trajectory = []
+        board = chess.Board()
+        #is_white = i % 2 == 0  # alternate colors
+        is_white = True if color == 'white' else False
+
+        while not board.is_game_over():
+            if board.turn == is_white:
+                state = board_to_tensor(board).unsqueeze(0)
+                logits = policy_net(state)[0]
+                mask = legal_moves_mask(board)
+                if mask.sum() == 0:
+                    print(f"aborting game do to no legal moves available")
+                    break
+                masked_logits = logits.masked_fill(mask == 0, -1e9)
+                probs = torch.softmax(masked_logits, dim=0)
+                #probs = torch.softmax(logits.masked_fill(mask == 0, -1e9), dim=0)
+                dist = torch.distributions.Categorical(probs)
+                move_idx = dist.sample().item()
+                move = index_to_move(move_idx)
+                trajectory.append((state, move_idx))
+                if move is None or move not in board.legal_moves:
+                    print(f"warning, illegal or none move selected by policy, move: {move}")
+                    move = random.choice(list(board.legal_moves))
+            else:
+                # Random bot
+                move = random.choice(list(board.legal_moves))
+            move_list.append(move)
+            board.push(move)
+            if len(move_list) > 50:
+                break
+
+        result = board.result()
+
+        if result == "1-0":
+            reward = 1 if is_white else -1
+            visualize_game_ascii(move_list)
+        elif result == "0-1":
+            reward = -1 if is_white else 1
+        else:
+            reward = 0
+        print(f"Game {game+1}, reward: {reward}, moves: {len(move_list)} ")
+        
+        loss = 0
+        for (state, move_idx) in trajectory:
+            logits = policy_net(state)[0]
+            log_prob = torch.log_softmax(logits, dim=0)[move_idx]
+            loss -= log_prob * reward
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -248,16 +319,14 @@ def log_evaluation(results, out_dir="evaluation_logs"):
     with open(filepath, "w") as f:
         json.dump(results, f, indent=4)
 
-    #print(f"Evaluation logged to {filepath}")
-
 if __name__ == "__main__":
     policy_net = ConvPolicyNet() #PolicyNet()
-    model_name = 'conv_white_capture2'
+    model_name = 'conv_white_vs_random'
     #"""
-    #policy_net.load_state_dict(torch.load(model_name+".pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.8e-3)
-    train(policy_net, model_name, optimizer, num_games=10, eval_interval=500)
-    #torch.save(policy_net.state_dict(), model_name+".pt")
+    policy_net.load_state_dict(torch.load(model_name+".pt"))
+    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
+    train_vs_random(policy_net, model_name, optimizer, num_games=1001, eval_interval=500)
+    torch.save(policy_net.state_dict(), model_name+".pt")
     #"""
     #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))
     #play_vs_random(policy_net, 100)
