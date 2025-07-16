@@ -4,7 +4,7 @@ import torch.optim as optim
 import chess
 import chess.pgn
 import random
-from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, PIECE_VALUES
+from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, eval_material, PIECE_VALUES
 import json
 import os
 from datetime import datetime
@@ -44,6 +44,14 @@ class PolicyNet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+    
+def compare_weights(initial, trained):
+    total_diff = 0.0
+    for name in initial:
+        diff = torch.norm(initial[name] - trained[name]).item()
+        print(f"{name}: L2 diff = {diff:.4f}")
+        total_diff += diff
+    print(f"Total L2 weight difference: {total_diff:.4f}")
 
 #Play a Self-Game and Store Trajectory ===
 def self_play_game(policy_net):
@@ -234,6 +242,7 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
             white_loss -= log_prob * adjusted_white_reward
 
+        print(f"white loss: {white_loss.item()}")
         optimizer.zero_grad()
         white_loss.backward()
         optimizer.step()
@@ -244,15 +253,20 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
             logits = logits.squeeze(0)
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
             black_loss -= log_prob * adjusted_black_reward
-          
+        
+        print(f"black loss: {black_loss.item()}")
         optimizer.zero_grad()
         black_loss.backward()
         optimizer.step()
 
 def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=1000, eval_interval=500):
+    #This function trains a policy network against an opponent that makes random moves.
+    #It uses a simple reinforcement learning algorithm called REINFORCE.
+    reward_history = []
     for game in range(num_games):
         
         move_list = []
+        # Periodically evaluate the model against a random opponent to track progress
         if game % eval_interval == 0 and game != 0:
             eval_stats = evaluate_vs_random(policy_net)
             print(f"[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}")
@@ -260,55 +274,88 @@ def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=
 
         trajectory = []
         board = chess.Board()
-        #is_white = i % 2 == 0  # alternate colors
+        # Set the color of the policy network
         is_white = True if color == 'white' else False
 
+        # --- GAME SIMULATION ---
         while not board.is_game_over():
             if board.turn == is_white:
+                # --- POLICY'S TURN ---
                 state = board_to_tensor(board).unsqueeze(0)
                 logits = policy_net(state)[0]
                 mask = legal_moves_mask(board)
                 if mask.sum() == 0:
                     print(f"aborting game do to no legal moves available")
                     break
+                # Apply a mask to the logits to only consider legal moves
                 masked_logits = logits.masked_fill(mask == 0, -1e9)
                 probs = torch.softmax(masked_logits, dim=0)
-                #probs = torch.softmax(logits.masked_fill(mask == 0, -1e9), dim=0)
                 dist = torch.distributions.Categorical(probs)
+                entropy = dist.entropy()
                 move_idx = dist.sample().item()
                 move = index_to_move(move_idx)
-                trajectory.append((state, move_idx))
+                # Store the state, move, logits, and entropy for later use in training
+                trajectory.append((state, move_idx, masked_logits, entropy))
                 if move is None or move not in board.legal_moves:
                     print(f"warning, illegal or none move selected by policy, move: {move}")
                     move = random.choice(list(board.legal_moves))
             else:
-                # Random bot
+                # --- RANDOM OPPONENT'S TURN ---
                 move = random.choice(list(board.legal_moves))
             move_list.append(move)
             board.push(move)
-            if len(move_list) > 50:
+
+            if len(move_list) > 150:
                 break
 
-        result = board.result()
+        # --- REWARD CALCULATION ---
+        result = board.result()        
 
         if result == "1-0":
             reward = 1 if is_white else -1
-            visualize_game_ascii(move_list)
         elif result == "0-1":
             reward = -1 if is_white else 1
         else:
-            reward = 0
-        print(f"Game {game+1}, reward: {reward}, moves: {len(move_list)} ")
+            reward = 0        
+            outcome = board.outcome()
+            if outcome is not None:
+                # Add small penalties for certain types of draws
+                if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+                    reward -= 0.1
+                elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
+                    reward -= 0.2
+                # In case of a stalemate, use material advantage to assign a small reward
+                elif outcome.termination == chess.Termination.STALEMATE:
+                    score = eval_material(board)
+                    reward += score/40
+                    print(f"piece reward in stalemate: {score/40}")
+
+        # --- ADVANTAGE CALCULATION (REWARD - BASELINE) ---
+        reward_history.append(reward)
+        if len(reward_history) > 500: 
+            reward_history.pop(0)
+        # Calculate a baseline reward to reduce variance in the training signal
+        baseline = sum(reward_history) / len(reward_history) if reward_history else 0
+        adjusted_reward = reward - baseline
+
+        # --- LOSS CALCULATION ---
+        avg_entropy = sum(e.item() for _, _,_, e in trajectory) / len(trajectory) if trajectory else 0
+        policy_loss = 0
+        entropy_loss = 0.1 * avg_entropy
         
-        loss = 0
-        for (state, move_idx) in trajectory:
-            logits = policy_net(state)[0]
-            log_prob = torch.log_softmax(logits, dim=0)[move_idx]
-            loss -= log_prob * reward
+        for (state, move_idx, masked_logits, entropy) in trajectory:
+            log_prob = torch.log_softmax(masked_logits, dim=0)[move_idx]
+            # The policy loss is the log probability of the chosen move multiplied by the adjusted reward
+            policy_loss -= log_prob * adjusted_reward 
         
+        loss = policy_loss - entropy_loss
+        #print(f"policy loss: {policy_loss}, entropy loss: {entropy_loss}, loss: {loss}")        
+        # --- OPTIMIZATION ---
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
+        print(f"Game {game+1}, reward (adjusted): {reward} ({adjusted_reward}), moves: {len(move_list)}, average entropy: {avg_entropy}, loss: {loss.item()}")
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -321,11 +368,12 @@ def log_evaluation(results, out_dir="evaluation_logs"):
 
 if __name__ == "__main__":
     policy_net = ConvPolicyNet() #PolicyNet()
-    model_name = 'conv_white_vs_random'
+    model_name = 'conv_white_vs_random_entropy_short'
     #"""
-    policy_net.load_state_dict(torch.load(model_name+".pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=1e-3)
-    train_vs_random(policy_net, model_name, optimizer, num_games=1001, eval_interval=500)
+    if os.path.exists(model_name + ".pt"):
+        policy_net.load_state_dict(torch.load(model_name+".pt"))
+    optimizer = optim.Adam(policy_net.parameters(), lr=0.5e-3)
+    train_vs_random(policy_net, model_name, optimizer, num_games=2501, eval_interval=500)
     torch.save(policy_net.state_dict(), model_name+".pt")
     #"""
     #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))

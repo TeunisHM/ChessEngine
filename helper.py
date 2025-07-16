@@ -167,6 +167,15 @@ def legal_moves_mask(board):
     #assert mask.sum().item() == len(legal_moves), "Mismatch between mask and legal moves"
     return mask
 
+def eval_material(board):
+    score = 0
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            value = PIECE_VALUES[piece.piece_type]
+            score += value if piece.color == chess.WHITE else -value
+    return score
+
 if __name__ == "__main__":
     idx = move_to_index(chess.Move.from_uci("B1a3"))
     print(idx)
