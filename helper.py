@@ -53,6 +53,10 @@ def move_to_index(move: chess.Move) -> int:
 
     # 1. Handle promotions
     if move.promotion:
+        # piece = board.piece_at(from_sq)
+        # if piece is None or piece.piece_type != chess.PAWN:
+        #     return None
+
         # Pawn promotions must be one rank forward
         if dy not in [1, -1]:
             return None
@@ -177,6 +181,6 @@ def eval_material(board):
     return score
 
 if __name__ == "__main__":
-    idx = move_to_index(chess.Move.from_uci("B1a3"))
+    idx = move_to_index(chess.Move.from_uci("d8c7"))
     print(idx)
-    print(index_to_move(idx))  # should give back Move(g2, h4)
+    print(index_to_move(idx))  

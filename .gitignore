@@ -5,3 +5,4 @@ suggestions.txt
 *.json
 *.png
 eval_log*
+decent_models/

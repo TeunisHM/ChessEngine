@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import chess
 import chess.pgn
@@ -9,8 +10,48 @@ import json
 import os
 from datetime import datetime
 from Visualize import visualize_game_ascii
+import time
 
 #Define Policy Networks
+import torch.nn as nn
+
+class ActorCriticConvNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Shared convolutional layers
+        self.conv = nn.Sequential(
+            nn.Conv2d(13, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        
+        # Actor head
+        self.policy_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 512),
+            nn.ReLU(),
+            nn.Linear(512, 4672)  # Output logits for all possible moves
+        )
+        
+        # Critic head
+        self.value_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 8 * 8, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)  # Output a single value for the state
+        )
+
+    def forward(self, x):
+        # Pass input through the shared convolutional layers
+        features = self.conv(x)
+        
+        # Get policy and value outputs from their respective heads
+        policy_logits = self.policy_head(features)
+        state_value = self.value_head(features.detach()) # Detach features for the value head to prevent gradients from flowing into the shared layers from the value loss
+        
+        return policy_logits, state_value
+
 class ConvPolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -37,7 +78,7 @@ class PolicyNet(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(769, 512),  # board state input size
             nn.ReLU(),
-            nn.Linear(512, 256),  # --- ADDED HIDDEN LAYER ---
+            nn.Linear(512, 256),  
             nn.ReLU(),
             nn.Linear(256, 4672)  # total legal UCI moves in chess (e.g., e2e4)
         )
@@ -53,6 +94,102 @@ def compare_weights(initial, trained):
         total_diff += diff
     print(f"Total L2 weight difference: {total_diff:.4f}")
 
+def train_actor_critic_game(actor_critic_net):
+    """
+    Plays a single game of self-play using the actor-critic network,
+    collecting data for training.
+
+    Args:
+        actor_critic_net: The ActorCriticConvNet model.
+
+    Returns:
+        A tuple containing:
+        - white_trajectory (list): A list of (state, log_prob, value) for white.
+        - white_rewards (list): A list of rewards per move for white.
+        - black_trajectory (list): A list of (state, log_prob, value) for black.
+        - black_rewards (list): A list of rewards per move for black.
+    """
+    board = chess.Board()
+    
+    # Trajectories store data needed for loss calculation
+    white_trajectory = []  # Stores (state, log_prob, state_value)
+    black_trajectory = []
+    
+    # Rewards are stored separately
+    white_rewards = []
+    black_rewards = []
+
+    while not board.is_game_over():
+        # 1. Get state, and pass it through the network
+        state = board_to_tensor(board).unsqueeze(0)
+        policy_logits, state_value = actor_critic_net(state)
+
+        # 2. Select an action (move) based on policy
+        mask = legal_moves_mask(board)
+        if mask.sum() == 0:
+            print("No legal moves detected, aborting game.")
+            break
+            
+        # Apply mask to logits to only consider legal moves
+        probs = torch.softmax(policy_logits[0].masked_fill(mask == 0, -1e9), dim=0)
+        dist = torch.distributions.Categorical(probs)
+        move_idx = dist.sample() # Sample an action
+        log_prob = dist.log_prob(move_idx) # Get the log probability of the action
+
+        move = index_to_move(move_idx.item())
+
+        # Fallback for rare cases of invalid moves from the model
+        if move is None or move not in board.legal_moves:
+            print(f"Invalid move {move} proposed! Picking a random legal move.")
+            move = random.choice(list(board.legal_moves))
+
+        # 3. Calculate immediate reward for the move
+        immediate_reward = 0.0
+        if board.is_capture(move):
+            # Determine the type of the captured piece
+            captured_piece_type = None
+            if board.is_en_passant(move):
+                captured_piece_type = chess.PAWN
+            else:
+                captured_piece = board.piece_at(move.to_square)
+                if captured_piece:
+                    captured_piece_type = captured_piece.piece_type
+            
+            # Calculate reward based on material value
+            if captured_piece_type:
+                immediate_reward = PIECE_VALUES.get(captured_piece_type, 0.0) / 40.0
+        
+        # 4. Store the trajectory data for the current player
+        if board.turn == chess.WHITE:
+            white_trajectory.append((state, log_prob, state_value))
+            white_rewards.append(immediate_reward)
+        else:
+            black_trajectory.append((state, log_prob, state_value))
+            black_rewards.append(immediate_reward)
+
+        # 5. Make the move on the board
+        board.push(move)
+
+    # 6. Determine final game outcome and assign terminal rewards
+    result = board.result()
+    if result == "1-0":
+        final_white_reward = 1.0
+        final_black_reward = -1.0
+    elif result == "0-1":
+        final_white_reward = -1.0
+        final_black_reward = 1.0
+    else:  # Draw
+        final_white_reward = 0.0
+        final_black_reward = 0.0
+
+    # Add the final game outcome reward to the last move's reward
+    if white_rewards:
+        white_rewards[-1] += final_white_reward
+    if black_rewards:
+        black_rewards[-1] += final_black_reward
+    
+    return white_trajectory, white_rewards, black_trajectory, black_rewards
+
 #Play a Self-Game and Store Trajectory ===
 def self_play_game(policy_net):
     board = chess.Board()
@@ -64,6 +201,9 @@ def self_play_game(policy_net):
     while not board.is_game_over():
         state = board_to_tensor(board).unsqueeze(0)
         logits = policy_net(state)[0]
+        print("Current board:")
+        print(board)
+        print("Legal moves:", [m.uci() for m in board.legal_moves])
         mask = legal_moves_mask(board)
         if mask.sum() == 0:
             print("no legal moves detected, aborting")
@@ -79,6 +219,16 @@ def self_play_game(policy_net):
             print("Decoded move:", move)
             print("Legal moves:", [m.uci() for m in board.legal_moves])
             print("Softmax top move UCI:", index_to_move(torch.argmax(probs).item()))
+            print(board)
+            print(board.turn)
+            logits = policy_net(state)  # shape: [1, 4672]
+            probs = torch.softmax(logits, dim=-1).squeeze()
+
+            topk = torch.topk(probs, 10)
+            for idx, prob in zip(topk.indices.tolist(), topk.values.tolist()):
+                move = index_to_move(idx)
+                print(f"{move} — index {idx}, prob {prob:.4f}, legal: {move in board.legal_moves}")
+            time.sleep(90)
             move = random.choice(list(board.legal_moves))
 
         captured_piece = board.piece_at(move.to_square)
@@ -100,22 +250,22 @@ def self_play_game(policy_net):
 
     result = board.result()
     if result == "1-0":
-        white_reward = 100/len(white_trajectory)# + white_capture_reward
-        black_reward = -100/len(black_trajectory)# - white_capture_reward #+ length_penalty
+        white_reward = 1#100/len(white_trajectory)# + white_capture_reward
+        black_reward = -1 #00/len(black_trajectory)# - white_capture_reward #+ length_penalty
     elif result == "0-1":
-        white_reward = -100/len(white_trajectory)# - black_capture_reward# + length_penalty
-        black_reward = 100/len(black_trajectory)# + black_capture_reward
+        white_reward = -1#00/len(white_trajectory)# - black_capture_reward# + length_penalty
+        black_reward = 1 #00/len(black_trajectory)# + black_capture_reward
     else:
         white_reward = 0 # + white_capture_reward - black_capture_reward #+ length_penalty 
         black_reward = 0 #- white_capture_reward + black_capture_reward #+ length_penalty
     
-    outcome = board.outcome()
-    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
-        black_reward -= 0.1
-        white_reward -= -0.1
-    elif outcome.termination == chess.Termination.FIFTY_MOVES:
-        white_reward -= 0.2
-        black_reward -= 0.2
+        outcome = board.outcome()
+        if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+            black_reward -= 0.1
+            white_reward -= 0.1
+        elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
+            white_reward -= 0.2
+            black_reward -= 0.2
     return white_trajectory, white_reward, black_trajectory, black_reward
 
 def evaluate_vs_random(policy_net, num_games=50):
@@ -127,8 +277,8 @@ def evaluate_vs_random(policy_net, num_games=50):
 
     for i in range(num_games):
         board = chess.Board()
-        #is_white = i % 2 == 0  # alternate colors
-        is_white = True
+        is_white = i % 2 == 0  # alternate colors
+        #is_white = True
         move_count = 0
 
         while not board.is_game_over():
@@ -229,12 +379,13 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
         if len(white_reward_history) > 500: 
             white_reward_history.pop(0)
 
-        white_baseline = sum(white_reward_history) / len(white_reward_history) if white_reward_history else 0
-        black_baseline = sum(black_reward_history) / len(black_reward_history) if black_reward_history else 0
+        white_baseline = 0# sum(white_reward_history) / len(white_reward_history) if white_reward_history else 0
+        black_baseline = 0# sum(black_reward_history) / len(black_reward_history) if black_reward_history else 0
 
         # --- ADJUST REWARDS ---
         adjusted_white_reward = white_reward - white_baseline
         adjusted_black_reward = black_reward - black_baseline
+        print(f"adjusted rewards (white/black): ({adjusted_white_reward:.2f} {adjusted_black_reward:.2f})")
 
         white_loss = 0
         for (state, move_idx) in white_traj:
@@ -242,7 +393,6 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
             white_loss -= log_prob * adjusted_white_reward
 
-        print(f"white loss: {white_loss.item()}")
         optimizer.zero_grad()
         white_loss.backward()
         optimizer.step()
@@ -254,12 +404,11 @@ def train(policy_net, model_name, optimizer, num_games=1500, eval_interval=500):
             log_prob = torch.log_softmax(logits, dim=0)[move_idx]
             black_loss -= log_prob * adjusted_black_reward
         
-        print(f"black loss: {black_loss.item()}")
         optimizer.zero_grad()
         black_loss.backward()
         optimizer.step()
 
-def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=1000, eval_interval=500):
+def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=1000, eval_interval=1000):
     #This function trains a policy network against an opponent that makes random moves.
     #It uses a simple reinforcement learning algorithm called REINFORCE.
     reward_history = []
@@ -330,7 +479,6 @@ def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=
                     reward += score/40
                     print(f"piece reward in stalemate: {score/40}")
 
-        # --- ADVANTAGE CALCULATION (REWARD - BASELINE) ---
         reward_history.append(reward)
         if len(reward_history) > 500: 
             reward_history.pop(0)
@@ -345,7 +493,6 @@ def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=
         
         for (state, move_idx, masked_logits, entropy) in trajectory:
             log_prob = torch.log_softmax(masked_logits, dim=0)[move_idx]
-            # The policy loss is the log probability of the chosen move multiplied by the adjusted reward
             policy_loss -= log_prob * adjusted_reward 
         
         loss = policy_loss - entropy_loss
@@ -355,7 +502,111 @@ def train_vs_random(policy_net, model_name, optimizer, color='white', num_games=
         loss.backward()
         optimizer.step()
         
-        print(f"Game {game+1}, reward (adjusted): {reward} ({adjusted_reward}), moves: {len(move_list)}, average entropy: {avg_entropy}, loss: {loss.item()}")
+        print(f"Game {game+1}, reward (adjusted): {reward} ({adjusted_reward:.2f}), moves: {len(move_list)}, average entropy: {avg_entropy:.2f}, loss: {loss.item():.2f}")
+
+def calculate_discounted_returns(rewards, gamma=0.99):
+    """
+    Calculates the discounted returns for each step in a list of rewards.
+    The return for a step is the sum of all future rewards, discounted by gamma.
+
+    Args:
+        rewards (list): A list of rewards for an episode.
+        gamma (float): The discount factor.
+
+    Returns:
+        A tensor of discounted returns.
+    """
+    returns = []
+    discounted_return = 0.0
+    # Iterate backwards through the rewards
+    for r in reversed(rewards):
+        discounted_return = r + gamma * discounted_return
+        returns.insert(0, discounted_return)
+    
+    return torch.tensor(returns, dtype=torch.float32)
+
+### Main Actor-Critic Training Function
+def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, eval_interval=500, gamma=0.99, critic_loss_weight=0.5):
+    """
+    Main training loop for the Actor-Critic model.
+
+    Args:
+        actor_critic_net: The ActorCriticConvNet model.
+        model_name (str): The name for saving logs and checkpoints.
+        optimizer: The PyTorch optimizer.
+        num_games (int): The total number of self-play games to train on.
+        eval_interval (int): The interval at which to evaluate the model.
+        gamma (float): The discount factor for future rewards.
+        critic_loss_weight (float): The weight to apply to the critic's loss.
+    """
+    for game in range(num_games):
+        # Evaluate every X games
+        if game % eval_interval == 0 and game != 0:
+            eval_stats = evaluate_vs_random(actor_critic_net)
+            print(f"\n[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
+            log_evaluation(eval_stats, model_name)
+            # torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{game}.pt")
+
+        # 1. Generate game data using the new actor-critic game function
+        white_traj, white_rewards, black_traj, black_rewards = train_actor_critic_game(actor_critic_net)
+
+        # Skip update if a game ends prematurely with no moves
+        if not white_traj or not black_traj:
+            print(f"Game {game+1}: Skipped due to empty trajectory.")
+            continue
+
+        print(f"Game {game+1}, Total Moves: {len(white_traj) + len(black_traj)}, Final White Reward: {sum(white_rewards):.2f}, Final Black Reward: {sum(black_rewards):.2f}")
+
+        # 2. Prepare data for loss calculation
+        all_log_probs = []
+        all_state_values = []
+        all_returns = []
+
+        # Process White's trajectory
+        if white_traj:
+            white_returns = calculate_discounted_returns(white_rewards, gamma)
+            all_returns.extend(white_returns)
+            for (_, log_prob, state_value), R in zip(white_traj, white_returns):
+                all_log_probs.append(log_prob)
+                all_state_values.append(state_value)
+
+        # Process Black's trajectory
+        if black_traj:
+            black_returns = calculate_discounted_returns(black_rewards, gamma)
+            all_returns.extend(black_returns)
+            for (_, log_prob, state_value), R in zip(black_traj, black_returns):
+                all_log_probs.append(log_prob)
+                all_state_values.append(state_value)
+
+        # Convert lists to tensors for batch processing
+        log_probs_tensor = torch.stack(all_log_probs)
+        state_values_tensor = torch.cat(all_state_values).squeeze()
+        returns_tensor = torch.stack(all_returns)
+        
+        # 3. Calculate Advantage (A = R - V(s))
+        # Advantage is how much better the returns (R) were than the critic's prediction (V(s)).
+        # .detach() is used so that we don't propagate gradients through the value function here.
+        advantages = returns_tensor - state_values_tensor.detach()
+
+        # 4. Calculate Actor Loss (Policy Loss)
+        # We want to increase the log probability of actions that led to a positive advantage.
+        actor_loss = -(log_probs_tensor * advantages).mean()
+
+        # 5. Calculate Critic Loss (Value Loss)
+        # This is the mean squared error between the predicted state values and the actual discounted returns.
+        critic_loss = F.mse_loss(state_values_tensor, returns_tensor)
+
+        # 6. Calculate Total Loss and perform backpropagation
+        total_loss = actor_loss + critic_loss_weight * critic_loss
+        
+        optimizer.zero_grad()
+        total_loss.backward()
+        # Optional: Clip gradients to prevent them from exploding
+        torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
+        optimizer.step()
+
+        if (game + 1) % 10 == 0:
+            print(f"Game {game+1}: Total Loss: {total_loss.item():.4f}, Actor Loss: {actor_loss.item():.4f}, Critic Loss: {critic_loss.item():.4f}")
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -367,14 +618,36 @@ def log_evaluation(results, out_dir="evaluation_logs"):
         json.dump(results, f, indent=4)
 
 if __name__ == "__main__":
+    """
     policy_net = ConvPolicyNet() #PolicyNet()
     model_name = 'conv_white_vs_random_entropy_short'
-    #"""
     if os.path.exists(model_name + ".pt"):
         policy_net.load_state_dict(torch.load(model_name+".pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.5e-3)
-    train_vs_random(policy_net, model_name, optimizer, num_games=2501, eval_interval=500)
+    optimizer = optim.Adam(policy_net.parameters(), lr=0.75e-3)
+    train(policy_net, model_name, optimizer, num_games=1001, eval_interval=1000)
     torch.save(policy_net.state_dict(), model_name+".pt")
     #"""
-    #policy_net.load_state_dict(torch.load("policy_seperate_colors_20250711_knights.pt"))
-    #play_vs_random(policy_net, 100)
+    if __name__ == "__main__":
+        actor_critic_net = ActorCriticConvNet()    
+        model_name = 'actor_critic_chess_v1'
+        model_filename = model_name + ".pt"
+
+        # Load pre-trained weights if they exist
+        if os.path.exists(model_filename):
+            print(f"Loading pre-trained model from: {model_filename}")
+            actor_critic_net.load_state_dict(torch.load(model_filename))
+        else:
+            print("Initializing a new model.")
+            
+        optimizer = optim.Adam(actor_critic_net.parameters(), lr=5e-4)
+        train_actor_critic(
+            actor_critic_net=actor_critic_net,
+            model_name=model_name,
+            optimizer=optimizer,
+            num_games=1001,
+            eval_interval=1000
+        )
+
+        # 6. Save the final trained model
+        print(f"Training finished. Saving final model to: {model_filename}")
+        torch.save(actor_critic_net.state_dict(), model_filename)
