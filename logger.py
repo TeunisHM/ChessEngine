@@ -47,5 +47,5 @@ def main(model_name):
     plt.savefig(f"eval_plot_{model_name}.png")
 
 if __name__ == "__main__":
-    model_name = "conv_white_vs_random_entropy_short"
+    model_name = "actor_critic_chess_v1"
     main(model_name)
