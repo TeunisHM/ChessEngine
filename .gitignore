@@ -1,4 +1,5 @@
 .venv/
+venv/
 policy.pt
 *.pt
 suggestions.txt
