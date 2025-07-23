@@ -11,6 +11,7 @@ import os
 from datetime import datetime
 from Visualize import visualize_game_ascii
 import time
+from torch.utils.tensorboard import SummaryWriter
 
 #Define Policy Networks
 class ActorCriticConvNet(nn.Module):
@@ -535,7 +536,7 @@ def calculate_discounted_returns(rewards, gamma=0.99):
     return torch.tensor(returns, dtype=torch.float32)
 
 ### Main Actor-Critic Training Function
-def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, eval_interval=500, gamma=0.99, critic_loss_weight=0.5, entropy_weight=0.01):
+def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, eval_interval=500, gamma=0.99, critic_loss_weight=0.5, entropy_weight=0.01, writer=None):
     """
     Main training loop for the Actor-Critic model.
 
@@ -547,11 +548,11 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
         eval_interval (int): The interval at which to evaluate the model.
         gamma (float): The discount factor for future rewards.
         critic_loss_weight (float): The weight to apply to the critic's loss.
-    """
+    """    
     for game in range(num_games):
         # Evaluate every X games
         if game % eval_interval == 0 and game != 0:
-            eval_stats = evaluate_vs_random_a2c(actor_critic_net)
+            eval_stats = evaluate_vs_random_a2c(actor_critic_net, game, num_games=100, writer=writer)
             print(f"\n[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             log_evaluation(eval_stats, model_name)
             # torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{game}.pt")
@@ -612,6 +613,14 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
 
         #Calculate Total Loss and perform backpropagation
         total_loss = actor_loss + critic_loss_weight * critic_loss + entropy_weight * entropy_loss
+
+        writer.add_scalar("Loss/Total", total_loss.item(), game)
+        writer.add_scalar("Loss/Actor", actor_loss.item(), game)
+        writer.add_scalar("Loss/Critic", critic_loss.item(), game)
+        writer.add_scalar("Loss/Entropy", entropy_loss, game)
+        writer.add_scalar("Training/FinalReward_White", sum(white_rewards), game)
+        writer.add_scalar("Training/FinalReward_Black", sum(black_rewards), game)
+        writer.add_scalar("Training/GameLength", len(white_traj) + len(black_traj), game)
         
         optimizer.zero_grad()
         total_loss.backward()
@@ -621,6 +630,9 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
 
         if (game + 1) % 10 == 0:
             print(f"Game {game+1}: Total Loss: {total_loss.item():.4f}, Actor: {actor_loss.item():.4f}, Critic: {critic_loss.item():.4f}, Entropy: {entropy_loss.item():.4f}")
+            writer.add_histogram("critic/state_values", state_values_tensor, game)
+            writer.add_histogram("critic/returns", returns_tensor, game)
+            writer.add_histogram("critic/advantages", advantages, game)
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -631,7 +643,7 @@ def log_evaluation(results, out_dir="evaluation_logs"):
     with open(filepath, "w") as f:
         json.dump(results, f, indent=4)
 
-def evaluate_vs_random_a2c(actor_critic_net, num_games=50):
+def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None):
     """
     Evaluates the actor-critic model's policy against a random opponent.
 
@@ -727,6 +739,14 @@ def evaluate_vs_random_a2c(actor_critic_net, num_games=50):
     print(f"Policy as White Wins: {policy_white_wins}, Policy as Black Wins: {policy_black_wins}")
     print(f"--------------------------\n")
 
+    writer.add_scalar("Eval/Wins", wins, game_num)
+    writer.add_scalar("Eval/Losses", losses, game_num)
+    writer.add_scalar("Eval/Draws", ties, game_num)
+    writer.add_scalar("Eval/PolicyWhiteWins", policy_white_wins, game_num)
+    writer.add_scalar("Eval/PolicyBlackWins", policy_black_wins, game_num)
+    writer.add_scalar("Eval/AvgGameLength", sum(game_lengths) / len(game_lengths), game_num)
+    writer.add_scalar("Eval/AvgEntropy", sum(entropies) / len(entropies), game_num)
+
     return {
         "white_wins": white_wins,
         "black_wins": black_wins,
@@ -761,13 +781,16 @@ if __name__ == "__main__":
         print("Initializing a new model.")
         
     optimizer = optim.Adam(actor_critic_net.parameters(), lr=5e-4)
+    writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.98,
+        gamma=0.95,
         num_games=5001,
-        eval_interval=1000
+        eval_interval=1000,
+        entropy_weight=0.025,
+        writer=writer
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")
