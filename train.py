@@ -157,6 +157,8 @@ def train_actor_critic_game(actor_critic_net):
             # Calculate reward based on material value
             if captured_piece_type:
                 immediate_reward = PIECE_VALUES.get(captured_piece_type, 0.0) / 20.0
+            
+        immediate_reward -= 0.0025 # small per move penalty
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
@@ -175,22 +177,22 @@ def train_actor_critic_game(actor_critic_net):
     #Determine final game outcome and assign terminal rewards
     result = board.result()
     if result == "1-0":
-        final_white_reward = 1.0
-        final_black_reward = -1.0
+        final_white_reward = 3.0
+        final_black_reward = -2.0
     elif result == "0-1":
-        final_white_reward = -1.0
-        final_black_reward = 1.0
+        final_white_reward = -2.0
+        final_black_reward = 3.0
     else:  # Draw
-        final_white_reward = 0.0
-        final_black_reward = 0.0
+        final_white_reward = -1
+        final_black_reward = -1
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= 0.2
-                final_white_reward -= 0.2
+                final_black_reward -= 0.4
+                final_white_reward -= 0.4
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= 0.33
-                final_black_reward -= 0.33
+                final_white_reward -= 0.66
+                final_black_reward -= 0.66
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -550,13 +552,6 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
         critic_loss_weight (float): The weight to apply to the critic's loss.
     """    
     for game in range(num_games):
-        # Evaluate every X games
-        if game % eval_interval == 0 and game != 0:
-            eval_stats = evaluate_vs_random_a2c(actor_critic_net, game, num_games=100, writer=writer)
-            print(f"\n[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
-            log_evaluation(eval_stats, model_name)
-            # torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{game}.pt")
-
         # Generate game data using the new actor-critic game function
         white_traj, white_rewards, black_traj, black_rewards = train_actor_critic_game(actor_critic_net)
 
@@ -633,6 +628,13 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
             writer.add_histogram("critic/state_values", state_values_tensor, game)
             writer.add_histogram("critic/returns", returns_tensor, game)
             writer.add_histogram("critic/advantages", advantages, game)
+        
+        # Evaluate every X games
+        if (game + 1) % eval_interval == 0:
+            eval_stats = evaluate_vs_random_a2c(actor_critic_net, game, num_games=100, writer=writer)
+            print(f"\n[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
+            log_evaluation(eval_stats, model_name)
+            torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{game}.pt")
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -760,17 +762,8 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
     }
 
 if __name__ == "__main__":
-    """
-    policy_net = ConvPolicyNet() #PolicyNet()
-    model_name = 'conv_white_vs_random_entropy_short'
-    if os.path.exists(model_name + ".pt"):
-        policy_net.load_state_dict(torch.load(model_name+".pt"))
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.75e-3)
-    train(policy_net, model_name, optimizer, num_games=1001, eval_interval=1000)
-    torch.save(policy_net.state_dict(), model_name+".pt")
-    #"""
     actor_critic_net = ActorCriticConvNet()    
-    model_name = 'actor_critic_chess_v1'
+    model_name = 'actor_critic_chess_v3'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -786,10 +779,10 @@ if __name__ == "__main__":
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.95,
-        num_games=5001,
+        gamma=0.97,
+        num_games=5000,
         eval_interval=1000,
-        entropy_weight=0.025,
+        entropy_weight=0.033,
         writer=writer
     )
 
