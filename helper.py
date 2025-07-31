@@ -108,7 +108,6 @@ def move_to_index(move: chess.Move) -> int:
 def index_to_move(index: int, board: chess.Board) -> chess.Move:
     """
     Converts an index to a chess.Move object.
-    CRITICAL: This function now requires the board state to handle promotions correctly.
     """
     from_square = index // 73
     plane = index % 73
@@ -157,8 +156,7 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
         
         # Check for queen promotion
         is_pawn = board.piece_type_at(from_square) == chess.PAWN
-        is_promo_rank = (from_rank == 6 and board.turn == chess.WHITE) or \
-                        (from_rank == 1 and board.turn == chess.BLACK)
+        is_promo_rank = (from_rank == 6)
                         
         if is_pawn and is_promo_rank:
             return chess.Move(from_square, chess.square(to_file, to_rank), promotion=chess.QUEEN)

@@ -101,7 +101,7 @@ def train_actor_critic_game(actor_critic_net):
 
         entropy = dist.entropy()
 
-        move = index_to_move(move_idx.item())
+        move = index_to_move(move_idx.item(), board)
 
         # Fallback for rare cases of invalid moves from the model
         if move is None or move not in board.legal_moves:
@@ -347,7 +347,7 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
                     entropies.append(entropy)
                     
                     move_idx = torch.argmax(probs).item()
-                    move = index_to_move(move_idx)
+                    move = index_to_move(move_idx, board)
                     
                     if move is None or move not in board.legal_moves:
                         # Needs more loggins, this should not really happen
