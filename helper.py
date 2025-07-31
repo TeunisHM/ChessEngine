@@ -44,110 +44,126 @@ PROMOTION_PIECES = ['n', 'r', 'q']  # Promotion piece order (standard)
 def square_to_coords(square):
     return chess.square_file(square), chess.square_rank(square)
 
-def move_to_index(move: chess.Move) -> int:
-    from_sq = move.from_square
-    to_sq = move.to_square
-    fx, fy = square_to_coords(from_sq)
-    tx, ty = square_to_coords(to_sq)
-    dx = tx - fx
-    dy = ty - fy
-
-    # 1. Handle promotions
-    if move.promotion:
-        # piece = board.piece_at(from_sq)
-        # if piece is None or piece.piece_type != chess.PAWN:
-        #     return None
-
-        # Pawn promotions must be one rank forward
-        if dy not in [1, -1]:
-            return None
-        color = 1 if dy > 0 else -1
-        offset_x = dx
-
-        promo_piece = chess.piece_symbol(move.promotion).lower()
-        if promo_piece not in PROMOTION_PIECES:
-            return None
-        promo_idx = PROMOTION_PIECES.index(promo_piece)
-
-        if offset_x == 0:     # Forward
-            direction = 0
-        elif offset_x == -1:  # Left capture
-            direction = 1
-        elif offset_x == 1:   # Right capture
-            direction = 2
+def get_move_plane(move: chess.Move):
+    """
+    Calculates the action plane for a given move in the AlphaZero-style representation.
+    """
+    # Underpromotions (to Rook, Bishop, or Knight)
+    if move.promotion and move.promotion in [chess.KNIGHT, chess.BISHOP, chess.ROOK]:
+        promo_piece = move.promotion
+        from_file = chess.square_file(move.from_square)
+        to_file = chess.square_file(move.to_square)
+        
+        direction = to_file - from_file  # -1 for left, 0 for fwd, 1 for right
+        
+        if direction == -1: # Capture left
+            plane_base = 64
+        elif direction == 0: # Push forward
+            plane_base = 67
+        elif direction == 1: # Capture right
+            plane_base = 70
         else:
-            return None
+            raise ValueError("Invalid promotion direction")
+            
+        # N, B, R
+        promo_offset = [chess.KNIGHT, chess.BISHOP, chess.ROOK].index(promo_piece)
+        return plane_base + promo_offset
 
-        move_type = 56 + direction * 3 + promo_idx  # 56–64
-        return from_sq * 73 + move_type
-
-    # 2. Handle sliding (queen-like) moves
-    for dir_idx, (dx_step, dy_step) in enumerate(DIRECTIONS):
-        for dist in range(1, 8):
-            if fx + dx_step * dist == tx and fy + dy_step * dist == ty:
-                move_type = dir_idx * 7 + (dist - 1)  # 0–55
-                return from_sq * 73 + move_type
-
-    # 3. Handle knight moves
-    for i, (kx, ky) in enumerate(KNIGHT_DIRS):
-        if fx + kx == tx and fy + ky == ty:
-            move_type = 65 + i  # 65–72
-            return from_sq * 73 + move_type
-    return None  # unsupported move
-
-def index_to_move(index: int) -> chess.Move:
-    if index < 0 or index >= 4672:
-        return None
+    # Knight moves
+    from_rank, from_file = chess.square_rank(move.from_square), chess.square_file(move.from_square)
+    to_rank, to_file = chess.square_rank(move.to_square), chess.square_file(move.to_square)
     
-    from_sq = index // 73
-    move_type = index % 73
-    fx, fy = square_to_coords(from_sq)
+    d_rank, d_file = abs(to_rank - from_rank), abs(to_file - from_file)
+    if (d_rank == 2 and d_file == 1) or (d_rank == 1 and d_file == 2):
+        # It's a knight move
+        # We can define a fixed mapping for the 8 knight moves
+        delta = (to_rank - from_rank, to_file - from_file)
+        knight_moves_map = {
+            (2, 1): 0, (1, 2): 1, (-1, 2): 2, (-2, 1): 3,
+            (-2, -1): 4, (-1, -2): 5, (1, -2): 6, (2, -1): 7
+        }
+        return 56 + knight_moves_map[delta]
 
-    # 0–55: queen-like sliding moves
-    if move_type < 56:
-        dir_idx = move_type // 7
-        dist = (move_type % 7) + 1
-        dx, dy = DIRECTIONS[dir_idx]
-        tx = fx + dx * dist
-        ty = fy + dy * dist
-        if 0 <= tx < 8 and 0 <= ty < 8:
-            to_sq = chess.square(tx, ty)
-            return chess.Move(from_sq, to_sq)
-
-    # 56–64: promotions (3 directions × 3 pieces)
-    elif 56 <= move_type < 65:
-        promo_offset = move_type - 56
-        direction = promo_offset // 3
-        piece_idx = promo_offset % 3
-        dx = [0, -1, 1][direction]  # forward, left, right
-        dy = 1 if fy == 6 else -1   # guess color by rank (white promotes from rank 6)
-        tx = fx + dx
-        ty = fy + dy
-        if 0 <= tx < 8 and 0 <= ty < 8:
-            to_sq = chess.square(tx, ty)
-            promo_piece = PROMOTION_PIECES[piece_idx]
-            return chess.Move(from_sq, to_sq, promotion=chess.PIECE_SYMBOLS.index(promo_piece))
-
-    # 65–72: knight moves
-    elif 65 <= move_type < 73:
-        knight_idx = move_type - 65
-        dx, dy = KNIGHT_DIRS[knight_idx]
-        tx = fx + dx
-        ty = fy + dy
-        if 0 <= tx < 8 and 0 <= ty < 8:
-            to_sq = chess.square(tx, ty)
-            return chess.Move(from_sq, to_sq)
-
-    return None  # unsupported or out of bounds
+    # Sliding moves (including queen promotions)
+    # This covers Rooks, Bishops, and Queens
+    dr, df = to_rank - from_rank, to_file - from_file
+    dist = max(abs(dr), abs(df))
     
-def board_to_tensor_flat(board):
-    piece_map = board.piece_map()
-    board_tensor = torch.zeros(64 * 12)
-    for square, piece in piece_map.items():
-        offset = "PNBRQKpnbrqk".index(piece.symbol())
-        board_tensor[64 * offset + square] = 1
-    turn_tensor = torch.tensor([board.turn], dtype=torch.float32)
-    return torch.cat([board_tensor, turn_tensor])
+    # Normalize direction to a single step
+    step_dr, step_df = dr // dist, df // dist
+    
+    direction_map = {
+        (1, 0): 0, (1, 1): 1, (0, 1): 2, (-1, 1): 3,
+        (-1, 0): 4, (-1, -1): 5, (0, -1): 6, (1, -1): 7
+    }
+    direction_idx = direction_map[(step_dr, step_df)]
+    
+    return (direction_idx * 7) + (dist - 1)
+
+def move_to_index(move: chess.Move) -> int:
+    """Converts a move to its index in the 4672-action space."""
+    plane = get_move_plane(move)
+    return move.from_square * 73 + plane
+
+def index_to_move(index: int, board: chess.Board) -> chess.Move:
+    """
+    Converts an index to a chess.Move object.
+    CRITICAL: This function now requires the board state to handle promotions correctly.
+    """
+    from_square = index // 73
+    plane = index % 73
+    
+    from_rank = chess.square_rank(from_square)
+
+    # Underpromotions
+    if plane >= 64:
+        promo_map = {0: chess.KNIGHT, 1: chess.BISHOP, 2: chess.ROOK}
+        if 64 <= plane < 67: # Capture left
+            promo_piece = promo_map[plane - 64]
+            to_file = chess.square_file(from_square) - 1
+        elif 67 <= plane < 70: # Push forward
+            promo_piece = promo_map[plane - 67]
+            to_file = chess.square_file(from_square)
+        else: # Capture right
+            promo_piece = promo_map[plane - 70]
+            to_file = chess.square_file(from_square) + 1
+        
+        to_rank = 7 if board.turn == chess.WHITE else 0
+        return chess.Move(from_square, chess.square(to_file, to_rank), promotion=promo_piece)
+
+    # Knight moves
+    elif 56 <= plane < 64:
+        knight_map = {
+            0: (2, 1), 1: (1, 2), 2: (-1, 2), 3: (-2, 1),
+            4: (-2, -1), 5: (-1, -2), 6: (1, -2), 7: (2, -1)
+        }
+        dr, df = knight_map[plane - 56]
+        to_rank = from_rank + dr
+        to_file = chess.square_file(from_square) + df
+        return chess.Move(from_square, chess.square(to_file, to_rank))
+
+    # Sliding moves (and Queen promotions)
+    else:
+        direction_map = {
+            0: (1, 0), 1: (1, 1), 2: (0, 1), 3: (-1, 1),
+            4: (-1, 0), 5: (-1, -1), 6: (0, -1), 7: (1, -1)
+        }
+        direction_idx = plane // 7
+        distance = (plane % 7) + 1
+        dr, df = direction_map[direction_idx]
+        
+        to_rank = from_rank + dr * distance
+        to_file = chess.square_file(from_square) + df * distance
+        
+        # Check for queen promotion
+        is_pawn = board.piece_type_at(from_square) == chess.PAWN
+        is_promo_rank = (from_rank == 6 and board.turn == chess.WHITE) or \
+                        (from_rank == 1 and board.turn == chess.BLACK)
+                        
+        if is_pawn and is_promo_rank:
+            return chess.Move(from_square, chess.square(to_file, to_rank), promotion=chess.QUEEN)
+        else:
+            return chess.Move(from_square, chess.square(to_file, to_rank)) 
 
 def board_to_tensor(board):
     """
