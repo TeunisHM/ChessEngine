@@ -19,7 +19,7 @@ class ActorCriticConvNet(nn.Module):
         super().__init__()
         # Shared convolutional layers
         self.conv = nn.Sequential(
-            nn.Conv2d(13, 64, kernel_size=3, padding=1),
+            nn.Conv2d(18, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -188,11 +188,11 @@ def train_actor_critic_game(actor_critic_net):
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= 0.4
-                final_white_reward -= 0.4
+                final_black_reward -= 0.5
+                final_white_reward -= 0.5
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= 0.66
-                final_black_reward -= 0.66
+                final_white_reward -= 0.75
+                final_black_reward -= 0.75
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -763,7 +763,7 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticConvNet()    
-    model_name = 'actor_critic_chess_v3'
+    model_name = 'actor_critic_chess_symmetry'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -780,9 +780,9 @@ if __name__ == "__main__":
         model_name=model_name,
         optimizer=optimizer,
         gamma=0.97,
-        num_games=5000,
+        num_games=10000,
         eval_interval=1000,
-        entropy_weight=0.033,
+        entropy_weight=0.025,
         writer=writer
     )
 

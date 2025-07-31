@@ -11,16 +11,17 @@ PIECE_VALUES = {
     chess.KING: 0.0  # not used since game ends before king capture
 }
 
-def piece_plane_index(piece):
-    offset = 0 if piece.color == chess.WHITE else 6
-    return offset + {
-        chess.PAWN: 0,
-        chess.KNIGHT: 1,
-        chess.BISHOP: 2,
-        chess.ROOK: 3,
-        chess.QUEEN: 4,
-        chess.KING: 5
-    }[piece.piece_type]
+def piece_plane_index(piece, perspective):
+    """
+    Calculates the plane index for a piece from a specific perspective.
+    Perspective should be the color of the player whose turn it is.
+    """
+    # Planes 0-5 are for the current player's pieces
+    if piece.color == perspective:
+        return piece.piece_type - 1  # PAWN=1 -> 0, KNIGHT=2 -> 1, etc.
+    # Planes 6-11 are for the opponent's pieces
+    else:
+        return piece.piece_type - 1 + 6
 
 DIRECTIONS = [
     (0, 1),    # up
@@ -149,17 +150,52 @@ def board_to_tensor_flat(board):
     return torch.cat([board_tensor, turn_tensor])
 
 def board_to_tensor(board):
-    tensor = torch.zeros((13, 8, 8), dtype=torch.float32)
+    """
+    Converts the board state to a canonical tensor representation (18, 8, 8).
+    The board is always viewed from the perspective of the current player.
+    """
+    # 18 planes: 6 for player pieces, 6 for opponent, 4 for castling, 1 for turn, 1 for move count
+    tensor = torch.zeros((18, 8, 8), dtype=torch.float32)
+    
+    current_player = board.turn
+    
+    # --- Planes 0-11: Piece Positions (from current player's perspective) ---
+    for square, piece in board.piece_map().items():
+        rank, file = chess.square_rank(square), chess.square_file(square)
+        
+        # Flip the board if the current player is Black
+        if current_player == chess.BLACK:
+            rank = 7 - rank
+        
+        plane = piece_plane_index(piece, current_player)
+        tensor[plane, rank, file] = 1.0
 
-    piece_map = board.piece_map()
-    for square, piece in piece_map.items():
-        row = 7 - chess.square_rank(square)
-        col = chess.square_file(square)
-        plane = piece_plane_index(piece)
-        tensor[plane, row, col] = 1.0
+    # --- Planes 12-15: Castling Rights ---
+    # These are also from the perspective of the current player
+    if board.has_castling_rights(current_player):
+        if board.has_kingside_castling_rights(current_player):
+            tensor[12, :, :] = 1.0 # Player can castle kingside
+        if board.has_queenside_castling_rights(current_player):
+            tensor[13, :, :] = 1.0 # Player can castle queenside
+            
+    opponent = not current_player
+    if board.has_castling_rights(opponent):
+        if board.has_kingside_castling_rights(opponent):
+            tensor[14, :, :] = 1.0 # Opponent can castle kingside
+        if board.has_queenside_castling_rights(opponent):
+            tensor[15, :, :] = 1.0 # Opponent can castle queenside
 
-    tensor[12, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
-    #print(tensor.shape)
+    # --- Plane 16: Turn Indicator ---
+    # This is now less critical since the board is canonical, but can still be useful.
+    # It's always 1.0 to indicate "it is my turn to move".
+    tensor[16, :, :] = 1.0
+
+    # --- Plane 17: Total Move Count ---
+    # Helps the network learn about game progression. Can be normalized.
+    # A simple way is to scale it to be between 0 and 1.
+    move_count_scaled = min(board.fullmove_number / 100.0, 1.0)
+    tensor[17, :, :] = move_count_scaled
+    
     return tensor
 
 def legal_moves_mask(board):
