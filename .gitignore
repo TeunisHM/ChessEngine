@@ -9,3 +9,4 @@ eval_log*
 decent_models/
 __pycache__/
 /runs
+models/

@@ -11,18 +11,6 @@ PIECE_VALUES = {
     chess.KING: 0.0  # not used since game ends before king capture
 }
 
-def piece_plane_index(piece, perspective):
-    """
-    Calculates the plane index for a piece from a specific perspective.
-    Perspective should be the color of the player whose turn it is.
-    """
-    # Planes 0-5 are for the current player's pieces
-    if piece.color == perspective:
-        return piece.piece_type - 1  # PAWN=1 -> 0, KNIGHT=2 -> 1, etc.
-    # Planes 6-11 are for the opponent's pieces
-    else:
-        return piece.piece_type - 1 + 6
-
 DIRECTIONS = [
     (0, 1),    # up
     (1, 1),    # up-right
@@ -100,35 +88,79 @@ def get_move_plane(move: chess.Move):
     
     return (direction_idx * 7) + (dist - 1)
 
-def move_to_index(move: chess.Move) -> int:
-    """Converts a move to its index in the 4672-action space."""
-    plane = get_move_plane(move)
-    return move.from_square * 73 + plane
+def move_to_index(move: chess.Move, board: chess.Board) -> int:
+    """
+    Converts an absolute move from the board into its canonical index.
+    This function now REQUIRES the board to know the perspective.
+    """
+    player = board.turn
+    
+    # --- Canonicalize the move ---
+    # If the player is Black, we "flip" the move to see it from White's perspective.
+    from_square = move.from_square
+    to_square = move.to_square
+    
+    if player == chess.BLACK:
+        from_square = chess.square_mirror(from_square)
+        to_square = chess.square_mirror(to_square)
+        
+    # Now, from_square and to_square are the move's squares as if White were making an analogous move.
+    
+    # Create a temporary move object for this canonical move
+    canonical_move = chess.Move(from_square, to_square, promotion=move.promotion)
+    
+    # Use the same plane logic as before, which works on this canonical move
+    plane = get_move_plane(canonical_move)
+    
+    # The final index is based on the canonical from_square and the plane
+    return from_square * 73 + plane
 
 def index_to_move(index: int, board: chess.Board) -> chess.Move:
     """
-    Converts an index to a chess.Move object.
+    Converts a canonical index back into an absolute, legal move for the board.
     """
-    from_square = index // 73
+    player = board.turn
+    
+    # --- Deconstruct the canonical action ---
+    canonical_from_square = index // 73
     plane = index % 73
     
+    # Decode the move as if White were making it
+    # (This part is complex, let's use a helper for clarity)
+    canonical_move = decode_plane_to_move(canonical_from_square, plane, board)
+    
+    if canonical_move is None:
+        return None
+
+    # --- Translate back to the absolute board ---
+    # If the player is Black, we must "un-flip" the canonical move
+    if player == chess.BLACK:
+        from_square = chess.square_mirror(canonical_move.from_square)
+        to_square = chess.square_mirror(canonical_move.to_square)
+        return chess.Move(from_square, to_square, promotion=canonical_move.promotion)
+    else:
+        # If White, the canonical move is the real move
+        return canonical_move
+
+
+def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> chess.Move:
+    """
+    Helper function to decode a canonical from_square and plane into a move.
+    This function always thinks it's creating a move for White.
+    """
     from_rank = chess.square_rank(from_square)
+    from_file = chess.square_file(from_square)
 
     # Underpromotions
     if plane >= 64:
         promo_map = {0: chess.KNIGHT, 1: chess.BISHOP, 2: chess.ROOK}
-        if 64 <= plane < 67: # Capture left
-            promo_piece = promo_map[plane - 64]
-            to_file = chess.square_file(from_square) - 1
-        elif 67 <= plane < 70: # Push forward
-            promo_piece = promo_map[plane - 67]
-            to_file = chess.square_file(from_square)
-        else: # Capture right
-            promo_piece = promo_map[plane - 70]
-            to_file = chess.square_file(from_square) + 1
+        if 64 <= plane < 67: to_file_offset, piece_idx = -1, plane - 64
+        elif 67 <= plane < 70: to_file_offset, piece_idx = 0, plane - 67
+        else: to_file_offset, piece_idx = 1, plane - 70
         
-        to_rank = 7 if board.turn == chess.WHITE else 0
-        return chess.Move(from_square, chess.square(to_file, to_rank), promotion=promo_piece)
+        to_file = from_file + to_file_offset
+        promo_piece = promo_map[piece_idx]
+        return chess.Move(from_square, chess.square(to_file, 7), promotion=promo_piece)
 
     # Knight moves
     elif 56 <= plane < 64:
@@ -137,9 +169,7 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
             4: (-2, -1), 5: (-1, -2), 6: (1, -2), 7: (2, -1)
         }
         dr, df = knight_map[plane - 56]
-        to_rank = from_rank + dr
-        to_file = chess.square_file(from_square) + df
-        return chess.Move(from_square, chess.square(to_file, to_rank))
+        return chess.Move(from_square, chess.square(from_file + df, from_rank + dr))
 
     # Sliding moves (and Queen promotions)
     else:
@@ -152,73 +182,75 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
         dr, df = direction_map[direction_idx]
         
         to_rank = from_rank + dr * distance
-        to_file = chess.square_file(from_square) + df * distance
-        
-        # Check for queen promotion
-        is_pawn = board.piece_type_at(from_square) == chess.PAWN
-        is_promo_rank = (from_rank == 6)
-                        
-        if is_pawn and is_promo_rank:
-            return chess.Move(from_square, chess.square(to_file, to_rank), promotion=chess.QUEEN)
-        else:
-            return chess.Move(from_square, chess.square(to_file, to_rank)) 
+        to_file = from_file + df * distance
+        to_square = chess.square(to_file, to_rank)
 
-def board_to_tensor(board):
+        # We need to check the original board to see if it's a pawn
+        # This requires translating the from_square back if it's black's turn
+        original_from_square = from_square if board.turn == chess.WHITE else chess.square_mirror(from_square)
+        
+        if board.piece_type_at(original_from_square) == chess.PAWN and from_rank == 6:
+            return chess.Move(from_square, to_square, promotion=chess.QUEEN)
+        else:
+            return chess.Move(from_square, to_square)
+
+# In helper.py
+
+def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """
     Converts the board state to a canonical tensor representation (18, 8, 8).
     The board is always viewed from the perspective of the current player.
+    THIS IS THE CORRECTED AND ROBUST VERSION.
     """
-    # 18 planes: 6 for player pieces, 6 for opponent, 4 for castling, 1 for turn, 1 for move count
     tensor = torch.zeros((18, 8, 8), dtype=torch.float32)
     
-    current_player = board.turn
+    player = board.turn
     
-    # --- Planes 0-11: Piece Positions (from current player's perspective) ---
+    # --- Planes 0-11: Piece Positions ---
     for square, piece in board.piece_map().items():
         rank, file = chess.square_rank(square), chess.square_file(square)
         
-        # Flip the board if the current player is Black
-        if current_player == chess.BLACK:
+        # If the current player is Black, we flip the board vertically.
+        if player == chess.BLACK:
             rank = 7 - rank
         
-        plane = piece_plane_index(piece, current_player)
+        # Determine the correct plane based on the piece type and its owner.
+        if piece.color == player:
+            # It's our piece. Place it on planes 0-5.
+            plane = piece.piece_type - 1
+        else:
+            # It's the opponent's piece. Place it on planes 6-11.
+            plane = piece.piece_type - 1 + 6
+            
         tensor[plane, rank, file] = 1.0
 
-    # --- Planes 12-15: Castling Rights ---
-    # These are also from the perspective of the current player
-    if board.has_castling_rights(current_player):
-        if board.has_kingside_castling_rights(current_player):
-            tensor[12, :, :] = 1.0 # Player can castle kingside
-        if board.has_queenside_castling_rights(current_player):
-            tensor[13, :, :] = 1.0 # Player can castle queenside
-            
-    opponent = not current_player
-    if board.has_castling_rights(opponent):
-        if board.has_kingside_castling_rights(opponent):
-            tensor[14, :, :] = 1.0 # Opponent can castle kingside
-        if board.has_queenside_castling_rights(opponent):
-            tensor[15, :, :] = 1.0 # Opponent can castle queenside
+    # --- Planes 12-15: Castling Rights (Absolute is more robust) ---
+    if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
+    if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
+    if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
+    if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
 
-    # --- Plane 16: Turn Indicator ---
-    # This is now less critical since the board is canonical, but can still be useful.
-    # It's always 1.0 to indicate "it is my turn to move".
-    tensor[16, :, :] = 1.0
+    # --- Plane 16: Turn Indicator (Binary and CRITICAL) ---
+    if player == chess.WHITE:
+        tensor[16, :, :] = 1.0
+    # else, it remains 0.0 for Black's turn.
 
     # --- Plane 17: Total Move Count ---
-    # Helps the network learn about game progression. Can be normalized.
-    # A simple way is to scale it to be between 0 and 1.
     move_count_scaled = min(board.fullmove_number / 100.0, 1.0)
     tensor[17, :, :] = move_count_scaled
     
     return tensor
 
-def legal_moves_mask(board):
-    mask = torch.zeros(4672)
+def legal_moves_mask(board: chess.Board) -> torch.Tensor:
+    mask = torch.zeros(4672, dtype=torch.bool)
     for move in board.legal_moves:
-        idx = move_to_index(move)
-        if idx is not None:
-            mask[idx] = 1
-    #assert mask.sum().item() == len(legal_moves), "Mismatch between mask and legal moves"
+        try:
+            # Pass the board to correctly canonicalize the move
+            idx = move_to_index(move, board)
+            if idx is not None:
+                mask[idx] = 1
+        except (ValueError, KeyError) as e:
+            print(f"Could not encode legal move: {move.uci()} for board {board.fen()}. Error: {e}")
     return mask
 
 def eval_material(board):

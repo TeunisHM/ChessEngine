@@ -122,9 +122,17 @@ def train_actor_critic_game(actor_critic_net):
             
             # Calculate reward based on material value
             if captured_piece_type:
-                immediate_reward = PIECE_VALUES.get(captured_piece_type, 0.0) / 20.0
+                capture_value = PIECE_VALUES.get(captured_piece_type, 0.0) / 20.0
+                immediate_reward += capture_value
+
+                if board.turn == chess.WHITE:
+                    if black_rewards: 
+                        black_rewards[-1] -= 0.5 * capture_value
+                else: 
+                    if white_rewards: 
+                        white_rewards[-1] -= 0.5 * capture_value
             
-        immediate_reward -= 0.0025 # small per move penalty
+        immediate_reward -= 0.001 # small per move penalty
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
@@ -134,7 +142,6 @@ def train_actor_critic_game(actor_critic_net):
             black_trajectory.append((state, log_prob, state_value, entropy))
             black_rewards.append(immediate_reward)
 
-        #Make the move on the board
         board.push(move)
 
         # if len(black_trajectory) > 120:
@@ -143,22 +150,24 @@ def train_actor_critic_game(actor_critic_net):
     #Determine final game outcome and assign terminal rewards
     result = board.result()
     if result == "1-0":
-        final_white_reward = 3.0
-        final_black_reward = -2.0
+        final_white_reward = 2.0
+        final_black_reward = -1.0
     elif result == "0-1":
-        final_white_reward = -2.0
-        final_black_reward = 3.0
+        final_white_reward = -1.0
+        final_black_reward = 2.0
     else:  # Draw
-        final_white_reward = -1
-        final_black_reward = -1
+        final_white_reward = -0.5
+        final_black_reward = -0.5
+        """
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= 0.5
-                final_white_reward -= 0.5
+                final_black_reward -= 0.3
+                final_white_reward -= 0.3
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= 0.75
-                final_black_reward -= 0.75
+                final_white_reward -= 0.5
+                final_black_reward -= 0.5
+        """
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -415,7 +424,7 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticConvNet()    
-    model_name = 'actor_critic_chess_symmetry'
+    model_name = 'actor_critic_chess_double_capture_v3'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -431,8 +440,8 @@ if __name__ == "__main__":
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.97,
-        num_games=10000,
+        gamma=0.99,
+        num_games=7000,
         eval_interval=1000,
         entropy_weight=0.025,
         writer=writer
