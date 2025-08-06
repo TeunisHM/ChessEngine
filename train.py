@@ -14,6 +14,85 @@ import time
 from torch.utils.tensorboard import SummaryWriter
 
 #Define Policy Networks
+class ResidualBlock(nn.Module):
+    """A standard residual block for a ResNet."""
+    def __init__(self, num_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels) # Batch Norm is crucial
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(num_channels)
+
+    def forward(self, x):
+        # Store the original input for the skip connection
+        residual = x
+        
+        # First conv layer
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+        
+        # Second conv layer
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        # Add the residual (skip connection)
+        out += residual
+        
+        # Apply final activation
+        out = F.relu(out)
+        
+        return out
+
+class ActorCriticResNet(nn.Module):
+    def __init__(self, num_input_channels=18, num_residual_blocks=8, num_filters=128):
+        super().__init__()
+        
+        # Initial Convolutional Layer (the "stem")
+        self.stem = nn.Sequential(
+            nn.Conv2d(num_input_channels, num_filters, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_filters),
+            nn.ReLU()
+        )
+        
+        # This creates a list of 'num_residual_blocks' ResidualBlock modules
+        self.residual_tower = nn.Sequential(
+            *[ResidualBlock(num_filters) for _ in range(num_residual_blocks)]
+        )
+        
+        # Actor (Policy) Head
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(num_filters, 2, kernel_size=1), # Reduce to 2 filters
+            nn.BatchNorm2d(2),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(2 * 8 * 8, 4672)
+        )
+        
+        # Critic (Value) Head
+        self.value_head = nn.Sequential(
+            nn.Conv2d(num_filters, 1, kernel_size=1), # Reduce to 1 filter
+            nn.BatchNorm2d(1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(1 * 8 * 8, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        # Pass through the initial stem
+        out = self.stem(x)
+        
+        # Pass through the residual tower
+        out = self.residual_tower(out)
+        
+        # Get policy and value outputs
+        policy_logits = self.policy_head(out)
+        state_value = self.value_head(out) # No detach here, following AlphaZero's design
+        
+        return policy_logits, state_value
+
 class ActorCriticConvNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -125,14 +204,16 @@ def train_actor_critic_game(actor_critic_net):
                 capture_value = PIECE_VALUES.get(captured_piece_type, 0.0) / 20.0
                 immediate_reward += capture_value
 
+                """
                 if board.turn == chess.WHITE:
                     if black_rewards: 
                         black_rewards[-1] -= 0.5 * capture_value
                 else: 
                     if white_rewards: 
                         white_rewards[-1] -= 0.5 * capture_value
+                """
             
-        immediate_reward -= 0.001 # small per move penalty
+        immediate_reward -= 0.002 # small per move penalty
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
@@ -158,16 +239,14 @@ def train_actor_critic_game(actor_critic_net):
     else:  # Draw
         final_white_reward = -0.5
         final_black_reward = -0.5
-        """
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= 0.3
-                final_white_reward -= 0.3
+                final_black_reward -= 0.25
+                final_white_reward -= 0.25
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
                 final_white_reward -= 0.5
                 final_black_reward -= 0.5
-        """
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -423,8 +502,8 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
     }
 
 if __name__ == "__main__":
-    actor_critic_net = ActorCriticConvNet()    
-    model_name = 'actor_critic_chess_double_capture_v3'
+    actor_critic_net = ActorCriticResNet()    
+    model_name = 'actor_critic_chess_resnet_v1'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -434,16 +513,16 @@ if __name__ == "__main__":
     else:
         print("Initializing a new model.")
         
-    optimizer = optim.Adam(actor_critic_net.parameters(), lr=5e-4)
+    optimizer = optim.Adam(actor_critic_net.parameters(), lr=6e-4)
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.99,
-        num_games=7000,
+        gamma=0.982,
+        num_games=5000,
         eval_interval=1000,
-        entropy_weight=0.025,
+        entropy_weight=0.02,
         writer=writer
     )
 
