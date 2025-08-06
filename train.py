@@ -515,6 +515,9 @@ if __name__ == "__main__":
         
     optimizer = optim.Adam(actor_critic_net.parameters(), lr=6e-4)
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    dummy_input = torch.zeros(1, 18, 8, 8)
+    # Write the model graph to the TensorBoard log
+    writer.add_graph(actor_critic_net, dummy_input)
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
