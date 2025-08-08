@@ -200,45 +200,55 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """
     Converts the board state to a canonical tensor representation (18, 8, 8).
     The board is always viewed from the perspective of the current player.
-    THIS IS THE CORRECTED AND ROBUST VERSION.
     """
     tensor = torch.zeros((18, 8, 8), dtype=torch.float32)
-    
     player = board.turn
-    
-    # --- Planes 0-11: Piece Positions ---
+
+    # --- Planes 0-11: Piece Positions (own pieces 0-5, opp pieces 6-11) ---
     for square, piece in board.piece_map().items():
-        rank, file = chess.square_rank(square), chess.square_file(square)
-        
-        # If the current player is Black, we flip the board vertically.
+        rank = chess.square_rank(square)
+        file = chess.square_file(square)
+
+        # Rotate 180 deg for Black to make the net always see "player" at bottom
+    for square, piece in board.piece_map().items():
         if player == chess.BLACK:
-            rank = 7 - rank
-        
-        # Determine the correct plane based on the piece type and its owner.
+            square = chess.square_mirror(square)
+
+        rank = chess.square_rank(square)
+        file = chess.square_file(square)
+
         if piece.color == player:
-            # It's our piece. Place it on planes 0-5.
             plane = piece.piece_type - 1
         else:
-            # It's the opponent's piece. Place it on planes 6-11.
             plane = piece.piece_type - 1 + 6
-            
+
         tensor[plane, rank, file] = 1.0
 
-    # --- Planes 12-15: Castling Rights (Absolute is more robust) ---
-    if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
-    if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
-
-    # --- Plane 16: Turn Indicator (Binary and CRITICAL) ---
+    # --- Planes 12-15: Castling Rights RELATIVE TO CURRENT PLAYER ---
+    # planes 12 = our KS, 13 = our QS, 14 = opp KS, 15 = opp QS
     if player == chess.WHITE:
-        tensor[16, :, :] = 1.0
-    # else, it remains 0.0 for Black's turn.
+        our_ks = board.has_kingside_castling_rights(chess.WHITE)
+        our_qs = board.has_queenside_castling_rights(chess.WHITE)
+        opp_ks = board.has_kingside_castling_rights(chess.BLACK)
+        opp_qs = board.has_queenside_castling_rights(chess.BLACK)
+    else:
+        our_ks = board.has_kingside_castling_rights(chess.BLACK)
+        our_qs = board.has_queenside_castling_rights(chess.BLACK)
+        opp_ks = board.has_kingside_castling_rights(chess.WHITE)
+        opp_qs = board.has_queenside_castling_rights(chess.WHITE)
 
-    # --- Plane 17: Total Move Count ---
+    if our_ks: tensor[12, :, :] = 1.0
+    if our_qs: tensor[13, :, :] = 1.0
+    if opp_ks: tensor[14, :, :] = 1.0
+    if opp_qs: tensor[15, :, :] = 1.0
+
+    # --- Plane 16: PLAYER-TO-MOVE indicator (always 1 in canonicalized view) ---
+    tensor[16, :, :] = 1.0
+
+    # --- Plane 17: Total Move Count (scaled) ---
     move_count_scaled = min(board.fullmove_number / 100.0, 1.0)
     tensor[17, :, :] = move_count_scaled
-    
+
     return tensor
 
 def legal_moves_mask(board: chess.Board) -> torch.Tensor:

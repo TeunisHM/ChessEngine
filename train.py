@@ -12,6 +12,7 @@ from datetime import datetime
 from Visualize import visualize_game_ascii
 import time
 from torch.utils.tensorboard import SummaryWriter
+from time import perf_counter
 
 #Define Policy Networks
 class ResidualBlock(nn.Module):
@@ -93,50 +94,42 @@ class ActorCriticResNet(nn.Module):
         
         return policy_logits, state_value
 
-class ActorCriticConvNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Shared convolutional layers
-        self.conv = nn.Sequential(
-            nn.Conv2d(18, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        
-        # Actor head
-        self.policy_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 512),
-            nn.ReLU(),
-            nn.Linear(512, 4672)  # Output logits for all possible moves
-        )
-        
-        # Critic head
-        self.value_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)  # Output a single value for the state
-        )
+def generate_self_play_batch(actor_critic_net, batch_size=8):
+    """
+    Runs multiple self-play games in parallel and collects trajectories.
+    Returns:
+        - log_probs: list of log probabilities
+        - state_values: list of state values
+        - returns: list of discounted returns
+        - entropies: list of entropies
+    """
+    all_log_probs = []
+    all_state_values = []
+    all_returns = []
+    all_entropies = []
 
-    def forward(self, x):
-        # Pass input through the shared convolutional layers
-        features = self.conv(x)
-        
-        # Get policy and value outputs from their respective heads
-        policy_logits = self.policy_head(features)
-        state_value = self.value_head(features.detach()) # Detach features for the value head to prevent gradients from flowing into the shared layers from the value loss
-        
-        return policy_logits, state_value
+    for _ in range(batch_size):
+        white_traj, white_rewards, black_traj, black_rewards = train_actor_critic_game(actor_critic_net)
+        if not white_traj or not black_traj:
+            continue  # skip broken games
 
-def compare_weights(initial, trained):
-    total_diff = 0.0
-    for name in initial:
-        diff = torch.norm(initial[name] - trained[name]).item()
-        print(f"{name}: L2 diff = {diff:.4f}")
-        total_diff += diff
-    print(f"Total L2 weight difference: {total_diff:.4f}")
+        # White
+        white_returns = calculate_discounted_returns(white_rewards)
+        for (_, log_prob, value, entropy), R in zip(white_traj, white_returns):
+            all_log_probs.append(log_prob)
+            all_state_values.append(value)
+            all_returns.append(R)
+            all_entropies.append(entropy)
+
+        # Black
+        black_returns = calculate_discounted_returns(black_rewards)
+        for (_, log_prob, value, entropy), R in zip(black_traj, black_returns):
+            all_log_probs.append(log_prob)
+            all_state_values.append(value)
+            all_returns.append(R)
+            all_entropies.append(entropy)
+
+    return all_log_probs, all_state_values, all_returns, all_entropies
 
 def train_actor_critic_game(actor_critic_net):
     """
@@ -278,7 +271,7 @@ def calculate_discounted_returns(rewards, gamma=0.99):
     return torch.tensor(returns, dtype=torch.float32)
 
 ### Main Actor-Critic Training Function
-def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, eval_interval=500, gamma=0.99, critic_loss_weight=0.5, entropy_weight=0.01, writer=None):
+def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000, eval_interval=500, gamma=0.99, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=4, writer=None):
     """
     Main training loop for the Actor-Critic model.
 
@@ -291,90 +284,54 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_games=1500, 
         gamma (float): The discount factor for future rewards.
         critic_loss_weight (float): The weight to apply to the critic's loss.
     """    
-    for game in range(num_games):
-        # Generate game data using the new actor-critic game function
-        white_traj, white_rewards, black_traj, black_rewards = train_actor_critic_game(actor_critic_net)
+    for batch in range(num_batches):
+        t0 = perf_counter()
+        log_probs, state_values, returns, entropies = generate_self_play_batch(actor_critic_net, batch_size=batch_size)
+        t1 = perf_counter()
 
-        # Skip update if a game ends prematurely with no moves
-        if not white_traj or not black_traj:
-            print(f"Game {game+1}: Skipped due to empty trajectory.")
+        if not log_probs:
+            print(f"Game {batch+1}: Skipped due to empty batch.")
             continue
 
-        print(f"Game {game+1}, Total Moves: {len(white_traj) + len(black_traj)}, Final White Reward: {sum(white_rewards):.2f}, Final Black Reward: {sum(black_rewards):.2f}")
+        log_probs_tensor = torch.stack(log_probs)
+        state_values_tensor = torch.cat(state_values).squeeze()
+        returns_tensor = torch.stack(returns)
+        entropies_tensor = torch.stack(entropies)
 
-        # Prepare data for loss calculation
-        all_log_probs = []
-        all_state_values = []
-        all_returns = []
-        all_entropies = []
-
-        # Process White's trajectory
-        if white_traj:
-            white_returns = calculate_discounted_returns(white_rewards, gamma)
-            all_returns.extend(white_returns)
-            for (_, log_prob, state_value, entropy), R in zip(white_traj, white_returns):
-                all_log_probs.append(log_prob)
-                all_state_values.append(state_value)
-                all_entropies.append(entropy)
-
-        # Process Black's trajectory
-        if black_traj:
-            black_returns = calculate_discounted_returns(black_rewards, gamma)
-            all_returns.extend(black_returns)
-            for (_, log_prob, state_value, entropy), R in zip(black_traj, black_returns):
-                all_log_probs.append(log_prob)
-                all_state_values.append(state_value)
-                all_entropies.append(entropy)
-
-        #Convert lists to tensors for batch processing
-        log_probs_tensor = torch.stack(all_log_probs)
-        state_values_tensor = torch.cat(all_state_values).squeeze()
-        returns_tensor = torch.stack(all_returns)
-        entropies_tensor = torch.stack(all_entropies)
-        
-        #Calculate Advantage (A = R - V(s))
-        # .detach() is used so that we don't propagate gradients through the value function here.
+        # Advantage normalization
         advantages = returns_tensor - state_values_tensor.detach()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8) #normalize
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        #Calculate Actor Loss (Policy Loss)
         actor_loss = -(log_probs_tensor * advantages).mean()
-
-        #Calculate Critic Loss (Value Loss)
         critic_loss = F.mse_loss(state_values_tensor, returns_tensor)
-
-        #Entropy loss over one game
         entropy_loss = -entropies_tensor.mean()
-
-        #Calculate Total Loss and perform backpropagation
         total_loss = actor_loss + critic_loss_weight * critic_loss + entropy_weight * entropy_loss
 
-        writer.add_scalar("Loss/Total", total_loss.item(), game)
-        writer.add_scalar("Loss/Actor", actor_loss.item(), game)
-        writer.add_scalar("Loss/Critic", critic_loss.item(), game)
-        writer.add_scalar("Loss/Entropy", entropy_loss, game)
-        writer.add_scalar("Training/FinalReward_White", sum(white_rewards), game)
-        writer.add_scalar("Training/FinalReward_Black", sum(black_rewards), game)
-        writer.add_scalar("Training/GameLength", len(white_traj) + len(black_traj), game)
-        
+        writer.add_scalar("Loss/Total", total_loss.item(), batch)
+        writer.add_scalar("Loss/Actor", actor_loss.item(), batch)
+        writer.add_scalar("Loss/Critic", critic_loss.item(), batch)
+        writer.add_scalar("Loss/Entropy", entropy_loss.item(), batch)
+
         optimizer.zero_grad()
         total_loss.backward()
-        # Optional: Clip gradients to prevent them from exploding
         torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
         optimizer.step()
+        t2 = perf_counter()
 
-        if (game + 1) % 10 == 0:
-            print(f"Game {game+1}: Total Loss: {total_loss.item():.4f}, Actor: {actor_loss.item():.4f}, Critic: {critic_loss.item():.4f}, Entropy: {entropy_loss.item():.4f}")
-            writer.add_histogram("critic/state_values", state_values_tensor, game)
-            writer.add_histogram("critic/returns", returns_tensor, game)
-            writer.add_histogram("critic/advantages", advantages, game)
+        print(f"[Batch {batch+1}] DataGen: {t1 - t0:.2f}s | TrainStep: {t2 - t1:.2f}s | Total: {t2 - t0:.2f}s")
+
+        if (batch + 1) % 10 == 0:
+            print(f"Batch {batch+1}: Total Loss: {total_loss.item():.4f}, Actor: {actor_loss.item():.4f}, Critic: {critic_loss.item():.4f}, Entropy: {entropy_loss.item():.4f}")
+            writer.add_histogram("critic/state_values", state_values_tensor, batch)
+            writer.add_histogram("critic/returns", returns_tensor, batch)
+            writer.add_histogram("critic/advantages", advantages, batch)
         
         # Evaluate every X games
-        if (game + 1) % eval_interval == 0:
-            eval_stats = evaluate_vs_random_a2c(actor_critic_net, game, num_games=100, writer=writer)
-            print(f"\n[Eval at game {game}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
+        if (batch + 1) % eval_interval == 0:
+            eval_stats = evaluate_vs_random_a2c(actor_critic_net, batch, num_games=100, writer=writer)
+            print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             log_evaluation(eval_stats, model_name)
-            torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{game}.pt")
+            torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{batch}.pt")
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -512,21 +469,23 @@ if __name__ == "__main__":
         actor_critic_net.load_state_dict(torch.load(model_filename))
     else:
         print("Initializing a new model.")
+        # Write the model graph to the TensorBoard log
+        #dummy_input = torch.zeros(1, 18, 8, 8)
+        #writer.add_graph(actor_critic_net, dummy_input)
         
-    optimizer = optim.Adam(actor_critic_net.parameters(), lr=6e-4)
+    optimizer = optim.Adam(actor_critic_net.parameters(), lr=5e-4)
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    dummy_input = torch.zeros(1, 18, 8, 8)
-    # Write the model graph to the TensorBoard log
-    writer.add_graph(actor_critic_net, dummy_input)
+
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
         gamma=0.982,
-        num_games=5000,
-        eval_interval=1000,
-        entropy_weight=0.02,
-        writer=writer
+        num_batches=1000,
+        eval_interval=100,
+        entropy_weight=0.025,
+        writer=writer,
+        batch_size=8
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")
