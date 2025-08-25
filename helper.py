@@ -11,6 +11,14 @@ PIECE_VALUES = {
     chess.KING: 0.0  # not used since game ends before king capture
 }
 
+OPENINGS = {
+    "italian": ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"],
+    "scotch": ["e4", "e5", "Nf3", "Nc6", "d4", "exd4", "Nxd4"],
+    "sicilian": ["e4", "c5", "Nf3", "d6", "d4", "cxd4", "Nxd4", "Nf6", "Nc3"],
+    "french": ["e4", "e6", "d4", "d5", "Nc3"],
+    "caro": ["e4", "c6", "d4", "d5", "Nc3", "dxe4", "Nxe4"],
+}
+
 DIRECTIONS = [
     (0, 1),    # up
     (1, 1),    # up-right

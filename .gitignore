@@ -10,3 +10,4 @@ decent_models/
 __pycache__/
 /runs
 models/
+log_cuda.py

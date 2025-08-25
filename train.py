@@ -5,7 +5,7 @@ import torch.optim as optim
 import chess
 import chess.pgn
 import random
-from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, eval_material, PIECE_VALUES
+from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, eval_material, PIECE_VALUES, OPENINGS
 import json
 import os
 from datetime import datetime
@@ -109,7 +109,7 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
     all_entropies = []
 
     for _ in range(batch_size):
-        white_traj, white_rewards, black_traj, black_rewards = train_actor_critic_game(actor_critic_net)
+        white_traj, white_rewards, black_traj, black_rewards, game_moves = train_actor_critic_game(actor_critic_net)
         if not white_traj or not black_traj:
             continue  # skip broken games
 
@@ -131,7 +131,7 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
 
     return all_log_probs, all_state_values, all_returns, all_entropies
 
-def train_actor_critic_game(actor_critic_net):
+def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
     """
     Plays a single game of self-play using the actor-critic network,
     collecting data for training.
@@ -147,12 +147,21 @@ def train_actor_critic_game(actor_critic_net):
         - black_rewards (list): A list of rewards per move for black.
     """
     board = chess.Board()
+
+    game_moves = []  
+    if  random.random() < opening_prob:
+        name, san_line = random.choice(list(OPENINGS.items()))
+        n = random.randint(2, len(san_line))  # random truncation
+        for san in san_line[:n]:
+            board.push_san(san)
+            game_moves.append(board.peek().uci())
     
     # Trajectories store data needed for loss calculation
     white_trajectory = []  # Stores (state, log_prob, state_value)
     black_trajectory = []
     white_rewards = []
     black_rewards = []
+    game_moves = []
 
     while not board.is_game_over():
         # Get state, and pass it through the network
@@ -180,33 +189,18 @@ def train_actor_critic_game(actor_critic_net):
             print(f"Invalid move {move} proposed! Picking a random legal move.")
             move = random.choice(list(board.legal_moves))
 
-        # Calculate immediate reward for the move
-        immediate_reward = 0.0
-        if board.is_capture(move):
-            # Determine the type of the captured piece
-            captured_piece_type = None
-            if board.is_en_passant(move):
-                captured_piece_type = chess.PAWN
-            else:
-                captured_piece = board.piece_at(move.to_square)
-                if captured_piece:
-                    captured_piece_type = captured_piece.piece_type
-            
-            # Calculate reward based on material value
-            if captured_piece_type:
-                capture_value = PIECE_VALUES.get(captured_piece_type, 0.0) / 20.0
-                immediate_reward += capture_value
+        # Calculate immediate reward for the move by looking ahead one step
+        board.push(move)
+        material_advantage = eval_material(board)
+        board.pop() # Revert the board to its original state before storing trajectory
 
-                """
-                if board.turn == chess.WHITE:
-                    if black_rewards: 
-                        black_rewards[-1] -= 0.5 * capture_value
-                else: 
-                    if white_rewards: 
-                        white_rewards[-1] -= 0.5 * capture_value
-                """
-            
-        immediate_reward -= 0.002 # small per move penalty
+        # The reward is from the perspective of the player who made the move
+        if board.turn == chess.WHITE:
+            immediate_reward = material_advantage * 0.1
+        else:
+            immediate_reward = -material_advantage * 0.1
+
+        immediate_reward -= 0.0025 # small per move penalty
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
@@ -217,18 +211,16 @@ def train_actor_critic_game(actor_critic_net):
             black_rewards.append(immediate_reward)
 
         board.push(move)
-
-        # if len(black_trajectory) > 120:
-        #     break
+        game_moves.append(move)
 
     #Determine final game outcome and assign terminal rewards
     result = board.result()
     if result == "1-0":
-        final_white_reward = 2.0
-        final_black_reward = -1.0
+        final_white_reward = 2.5
+        final_black_reward = -1.5
     elif result == "0-1":
-        final_white_reward = -1.0
-        final_black_reward = 2.0
+        final_white_reward = -1.5
+        final_black_reward = 2.5
     else:  # Draw
         final_white_reward = -0.5
         final_black_reward = -0.5
@@ -247,7 +239,7 @@ def train_actor_critic_game(actor_critic_net):
     if black_rewards:
         black_rewards[-1] += final_black_reward
     
-    return white_trajectory, white_rewards, black_trajectory, black_rewards
+    return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
 
 def calculate_discounted_returns(rewards, gamma=0.99):
     """
@@ -283,7 +275,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         eval_interval (int): The interval at which to evaluate the model.
         gamma (float): The discount factor for future rewards.
         critic_loss_weight (float): The weight to apply to the critic's loss.
-    """    
+    """
     for batch in range(num_batches):
         t0 = perf_counter()
         log_probs, state_values, returns, entropies = generate_self_play_batch(actor_critic_net, batch_size=batch_size)
@@ -328,10 +320,10 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         
         # Evaluate every X games
         if (batch + 1) % eval_interval == 0:
-            eval_stats = evaluate_vs_random_a2c(actor_critic_net, batch, num_games=100, writer=writer)
+            eval_stats = evaluate_vs_random(actor_critic_net, batch, num_games=100, writer=writer)
             print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             log_evaluation(eval_stats, model_name)
-            torch.save(actor_critic_net.state_dict(), f"actor_critic_{model_name}_checkpoint_{batch}.pt")
+            torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
 
 def log_evaluation(results, out_dir="evaluation_logs"):
     out_dir = 'eval_logs/' + out_dir
@@ -342,7 +334,7 @@ def log_evaluation(results, out_dir="evaluation_logs"):
     with open(filepath, "w") as f:
         json.dump(results, f, indent=4)
 
-def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None):
+def evaluate_vs_random(actor_critic_net, game_num, num_games=50, writer=None):
     """
     Evaluates the actor-critic model's policy against a random opponent.
 
@@ -355,7 +347,7 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
     """
     entropies = []
     # Set the network to evaluation mode
-    actor_critic_net.eval()
+    actor_critic_net.eval() # This is important!
     
     results = []
     white_wins, black_wins, ties, policy_white_wins, policy_black_wins = 0, 0, 0, 0, 0
@@ -396,6 +388,7 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
                     
                     if move is None or move not in board.legal_moves:
                         # Needs more loggins, this should not really happen
+                        print("wrong move found, look into this")
                         move = random.choice(list(board.legal_moves))
                 else:
                     move = random.choice(list(board.legal_moves))
@@ -458,6 +451,9 @@ def evaluate_vs_random_a2c(actor_critic_net, game_num, num_games=50, writer=None
         "avg_entropy": sum(entropies) / len(entropies) if entropies else 0
     }
 
+def evaluateVsStockfish():
+    pass
+
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet()    
     model_name = 'actor_critic_chess_resnet_v1'
@@ -480,10 +476,10 @@ if __name__ == "__main__":
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.982,
+        gamma=0.99,
         num_batches=1000,
         eval_interval=100,
-        entropy_weight=0.025,
+        entropy_weight=0.0,
         writer=writer,
         batch_size=8
     )
