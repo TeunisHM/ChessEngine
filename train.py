@@ -115,7 +115,7 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
 
         # White
         white_returns = calculate_discounted_returns(white_rewards)
-        for (_, log_prob, value, entropy), R in zip(white_traj, white_returns):
+        for (log_prob, value, entropy), R in zip(white_traj, white_returns):
             all_log_probs.append(log_prob)
             all_state_values.append(value)
             all_returns.append(R)
@@ -123,7 +123,7 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
 
         # Black
         black_returns = calculate_discounted_returns(black_rewards)
-        for (_, log_prob, value, entropy), R in zip(black_traj, black_returns):
+        for (log_prob, value, entropy), R in zip(black_traj, black_returns):
             all_log_probs.append(log_prob)
             all_state_values.append(value)
             all_returns.append(R)
@@ -196,18 +196,18 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
 
         # The reward is from the perspective of the player who made the move
         if board.turn == chess.WHITE:
-            immediate_reward = material_advantage * 0.1
+            immediate_reward = material_advantage * 0.025
         else:
-            immediate_reward = -material_advantage * 0.1
+            immediate_reward = -material_advantage * 0.025
 
         immediate_reward -= 0.0025 # small per move penalty
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
-            white_trajectory.append((state, log_prob, state_value, entropy))
+            white_trajectory.append((log_prob, state_value, entropy))
             white_rewards.append(immediate_reward)
         else:
-            black_trajectory.append((state, log_prob, state_value, entropy))
+            black_trajectory.append((log_prob, state_value, entropy))
             black_rewards.append(immediate_reward)
 
         board.push(move)
@@ -216,22 +216,22 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
     #Determine final game outcome and assign terminal rewards
     result = board.result()
     if result == "1-0":
-        final_white_reward = 2.5
-        final_black_reward = -1.5
+        final_white_reward = 33
+        final_black_reward = -25
     elif result == "0-1":
-        final_white_reward = -1.5
-        final_black_reward = 2.5
+        final_white_reward = -25
+        final_black_reward = 33
     else:  # Draw
-        final_white_reward = -0.5
-        final_black_reward = -0.5
+        final_white_reward = -10
+        final_black_reward = -10
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= 0.25
-                final_white_reward -= 0.25
+                final_black_reward -= -3
+                final_white_reward -= -3
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= 0.5
-                final_black_reward -= 0.5
+                final_white_reward -= -5
+                final_black_reward -= -5
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -288,6 +288,10 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         log_probs_tensor = torch.stack(log_probs)
         state_values_tensor = torch.cat(state_values).squeeze()
         returns_tensor = torch.stack(returns)
+
+        v_norm  = (state_values_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
+        rt_norm = (returns_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
+
         entropies_tensor = torch.stack(entropies)
 
         # Advantage normalization
@@ -295,7 +299,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         actor_loss = -(log_probs_tensor * advantages).mean()
-        critic_loss = F.mse_loss(state_values_tensor, returns_tensor)
+        critic_loss = F.mse_loss(v_norm, rt_norm)
         entropy_loss = -entropies_tensor.mean()
         total_loss = actor_loss + critic_loss_weight * critic_loss + entropy_weight * entropy_loss
 
@@ -322,17 +326,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         if (batch + 1) % eval_interval == 0:
             eval_stats = evaluate_vs_random(actor_critic_net, batch, num_games=100, writer=writer)
             print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
-            log_evaluation(eval_stats, model_name)
             torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
-
-def log_evaluation(results, out_dir="evaluation_logs"):
-    out_dir = 'eval_logs/' + out_dir
-    os.makedirs(out_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join(out_dir, f"eval_{timestamp}.json")
-
-    with open(filepath, "w") as f:
-        json.dump(results, f, indent=4)
 
 def evaluate_vs_random(actor_critic_net, game_num, num_games=50, writer=None):
     """
@@ -456,7 +450,7 @@ def evaluateVsStockfish():
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet()    
-    model_name = 'actor_critic_chess_resnet_v1'
+    model_name = 'actor_critic_chess_resnet_v2'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -469,19 +463,19 @@ if __name__ == "__main__":
         #dummy_input = torch.zeros(1, 18, 8, 8)
         #writer.add_graph(actor_critic_net, dummy_input)
         
-    optimizer = optim.Adam(actor_critic_net.parameters(), lr=5e-4)
+    optimizer = optim.Adam(actor_critic_net.parameters(), lr=8e-4)
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.99,
-        num_batches=1000,
+        gamma=0.98,
+        num_batches=300,
         eval_interval=100,
-        entropy_weight=0.0,
+        entropy_weight=0.0225,
         writer=writer,
-        batch_size=8
+        batch_size=12
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")
