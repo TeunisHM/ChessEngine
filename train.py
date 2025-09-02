@@ -3,10 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import chess
-import chess.pgn
 import random
 from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, eval_material, PIECE_VALUES, OPENINGS
-import json
 import os
 from datetime import datetime
 from Visualize import visualize_game_ascii
@@ -94,13 +92,13 @@ class ActorCriticResNet(nn.Module):
         
         return policy_logits, state_value
 
-def generate_self_play_batch(actor_critic_net, batch_size=8):
+def generate_self_play_batch(actor_critic_net, batch_size=8, gamma= 0.99, gae_lamb=0.95):
     """
     Runs multiple self-play games in parallel and collects trajectories.
     Returns:
         - log_probs: list of log probabilities
         - state_values: list of state values
-        - returns: list of discounted returns
+        - returns: list of GAE returns
         - entropies: list of entropies
     """
     all_log_probs = []
@@ -114,7 +112,8 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
             continue  # skip broken games
 
         # White
-        white_returns = calculate_discounted_returns(white_rewards)
+        white_values = [v.squeeze().item() for (_, v, _) in white_traj]
+        white_returns = calculate_gae_returns(white_rewards, white_values, gamma=gamma, lam=gae_lamb)
         for (log_prob, value, entropy), R in zip(white_traj, white_returns):
             all_log_probs.append(log_prob)
             all_state_values.append(value)
@@ -122,7 +121,8 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
             all_entropies.append(entropy)
 
         # Black
-        black_returns = calculate_discounted_returns(black_rewards)
+        black_values = [v.squeeze().item() for (_, v, _) in black_traj]
+        black_returns = calculate_gae_returns(black_rewards, black_values, gamma=gamma, lam=gae_lamb)
         for (log_prob, value, entropy), R in zip(black_traj, black_returns):
             all_log_probs.append(log_prob)
             all_state_values.append(value)
@@ -131,7 +131,7 @@ def generate_self_play_batch(actor_critic_net, batch_size=8):
 
     return all_log_probs, all_state_values, all_returns, all_entropies
 
-def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
+def train_actor_critic_game(actor_critic_net, opening_prob=0.5):
     """
     Plays a single game of self-play using the actor-critic network,
     collecting data for training.
@@ -189,6 +189,7 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
             print(f"Invalid move {move} proposed! Picking a random legal move.")
             move = random.choice(list(board.legal_moves))
 
+        """MATERIAL ADVANTAGE ADDED TO REWARD, DOESNT SEEM TO WORK VERY WELL
         # Calculate immediate reward for the move by looking ahead one step
         board.push(move)
         material_advantage = eval_material(board)
@@ -199,8 +200,25 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
             immediate_reward = material_advantage * 0.025
         else:
             immediate_reward = -material_advantage * 0.025
+        """
 
-        immediate_reward -= 0.0025 # small per move penalty
+        # Base per-move penalty
+        immediate_reward = 0
+
+        # Add piece value to reward if this move captures a piece (incl. en passant)
+        if board.is_capture(move):
+            if board.is_en_passant(move):
+                # Captured pawn sits on the from-rank and to-file
+                captured_sq = chess.square(
+                    chess.square_file(move.to_square),
+                    chess.square_rank(move.from_square)
+                )
+            else:
+                captured_sq = move.to_square
+
+            captured_piece = board.piece_at(captured_sq)
+            if captured_piece is not None:
+                immediate_reward += PIECE_VALUES.get(captured_piece.piece_type, 0.0)/20
         
         #Store the trajectory data for the current player
         if board.turn == chess.WHITE:
@@ -216,22 +234,22 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
     #Determine final game outcome and assign terminal rewards
     result = board.result()
     if result == "1-0":
-        final_white_reward = 33
-        final_black_reward = -25
+        final_white_reward = 2.5
+        final_black_reward = -1
     elif result == "0-1":
-        final_white_reward = -25
-        final_black_reward = 33
+        final_white_reward = -1
+        final_black_reward = 2.5
     else:  # Draw
-        final_white_reward = -10
-        final_black_reward = -10
+        final_white_reward = -.5
+        final_black_reward = -.5
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= -3
-                final_white_reward -= -3
+                final_black_reward -= .3
+                final_white_reward -= .3
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= -5
-                final_black_reward -= -5
+                final_white_reward -= .5
+                final_black_reward -= .5
 
     #Add the final game outcome reward to the last move's reward
     if white_rewards:
@@ -240,6 +258,56 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.33):
         black_rewards[-1] += final_black_reward
     
     return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
+
+@torch.no_grad()
+def pick_move_topk_value(board, actor_critic_net, logits, k=5):
+    # Mask illegal moves
+    mask = legal_moves_mask(board)
+    if mask.sum().item() == 0:
+        return None
+
+    masked_logits = logits.masked_fill(mask == 0, -1e9)
+    k_eff = min(k, int(mask.sum().item()))
+    topk = torch.topk(masked_logits, k=k_eff)
+
+    best_score = float("-inf")
+    best_move = None
+
+    for idx in topk.indices.tolist():
+        move = index_to_move(idx, board)
+        if move is None or move not in board.legal_moves:
+            continue
+
+        board.push(move)
+        # Terminal handling (aligns with your reward scale)
+        if board.is_game_over():
+            result = board.result()
+            mover_is_white = not board.turn  # after push, it flipped
+            if result == "1-0":
+                score = 2.5 if mover_is_white else -1.0
+            elif result == "0-1":
+                score = 2.5 if not mover_is_white else -1.0
+            else:
+                score = -0.5
+        else:
+            # Value for opponent → negate for current player
+            state_next = board_to_tensor(board).unsqueeze(0)
+            _, v_next = actor_critic_net(state_next)
+            score = -v_next.item()
+        board.pop()
+
+        if score > best_score:
+            best_score = score
+            best_move = move
+
+    # Fallback if needed
+    if best_move is None:
+        probs = torch.softmax(masked_logits, dim=0)
+        idx = torch.argmax(probs).item()
+        best_move = index_to_move(idx, board)
+        if best_move is None or best_move not in board.legal_moves:
+            best_move = next(iter(board.legal_moves))
+    return best_move
 
 def calculate_discounted_returns(rewards, gamma=0.99):
     """
@@ -262,8 +330,31 @@ def calculate_discounted_returns(rewards, gamma=0.99):
     
     return torch.tensor(returns, dtype=torch.float32)
 
+def calculate_gae_returns(rewards, values, gamma=0.99, lam=0.95):
+    """
+    Calculates GAE(lambda) returns (a.k.a. lambda-returns) for a single trajectory.
+    Args:
+        rewards (list[float]): per-step rewards for a trajectory (same player turns only).
+        values (list[float]): value estimates V(s_t) for each step in the trajectory.
+        gamma (float): discount factor.
+        lam (float): GAE lambda parameter.
+    Returns:
+        list[torch.Tensor]: lambda-returns for each step, to be used as value targets.
+    """
+    T = len(rewards)
+    assert len(values) == T #rewards and values must have same length
+    gae = 0.0
+    returns = [None] * T
+    for t in reversed(range(T)):
+        v_t = values[t]
+        next_v = values[t + 1] if t + 1 < T else 0.0  # terminal bootstrap
+        delta = rewards[t] + gamma * next_v - v_t
+        gae = delta + gamma * lam * gae
+        returns[t] = torch.tensor(v_t + gae, dtype=torch.float32)
+    return returns
+
 ### Main Actor-Critic Training Function
-def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000, eval_interval=500, gamma=0.99, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=4, writer=None):
+def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000, eval_interval=500, gamma=0.99, gae_lamb=0.95, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=4, writer=None):
     """
     Main training loop for the Actor-Critic model.
 
@@ -271,14 +362,14 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         actor_critic_net: The ActorCriticConvNet model.
         model_name (str): The name for saving logs and checkpoints.
         optimizer: The PyTorch optimizer.
-        num_games (int): The total number of self-play games to train on.
-        eval_interval (int): The interval at which to evaluate the model.
+        num_batches (int): Number of self-play batches to train on.
+        eval_interval (int): Interval (in batches) for evaluation/checkpointing.
         gamma (float): The discount factor for future rewards.
         critic_loss_weight (float): The weight to apply to the critic's loss.
     """
     for batch in range(num_batches):
         t0 = perf_counter()
-        log_probs, state_values, returns, entropies = generate_self_play_batch(actor_critic_net, batch_size=batch_size)
+        log_probs, state_values, returns, entropies = generate_self_play_batch(actor_critic_net, batch_size=batch_size, gamma=gamma, gae_lamb=gae_lamb)
         t1 = perf_counter()
 
         if not log_probs:
@@ -286,11 +377,12 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
             continue
 
         log_probs_tensor = torch.stack(log_probs)
-        state_values_tensor = torch.cat(state_values).squeeze()
+        # Ensure 1D even when there's a single sample
+        state_values_tensor = torch.cat(state_values).view(-1)
         returns_tensor = torch.stack(returns)
 
-        v_norm  = (state_values_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
-        rt_norm = (returns_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
+        # v_norm  = (state_values_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
+        # rt_norm = (returns_tensor - returns_tensor.mean()) / returns_tensor.std().clamp_min(1e-6)
 
         entropies_tensor = torch.stack(entropies)
 
@@ -299,7 +391,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         actor_loss = -(log_probs_tensor * advantages).mean()
-        critic_loss = F.mse_loss(v_norm, rt_norm)
+        critic_loss = F.mse_loss(state_values_tensor, returns_tensor)
         entropy_loss = -entropies_tensor.mean()
         total_loss = actor_loss + critic_loss_weight * critic_loss + entropy_weight * entropy_loss
 
@@ -328,7 +420,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, num_batches=1000
             print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
 
-def evaluate_vs_random(actor_critic_net, game_num, num_games=50, writer=None):
+def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None):
     """
     Evaluates the actor-critic model's policy against a random opponent.
 
@@ -377,8 +469,7 @@ def evaluate_vs_random(actor_critic_net, game_num, num_games=50, writer=None):
                     entropy = dist.entropy().item()
                     entropies.append(entropy)
                     
-                    move_idx = torch.argmax(probs).item()
-                    move = index_to_move(move_idx, board)
+                    move = pick_move_topk_value(board, actor_critic_net, logits, k=5)
                     
                     if move is None or move not in board.legal_moves:
                         # Needs more loggins, this should not really happen
@@ -450,7 +541,7 @@ def evaluateVsStockfish():
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet()    
-    model_name = 'actor_critic_chess_resnet_v2'
+    model_name = 'actor_critic_chess_resnet_v4_capture_reward+GAE'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -463,19 +554,21 @@ if __name__ == "__main__":
         #dummy_input = torch.zeros(1, 18, 8, 8)
         #writer.add_graph(actor_critic_net, dummy_input)
         
-    optimizer = optim.Adam(actor_critic_net.parameters(), lr=8e-4)
+    optimizer = optim.Adam(actor_critic_net.parameters(), lr=1e-4)
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     train_actor_critic(
         actor_critic_net=actor_critic_net,
         model_name=model_name,
         optimizer=optimizer,
-        gamma=0.98,
-        num_batches=300,
+        gamma=0.995,
+        gae_lamb=0.9,
+        num_batches=1000,
         eval_interval=100,
-        entropy_weight=0.0225,
+        entropy_weight=0.025,
+        critic_loss_weight=0.5,
         writer=writer,
-        batch_size=12
+        batch_size=6
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")

@@ -11,3 +11,5 @@ __pycache__/
 /runs
 models/
 log_cuda.py
+test_move_encoding_edge_cases.py
+
