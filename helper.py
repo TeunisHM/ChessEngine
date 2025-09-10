@@ -213,11 +213,7 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     player = board.turn
 
     # --- Planes 0-11: Piece Positions (own pieces 0-5, opp pieces 6-11) ---
-    for square, piece in board.piece_map().items():
-        rank = chess.square_rank(square)
-        file = chess.square_file(square)
-
-        # Rotate 180 deg for Black to make the net always see "player" at bottom
+    # Rotate 180 deg for Black to make the net always see "player" at bottom
     for square, piece in board.piece_map().items():
         if player == chess.BLACK:
             square = chess.square_mirror(square)
@@ -281,6 +277,8 @@ def eval_material(board):
     return score
 
 if __name__ == "__main__":
-    idx = move_to_index(chess.Move.from_uci("d8c7"))
+    board = chess.Board()
+    move = chess.Move.from_uci("d8c7")
+    idx = move_to_index(move, board)
     print(idx)
-    print(index_to_move(idx))  
+    print(index_to_move(idx, board))  
