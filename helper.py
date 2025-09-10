@@ -202,7 +202,27 @@ def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> ch
         else:
             return chess.Move(from_square, to_square)
 
-# In helper.py
+def piece_planes(board: chess.Board) -> torch.Tensor:
+    # Your existing 12x8x8 encoding here
+    tensor = torch.zeros((12, 8, 8), dtype=torch.float32)
+    player = board.turn
+
+    # Planes 0-11: Piece Positions (own pieces 0-5, opp pieces 6-11) ---
+    # Rotate 180 deg for Black to make the net always see "player" at bottom
+    for square, piece in board.piece_map().items():
+        if player == chess.BLACK:
+            square = chess.square_mirror(square)
+
+        rank = chess.square_rank(square)
+        file = chess.square_file(square)
+
+        if piece.color == player:
+            plane = piece.piece_type - 1
+        else:
+            plane = piece.piece_type - 1 + 6
+
+        tensor[plane, rank, file] = 1.0
+    return tensor  
 
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """
