@@ -52,7 +52,7 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(tensor[6, 4, 4], 1.0)
 
         # --- Metadata ---
-        self.assertTrue(torch.all(tensor[16, :, :] == 0.0)) # Turn is Black
+        self.assertTrue(torch.all(tensor[16, :, :] == 1.0)) # Canonical STM plane stays 1.0
 
     def test_move_encoding_decoding_roundtrip(self):
         """
@@ -109,6 +109,41 @@ class TestHelperFunctions(unittest.TestCase):
         illegal_move = chess.Move.from_uci("a1a2") # Blocked
         illegal_idx = move_to_index(illegal_move, board)
         self.assertFalse(mask[illegal_idx], f"Mask is True for illegal move {illegal_move.uci()}")
+
+    def test_move_indices_match_mirror(self):
+        """Canonical move indices should be identical after mirroring the board."""
+        fen_strings = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R b KQ - 1 8",
+            "8/P7/8/k7/8/8/8/K7 w - - 0 1",
+            "k7/8/8/8/8/8/p7/K7 b - - 0 1",
+            "4k3/8/8/8/8/8/4p3/4K3 b - - 0 1",
+            "r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+            "r3k2r/ppp2ppp/2n5/2b5/2B5/2P2N2/P1P2PPP/R2QK2R b KQkq - 0 12",
+        ]
+
+        for fen in fen_strings:
+            board = chess.Board(fen)
+            mirror_board = board.mirror()
+            with self.subTest(fen=fen):
+                for move in list(board.legal_moves):
+                    idx = move_to_index(move, board)
+                    mirrored_move = chess.Move(
+                        chess.square_mirror(move.from_square),
+                        chess.square_mirror(move.to_square),
+                        promotion=move.promotion,
+                    )
+                    self.assertTrue(
+                        mirror_board.is_legal(mirrored_move),
+                        f"Mirrored move {mirrored_move.uci()} not legal in mirrored board for original move {move.uci()}",
+                    )
+                    idx_mirror = move_to_index(mirrored_move, mirror_board)
+                    self.assertEqual(
+                        idx,
+                        idx_mirror,
+                        f"Canonical index mismatch for move {move.uci()} (mirror {mirrored_move.uci()}) in FEN '{fen}'",
+                    )
 
 if __name__ == '__main__':
     unittest.main()

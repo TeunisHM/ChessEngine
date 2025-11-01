@@ -11,6 +11,7 @@ from Visualize import visualize_game_ascii
 import time
 from torch.utils.tensorboard import SummaryWriter
 from time import perf_counter
+from typing import Optional
 
 # Define Policy Networks
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,6 +143,7 @@ def _load_random_opponent_model(models_dir: str = "models"):
         if not files:
             return None
         path = os.path.join(models_dir, random.choice(files))
+        print(f"Opponent selected: {path}")
         net = ActorCriticResNet()
         net.load_state_dict(torch.load(path, map_location="cpu"))
         net.eval()
@@ -154,7 +156,8 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                                   opponent_mode: str = "random",
                                   opponent_net=None,
                                   models_dir: str = "models",
-                                  device="cpu"):
+                                  device="cpu",
+                                  opponent_temperature: Optional[float] = None):
     """
     Play one game where the given policy plays against an opponent.
     Collect only the policy's (log_prob, value, entropy) trajectory and rewards.
@@ -198,7 +201,7 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                 move = random.choice(list(board.legal_moves))
 
             # Immediate reward shaping (same as self-play)
-            immediate_reward = -0.025
+            immediate_reward = -0.01
             if board.is_capture(move):
                 if board.is_en_passant(move):
                     captured_sq = chess.square(
@@ -225,7 +228,14 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                     with torch.no_grad():
                         state = board_to_tensor(board).unsqueeze(0).to(device)
                         logits, _ = opp(state)
-                        move = pick_move_topk_value(board, opp, logits[0], k=5, device=device)
+                        move = pick_move_topk_value(
+                            board,
+                            opp,
+                            logits[0],
+                            k=20,
+                            device=device,
+                            temperature=opponent_temperature,
+                        )
 
             # Fallback to random-move bot
             if move is None or move not in board.legal_moves:
@@ -259,12 +269,15 @@ def generate_opponent_play_batch(actor_critic_net,
                                  gamma: float = 0.99,
                                  gae_lamb: float = 0.95,
                                  opponent: str = "random",
-                                 models_dir: str = "models"):
+                                 models_dir: str = "models",
+                                 opponent_temperature: Optional[float] = 1.0):
     """
     Run multiple games where the policy plays an external opponent and collect trajectories
     for the POLICY ONLY. Output matches generate_self_play_batch: lists of log_probs, values,
     returns (GAE), entropies — but only for policy turns.
     If opponent == 'model', one random model from models_dir is loaded and reused for the batch.
+    opponent_temperature controls stochasticity of the model opponent's move selection.
+    Pass None or a non-positive value to keep the previous deterministic top-k choice.
     """
     all_log_probs = []
     all_state_values = []
@@ -282,6 +295,7 @@ def generate_opponent_play_batch(actor_critic_net,
             opponent_net=opponent_net,
             models_dir=models_dir,
             device=device,
+            opponent_temperature=opponent_temperature,
         )
 
         if not policy_traj:
@@ -298,7 +312,7 @@ def generate_opponent_play_batch(actor_critic_net,
 
     return all_log_probs, all_state_values, all_returns, all_entropies
 
-def train_actor_critic_game(actor_critic_net, opening_prob=0.5, device="cpu"):
+def train_actor_critic_game(actor_critic_net, opening_prob=0.66, device="cpu"):
     """
     Plays a single game of self-play using the actor-critic network,
     collecting data for training.
@@ -427,7 +441,7 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.5, device="cpu"):
     return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
 
 @torch.no_grad()
-def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu"):
+def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu", temperature: Optional[float] = None):
     # Mask illegal moves
     mask = legal_moves_mask(board)
     if mask.sum().item() == 0:
@@ -437,8 +451,8 @@ def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu"):
     k_eff = min(k, int(mask.sum().item()))
     topk = torch.topk(masked_logits, k=k_eff)
 
-    best_score = float("-inf")
-    best_move = None
+    candidate_scores = []
+    candidate_moves = []
 
     for idx in topk.indices.tolist():
         move = index_to_move(idx, board)
@@ -463,9 +477,20 @@ def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu"):
             score = -v_next.item()
         board.pop()
 
-        if score > best_score:
-            best_score = score
-            best_move = move
+        candidate_moves.append(move)
+        candidate_scores.append(score)
+
+    if candidate_moves:
+        if temperature is not None and temperature > 1e-6 and len(candidate_moves) > 1:
+            scores_tensor = torch.tensor(candidate_scores, dtype=torch.float32)
+            probs = torch.softmax(scores_tensor / float(temperature), dim=0)
+            choice = torch.distributions.Categorical(probs=probs).sample().item()
+            best_move = candidate_moves[choice]
+        else:
+            best_idx = max(range(len(candidate_scores)), key=candidate_scores.__getitem__)
+            best_move = candidate_moves[best_idx]
+    else:
+        best_move = None
 
     # Fallback if needed
     if best_move is None:
@@ -521,7 +546,7 @@ def calculate_gae_returns(rewards, values, gamma=0.99, lam=0.95):
     return returns
 
 ### Main Actor-Critic Training Function
-def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", num_batches=1000, eval_interval=500, gamma=0.99, gae_lamb=0.95, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=8, writer=None, opponent_ratio=0.0):
+def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", num_batches=1000, eval_interval=500, gamma=0.99, gae_lamb=0.95, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=8, writer=None, opponent_ratio=0.0, opponent_temperature: Optional[float] = 1.0):
     """
     Main training loop for the Actor-Critic model.
 
@@ -538,6 +563,8 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
             against a random/old-policy opponent instead of pure self-play.
             If any checkpoints exist in `models/`, a random one is used;
             otherwise a random-move bot is used. 0.0 = only self-play.
+        opponent_temperature (float or None): Temperature used when sampling the
+            model opponent's moves. None or <= 0 keeps deterministic selection.
     """
     actor_critic_net.to(device)
     for batch in range(num_batches):
@@ -562,6 +589,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
                 gae_lamb=gae_lamb,
                 opponent=opponent_mode,
                 models_dir="models",
+                opponent_temperature=opponent_temperature,
             )
         else:
             # One-line batch mode trace
@@ -623,7 +651,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
             print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
 
-def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None, show_progress=False, device="cpu"):
+def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None, show_progress=True, device="cpu"):
     """
     Evaluates the actor-critic model's policy against a random opponent.
 
@@ -761,7 +789,7 @@ def evaluateVsStockfish():
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet().to(device)    
-    model_name = 'actor_critic_chess_resnet_v4_capture_reward+GAE'
+    model_name = 'actor_critic_chess_resnet_v3'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -774,7 +802,21 @@ if __name__ == "__main__":
         #dummy_input = torch.zeros(1, 18, 8, 8)
         #writer.add_graph(actor_critic_net, dummy_input)
         
-    optimizer = optim.Adam(actor_critic_net.parameters(), lr=3e-4)
+    # Split parameters into policy (actor) and value (critic) heads
+    actor_params = list(actor_critic_net.policy_head.parameters())
+    critic_params = list(actor_critic_net.value_head.parameters())
+    shared_params = list(actor_critic_net.stem.parameters()) + list(actor_critic_net.residual_tower.parameters())
+
+    # Typically: critic LR about 2× actor LR
+    lr_actor = 6e-4
+    lr_critic = 3e-4
+
+    optimizer = torch.optim.AdamW([
+        {"params": shared_params, "lr": lr_actor},   # shared trunk → follow actor pace
+        {"params": actor_params,  "lr": lr_actor},
+        {"params": critic_params, "lr": lr_critic},
+    ], betas=(0.9, 0.999), weight_decay=0.0)
+
     writer = SummaryWriter(log_dir=f"runs/{model_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     train_actor_critic(
@@ -782,15 +824,16 @@ if __name__ == "__main__":
         model_name=model_name,
         optimizer=optimizer,
         device=device,
-        gamma=0.98,
+        gamma=0.992,
         gae_lamb=0.9,
-        num_batches=1000,
-        eval_interval=200,
-        entropy_weight=0.018,
+        num_batches=2000,
+        eval_interval=400,
+        entropy_weight=0.05,
         critic_loss_weight=0.5,
         writer=writer,
-        batch_size=12,
-        opponent_ratio=0.5
+        batch_size=8,
+        opponent_ratio=0.4,
+        opponent_temperature=5,
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")

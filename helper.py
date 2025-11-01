@@ -12,11 +12,81 @@ PIECE_VALUES = {
 }
 
 OPENINGS = {
+    # Open Games (1.e4 e5)
     "italian": ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"],
     "scotch": ["e4", "e5", "Nf3", "Nc6", "d4", "exd4", "Nxd4"],
     "sicilian": ["e4", "c5", "Nf3", "d6", "d4", "cxd4", "Nxd4", "Nf6", "Nc3"],
     "french": ["e4", "e6", "d4", "d5", "Nc3"],
     "caro": ["e4", "c6", "d4", "d5", "Nc3", "dxe4", "Nxe4"],
+    "ruy_lopez": ["e4", "e5", "Nf3", "Nc6", "Bb5"],
+    "vienna": ["e4", "e5", "Nc3"],
+    "kings_gambit": ["e4", "e5", "f4"],
+    "philidor": ["e4", "e5", "Nf3", "d6"],
+    "petrov": ["e4", "e5", "Nf3", "Nf6"],
+    "four_knights": ["e4", "e5", "Nf3", "Nc6", "Nc3", "Nf6"],
+    "three_knights": ["e4", "e5", "Nf3", "Nc6", "Nc3"],
+    "pirc": ["e4", "d6", "d4", "Nf6", "Nc3", "g6"],
+    "modern": ["e4", "g6", "d4", "Bg7"],
+    "alehine": ["e4", "Nf6"],
+
+    # Semi-Open (1.e4 but Black replies asymmetrically)
+    "sicilian_dragon": ["e4", "c5", "Nf3", "d6", "d4", "cxd4", "Nxd4", "Nf6", "Nc3", "g6"],
+    "sicilian_najdorf": ["e4", "c5", "Nf3", "d6", "d4", "cxd4", "Nxd4", "Nf6", "Nc3", "a6"],
+    "sicilian_scheveningen": ["e4", "c5", "Nf3", "d6", "d4", "cxd4", "Nxd4", "Nf6", "Nc3", "e6"],
+    "sicilian_accelerated_dragon": ["e4", "c5", "Nf3", "Nc6", "d4", "cxd4", "Nxd4", "g6"],
+    "sicilian_alapin": ["e4", "c5", "c3"],
+    "sicilian_closed": ["e4", "c5", "Nc3"],
+    "caro_advance": ["e4", "c6", "d4", "d5", "e5"],
+    "french_advance": ["e4", "e6", "d4", "d5", "e5"],
+    "french_exchange": ["e4", "e6", "d4", "d5", "exd5", "exd5"],
+    "french_tarrasch": ["e4", "e6", "d4", "d5", "Nd2"],
+    "scandinavian": ["e4", "d5"],
+    "nimzowitsch_defense": ["e4", "Nc6"],
+
+    # Closed/Openings starting with 1.d4
+    "queens_gambit": ["d4", "d5", "c4"],
+    "queens_gambit_declined": ["d4", "d5", "c4", "e6"],
+    "queens_gambit_accepted": ["d4", "d5", "c4", "dxc4"],
+    "london": ["d4", "d5", "Nf3", "Nf6", "Bf4"],
+    "colle": ["d4", "d5", "Nf3", "Nf6", "e3"],
+    "trompowsky": ["d4", "Nf6", "Bg5"],
+    "veresov": ["d4", "Nf6", "Nc3", "d5", "Bg5"],
+    "catalan": ["d4", "Nf6", "c4", "e6", "g3"],
+    "benoni": ["d4", "Nf6", "c4", "c5", "d5", "e6"],
+    "benko": ["d4", "Nf6", "c4", "c5", "d5", "b5"],
+    "grunfeld": ["d4", "Nf6", "c4", "g6", "Nc3", "d5"],
+    "kings_indian": ["d4", "Nf6", "c4", "g6", "Nc3", "Bg7", "e4", "d6"],
+    "nimzo_indian": ["d4", "Nf6", "c4", "e6", "Nc3", "Bb4"],
+    "queens_indian": ["d4", "Nf6", "c4", "e6", "Nf3", "b6"],
+    "bogo_indian": ["d4", "Nf6", "c4", "e6", "Nf3", "Bb4+"],
+    "slav": ["d4", "d5", "c4", "c6"],
+    "semi_slav": ["d4", "d5", "c4", "c6", "Nc3", "Nf6", "Nf3", "e6"],
+    "tarrasch_defense": ["d4", "d5", "c4", "e6", "Nc3", "c5"],
+    "dutch": ["d4", "f5"],
+
+    # Flank openings
+    "english": ["c4", "e5"],
+    "english_symmetric": ["c4", "c5"],
+    "english_four_knights": ["c4", "Nf6", "Nc3", "Nc6", "Nf3", "e5"],
+    "reti": ["Nf3", "d5", "c4"],
+    "kings_fianchetto": ["Nf3", "d5", "g3", "Nf6", "Bg2", "g6"],
+    "bird": ["f4", "d5", "Nf3"],
+    "larsen_attack": ["b3", "e5"],
+    "benoni_fianchetto": ["d4", "Nf6", "c4", "c5", "d5", "g6"],
+    "old_indian": ["d4", "Nf6", "c4", "d6", "Nc3", "e5"],
+
+    # Weird/trap/fun
+    "grobs": ["g4", "d5"],
+    "vang_t_": ["d4", "e5"],
+    "polish": ["b4", "d5"],
+    "kings_indian_attack": ["Nf3", "Nf6", "d3", "d5", "g3", "g6", "Bg2", "Bg7", "O-O", "O-O", "Nbd2", "Nbd7", "e4", "e5"],
+    "albin_countergambit": ["d4", "d5", "c4", "e5"],
+    "budapest_gambit": ["d4", "Nf6", "c4", "e5"],
+    "englund_gambit": ["d4", "e5"],
+    "latvian_gambit": ["e4", "e5", "Nf3", "f5"],
+    "elephant_gambit": ["e4", "e5", "Nf3", "d5"],
+    "center_game": ["e4", "e5", "d4", "exd4", "Qxd4"],
+    "vienna_gambit": ["e4", "e5", "Nc3", "Nf6", "f4"],
 }
 
 DIRECTIONS = [
@@ -266,7 +336,7 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     if opp_ks: tensor[14, :, :] = 1.0
     if opp_qs: tensor[15, :, :] = 1.0
 
-    # --- Plane 16: PLAYER-TO-MOVE indicator (always 1 in canonicalized view) ---
+    # --- Plane 16: PLAYER-TO-MOVE indicator (canonical perspective -> always 1.0) ---
     tensor[16, :, :] = 1.0
 
     # --- Plane 17: Total Move Count (scaled) ---
@@ -297,8 +367,21 @@ def eval_material(board):
     return score
 
 if __name__ == "__main__":
-    board = chess.Board()
-    move = chess.Move.from_uci("d8c7")
-    idx = move_to_index(move, board)
-    print(idx)
-    print(index_to_move(idx, board))  
+    import chess
+
+    def is_playable_from_start(san_line):
+        b = chess.Board()
+        for san in san_line:
+            try:
+                b.push_san(san)
+            except Exception:
+                return False
+        return True
+
+    CLEAN_OPENINGS = {k:v for k,v in OPENINGS.items() if is_playable_from_start(v)}
+    BAD = {k:v for k,v in OPENINGS.items() if k not in CLEAN_OPENINGS}
+    if BAD:
+        print("Skipping non-alternating/illegal opening lines:")
+        for k,v in BAD.items():
+            print(f"  {k}: {v}")
+
