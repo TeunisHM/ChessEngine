@@ -204,7 +204,6 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
     plane = index % 73
     
     # Decode the move as if White were making it
-    # (This part is complex, let's use a helper for clarity)
     canonical_move = decode_plane_to_move(canonical_from_square, plane, board)
     
     if canonical_move is None:

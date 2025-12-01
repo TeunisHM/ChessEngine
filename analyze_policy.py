@@ -141,12 +141,16 @@ def play_and_explain(net: Optional[ActorCriticResNet] = None,
                      num_moves: int = 200,
                      sample: bool = False,
                      seed: int = 0,
-                     gamma: float = 0.995):
+                     gamma: float = 0.995,
+                     selection: str = "policy"):
     """
     Plays a single self-play game (policy controls both sides) and prints per-move diagnostics:
     - current value V(s)
     - top-K policy moves: SAN, prob, masked logit, value lookahead score
-    - chosen move (sample or argmax of policy probs)
+    - chosen move (sampled from policy or selected deterministically)
+
+    Args:
+        selection: 'policy' picks the policy argmax, 'value' picks the highest lookahead score.
 
     If model_path is None, initializes a fresh ActorCriticResNet.
     """
@@ -207,16 +211,31 @@ def play_and_explain(net: Optional[ActorCriticResNet] = None,
             )
         )
 
-        # Choose policy move (sample or argmax)
+        policy_argmax_idx = int(torch.argmax(probs).item())
+        policy_argmax_move = index_to_move(policy_argmax_idx, board)
+
+        # Choose policy move (sample or deterministic selection)
+        move = None
         if sample:
             dist = torch.distributions.Categorical(probs)
-            act_idx = dist.sample().item()
+            sampled_idx = dist.sample().item()
+            move = index_to_move(sampled_idx, board)
         else:
-            act_idx = int(torch.argmax(probs).item())
-        move = index_to_move(act_idx, board)
+            if selection not in {"policy", "value"}:
+                raise ValueError(f"Unsupported selection mode '{selection}'. Use 'policy' or 'value'.")
+
+            if selection == "policy":
+                move = policy_argmax_move
+            else:  # selection == "value"
+                move = topk_entries[0][0] if topk_entries else None
+
         if move is None or move not in board.legal_moves:
-            # fallback to best by value lookahead, else first legal
-            move = topk_entries[0][0] if topk_entries else next(iter(board.legal_moves))
+            # fallback hierarchy: top value candidate, policy argmax, then first legal
+            move = (topk_entries[0][0] if topk_entries else None) or (
+                policy_argmax_move
+            )
+            if move is None or move not in board.legal_moves:
+                move = next(iter(board.legal_moves))
 
         try:
             chosen_san = board.san(move)
@@ -376,6 +395,8 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Top-K candidates to display")
     parser.add_argument("--moves", type=int, default=800, help="Max number of plies to play")
     parser.add_argument("--sample", action="store_true", help="Sample from policy instead of argmax")
+    parser.add_argument("--select", choices=["policy", "value"], default="policy",
+                        help="Deterministic selection rule when not sampling")
     parser.add_argument("--gamma", type=float, default=0.995, help="Discount for lookahead value")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for action sampling")
     parser.add_argument("--diagnostics", action="store_true", help="Run diagnostic checks before self-play")
@@ -398,8 +419,8 @@ def main():
         sample=args.sample,
         seed=args.seed,
         gamma=args.gamma,
+        selection=args.select,
     )
-
 
 if __name__ == "__main__":
     main()

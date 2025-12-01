@@ -1,15 +1,45 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.pytest_cache/
+
+# Environments
 .venv/
 venv/
-policy.pt
-*.pt
-suggestions.txt
-*.json
-*.png
-eval_log*
-decent_models/
-__pycache__/
-/runs
-models/
-log_cuda.py
-test_move_encoding_edge_cases.py
+env/
+ENV/
+.conda/
 
+# Distribution / packaging
+build/
+dist/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+
+# IDE / tooling
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and run artifacts
+runs/
+logs/
+*.log
+*.out
+*.err
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Training data
+*.pgn

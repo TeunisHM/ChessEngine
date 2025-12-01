@@ -16,6 +16,11 @@ from typing import Optional
 # Define Policy Networks
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+try:
+    inference_mode = torch.inference_mode
+except AttributeError:
+    inference_mode = torch.no_grad
+
 class ResidualBlock(nn.Module):
     """A standard residual block for a ResNet."""
     def __init__(self, num_channels):
@@ -95,9 +100,16 @@ class ActorCriticResNet(nn.Module):
         
         return policy_logits, state_value
 
-def generate_self_play_batch(actor_critic_net, batch_size=8, gamma= 0.99, gae_lamb=0.95, device="cpu"):
+def generate_self_play_batch(actor_critic_net,
+                             batch_size=8,
+                             gamma=0.99,
+                             gae_lamb=0.95,
+                             device="cpu",
+                             temperature: float = 1.0):
     """
     Runs multiple self-play games in parallel and collects trajectories.
+    Args:
+        temperature (float): Softmax temperature applied to policy logits before sampling.
     Returns:
         - log_probs: list of log probabilities
         - state_values: list of state values
@@ -110,7 +122,11 @@ def generate_self_play_batch(actor_critic_net, batch_size=8, gamma= 0.99, gae_la
     all_entropies = []
 
     for _ in range(batch_size):
-        white_traj, white_rewards, black_traj, black_rewards, game_moves = train_actor_critic_game(actor_critic_net, device=device)
+        white_traj, white_rewards, black_traj, black_rewards, game_moves = train_actor_critic_game(
+            actor_critic_net,
+            device=device,
+            temperature=temperature,
+        )
         if not white_traj or not black_traj:
             continue  # skip broken games
 
@@ -157,7 +173,8 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                                   opponent_net=None,
                                   models_dir: str = "models",
                                   device="cpu",
-                                  opponent_temperature: Optional[float] = None):
+                                  opponent_temperature: Optional[float] = None,
+                                  policy_temperature: float = 1.0):
     """
     Play one game where the given policy plays against an opponent.
     Collect only the policy's (log_prob, value, entropy) trajectory and rewards.
@@ -190,7 +207,10 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                 print("No legal moves detected for policy; aborting game.")
                 break
 
-            probs = torch.softmax(policy_logits[0].masked_fill(mask == 0, -1e9), dim=0)
+            masked_logits = policy_logits[0].masked_fill(mask == 0, -1e9)
+            if policy_temperature != 1.0:
+                masked_logits = masked_logits / max(policy_temperature, 1e-6)
+            probs = torch.softmax(masked_logits, dim=0)
             dist = torch.distributions.Categorical(probs)
             move_idx = dist.sample()
             log_prob = dist.log_prob(move_idx)
@@ -225,7 +245,7 @@ def _play_policy_vs_opponent_game(actor_critic_net,
             if opponent_mode.lower() in ("model", "models", "random_model"):
                 opp = opponent_net if opponent_net is not None else _load_random_opponent_model(models_dir)
                 if opp is not None:
-                    with torch.no_grad():
+                    with inference_mode():
                         state = board_to_tensor(board).unsqueeze(0).to(device)
                         logits, _ = opp(state)
                         move = pick_move_topk_value(
@@ -270,13 +290,15 @@ def generate_opponent_play_batch(actor_critic_net,
                                  gae_lamb: float = 0.95,
                                  opponent: str = "random",
                                  models_dir: str = "models",
-                                 opponent_temperature: Optional[float] = 1.0):
+                                 opponent_temperature: Optional[float] = 1.0,
+                                 policy_temperature: float = 1.0):
     """
     Run multiple games where the policy plays an external opponent and collect trajectories
     for the POLICY ONLY. Output matches generate_self_play_batch: lists of log_probs, values,
     returns (GAE), entropies — but only for policy turns.
     If opponent == 'model', one random model from models_dir is loaded and reused for the batch.
     opponent_temperature controls stochasticity of the model opponent's move selection.
+    policy_temperature applies the same softmax temperature used for policy sampling.
     Pass None or a non-positive value to keep the previous deterministic top-k choice.
     """
     all_log_probs = []
@@ -296,6 +318,7 @@ def generate_opponent_play_batch(actor_critic_net,
             models_dir=models_dir,
             device=device,
             opponent_temperature=opponent_temperature,
+            policy_temperature=policy_temperature,
         )
 
         if not policy_traj:
@@ -312,13 +335,17 @@ def generate_opponent_play_batch(actor_critic_net,
 
     return all_log_probs, all_state_values, all_returns, all_entropies
 
-def train_actor_critic_game(actor_critic_net, opening_prob=0.66, device="cpu"):
+def train_actor_critic_game(actor_critic_net,
+                            opening_prob=0.7,
+                            device="cpu",
+                            temperature: float = 1.0):
     """
     Plays a single game of self-play using the actor-critic network,
     collecting data for training.
 
     Args:
         actor_critic_net: The ActorCriticConvNet model.
+        temperature (float): Softmax temperature applied before sampling moves.
 
     Returns:
         A tuple containing:
@@ -356,7 +383,10 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.66, device="cpu"):
             break
             
         # Apply mask to logits to only consider legal moves
-        probs = torch.softmax(policy_logits[0].masked_fill(mask == 0, -1e9), dim=0)
+        masked_logits = policy_logits[0].masked_fill(mask == 0, -1e9)
+        if temperature != 1.0:
+            masked_logits = masked_logits / max(temperature, 1e-6)
+        probs = torch.softmax(masked_logits, dim=0)
         dist = torch.distributions.Categorical(probs)
         move_idx = dist.sample() # Sample an action
         log_prob = dist.log_prob(move_idx) # Get the log probability of the action
@@ -440,7 +470,7 @@ def train_actor_critic_game(actor_critic_net, opening_prob=0.66, device="cpu"):
     
     return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
 
-@torch.no_grad()
+@inference_mode()
 def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu", temperature: Optional[float] = None):
     # Mask illegal moves
     mask = legal_moves_mask(board)
@@ -546,7 +576,21 @@ def calculate_gae_returns(rewards, values, gamma=0.99, lam=0.95):
     return returns
 
 ### Main Actor-Critic Training Function
-def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", num_batches=1000, eval_interval=500, gamma=0.99, gae_lamb=0.95, critic_loss_weight=0.5, entropy_weight=0.025, batch_size=8, writer=None, opponent_ratio=0.0, opponent_temperature: Optional[float] = 1.0):
+def train_actor_critic(actor_critic_net,
+                       model_name,
+                       optimizer,
+                       device="cpu",
+                       num_batches=1000,
+                       eval_interval=500,
+                       gamma=0.99,
+                       gae_lamb=0.95,
+                       critic_loss_weight=0.5,
+                       entropy_weight=0.025,
+                       batch_size=8,
+                       writer=None,
+                       opponent_ratio=0.0,
+                       opponent_temperature: Optional[float] = 1.0,
+                       sampling_temperature: float = 1.2):
     """
     Main training loop for the Actor-Critic model.
 
@@ -565,6 +609,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
             otherwise a random-move bot is used. 0.0 = only self-play.
         opponent_temperature (float or None): Temperature used when sampling the
             model opponent's moves. None or <= 0 keeps deterministic selection.
+        sampling_temperature (float): Temperature applied to policy sampling during training.
     """
     actor_critic_net.to(device)
     for batch in range(num_batches):
@@ -590,6 +635,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
                 opponent=opponent_mode,
                 models_dir="models",
                 opponent_temperature=opponent_temperature,
+                policy_temperature=sampling_temperature,
             )
         else:
             # One-line batch mode trace
@@ -600,6 +646,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
                 gamma=gamma,
                 gae_lamb=gae_lamb,
                 device=device,
+                temperature=sampling_temperature,
             )
         t1 = perf_counter()
 
@@ -651,7 +698,7 @@ def train_actor_critic(actor_critic_net, model_name, optimizer, device="cpu", nu
             print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
             torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
 
-def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None, show_progress=True, device="cpu"):
+def evaluate_vs_random(actor_critic_net, game_num, k=5, num_games=100, writer=None, show_progress=True, device="cpu"):
     """
     Evaluates the actor-critic model's policy against a random opponent.
 
@@ -671,7 +718,7 @@ def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None, s
     game_lengths = []
 
     # Disable gradients for performance, as they are not needed for evaluation
-    with torch.no_grad():
+    with inference_mode():
         start_t = perf_counter()
         for i in range(num_games):
             board = chess.Board()
@@ -701,7 +748,7 @@ def evaluate_vs_random(actor_critic_net, game_num, num_games=100, writer=None, s
                     entropy = dist.entropy().item()
                     entropies.append(entropy)
                     
-                    move = pick_move_topk_value(board, actor_critic_net, logits, k=5, device=device)
+                    move = pick_move_topk_value(board, actor_critic_net, logits, k=k, device=device)
                     
                     if move is None or move not in board.legal_moves:
                         # Needs more loggins, this should not really happen
@@ -789,7 +836,7 @@ def evaluateVsStockfish():
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet().to(device)    
-    model_name = 'actor_critic_chess_resnet_v3'
+    model_name = 'actor_critic_chess_resnet_v5'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -808,8 +855,8 @@ if __name__ == "__main__":
     shared_params = list(actor_critic_net.stem.parameters()) + list(actor_critic_net.residual_tower.parameters())
 
     # Typically: critic LR about 2× actor LR
-    lr_actor = 6e-4
-    lr_critic = 3e-4
+    lr_actor = 1e-4
+    lr_critic = 2e-4
 
     optimizer = torch.optim.AdamW([
         {"params": shared_params, "lr": lr_actor},   # shared trunk → follow actor pace
@@ -826,14 +873,15 @@ if __name__ == "__main__":
         device=device,
         gamma=0.992,
         gae_lamb=0.9,
-        num_batches=2000,
-        eval_interval=400,
-        entropy_weight=0.05,
+        num_batches=5000,
+        eval_interval=1000,
+        entropy_weight=0.025,
         critic_loss_weight=0.5,
         writer=writer,
-        batch_size=8,
-        opponent_ratio=0.4,
-        opponent_temperature=5,
+        batch_size=4,
+        opponent_ratio=0.5,
+        opponent_temperature=1.25,
+        sampling_temperature=1.25,
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")

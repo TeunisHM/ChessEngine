@@ -12,25 +12,38 @@ class NoOpWriter:
 
 def main():
     parser = argparse.ArgumentParser(description="Load a model and evaluate vs random.")
-    parser.add_argument("--model", "-m", type=str, required=True, help="Path to .pt model file")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--model", "-m", type=str, help="Path to .pt model file")
+    mode_group.add_argument(
+        "--zero-policy",
+        action="store_true",
+        help="Use a zero-initialized network (uniform policy logits) instead of loading a model",
+    )
     parser.add_argument("--games", "-g", type=int, default=100, help="Number of games to play")
     parser.add_argument("--device", type=str, default=None, help="Device override: cpu or cuda")
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not os.path.exists(args.model):
-        print(f"Model file not found: {args.model}")
-        raise SystemExit(1)
+    if args.zero_policy:
+        print("Creating zero-initialized ActorCriticResNet for uniform policy evaluation.")
+        net = ActorCriticResNet().to(device)
+        with torch.no_grad():
+            for param in net.parameters():
+                param.zero_()
+    else:
+        if not os.path.exists(args.model):
+            print(f"Model file not found: {args.model}")
+            raise SystemExit(1)
 
-    net = ActorCriticResNet().to(device)
-    print(f"Loading model: {args.model}")
-    state = torch.load(args.model, map_location=device)
-    net.load_state_dict(state)
+        net = ActorCriticResNet().to(device)
+        print(f"Loading model: {args.model}")
+        state = torch.load(args.model, map_location=device)
+        net.load_state_dict(state)
     net.eval()
 
     writer = NoOpWriter()
-    stats = evaluate_vs_random(net, game_num=0, num_games=args.games, writer=writer, show_progress=True)
+    stats = evaluate_vs_random(net, game_num=0, k=1, num_games=args.games, writer=writer, show_progress=True)
 
     print("\nSummary:")
     print(f"Wins: {stats['wins']}  Draws: {stats['draws']}  Losses: {stats['losses']}")

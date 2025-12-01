@@ -63,6 +63,16 @@ python3 train.py
 
 This will initialize a new model (or load a pre-trained one if a checkpoint is found) and begin the self-play training loop. Training progress, including losses, rewards, and evaluation metrics, will be logged to the `runs/` directory.
 
+## Supervised Pretraining from PGNs
+
+You can optionally warm-start the model on real games before reinforcement learning by running `pretrain_from_pgn.py`. Point it at one or more PGN files and it will optimize the policy head to mimic the human moves while teaching the value head to predict the eventual outcome from each position.
+
+```bash
+python pretrain_from_pgn.py --pgn /path/to/games.pgn --max-games 5000 --epochs 5 --output-model pretrained.pt
+```
+
+The resulting checkpoint (`pretrained.pt` in the example) can be supplied to `train.py` by renaming it to the expected model file (e.g., `actor_critic_chess_resnet_v4.pt`) or by loading it manually in your workflow.
+
 ### Monitoring Training
 
 You can monitor the training progress in real-time using TensorBoard. To launch TensorBoard, run the following command in a separate terminal:
