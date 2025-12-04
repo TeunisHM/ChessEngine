@@ -236,6 +236,10 @@ def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> ch
         else: to_file_offset, piece_idx = 1, plane - 70
         
         to_file = from_file + to_file_offset
+        # Check bounds!
+        if not (0 <= to_file <= 7):
+            return None
+
         promo_piece = promo_map[piece_idx]
         return chess.Move(from_square, chess.square(to_file, 7), promotion=promo_piece)
 
@@ -246,7 +250,14 @@ def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> ch
             4: (-2, -1), 5: (-1, -2), 6: (1, -2), 7: (2, -1)
         }
         dr, df = knight_map[plane - 56]
-        return chess.Move(from_square, chess.square(from_file + df, from_rank + dr))
+        to_file = from_file + df
+        to_rank = from_rank + dr
+        
+        # Check bounds!
+        if not (0 <= to_file <= 7 and 0 <= to_rank <= 7):
+            return None
+            
+        return chess.Move(from_square, chess.square(to_file, to_rank))
 
     # Sliding moves (and Queen promotions)
     else:
@@ -260,6 +271,11 @@ def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> ch
         
         to_rank = from_rank + dr * distance
         to_file = from_file + df * distance
+        
+        # Check bounds!
+        if not (0 <= to_file <= 7 and 0 <= to_rank <= 7):
+            return None
+
         to_square = chess.square(to_file, to_rank)
 
         # We need to check the original board to see if it's a pawn

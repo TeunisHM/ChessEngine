@@ -41,5 +41,9 @@ logs/
 *.pth
 *.ckpt
 
+# Stockfish binaries and bundles
+stockfish*
+**/stockfish*
+
 # Training data
 *.pgn

@@ -270,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=25000000,
+        default=2500000,
         help="Maximum number of positions to keep for training.",
     )
     parser.add_argument(
