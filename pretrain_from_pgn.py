@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from helper import board_to_tensor, move_to_index
-from train import ActorCriticResNet
+from models import ActorCriticResNet
 
 
 def _result_to_value(result: str) -> Optional[float]:

@@ -5,7 +5,7 @@ import chess
 import torch
 from typing import Optional
 from helper import board_to_tensor, legal_moves_mask, index_to_move, PIECE_VALUES
-from train import ActorCriticResNet
+from models import ActorCriticResNet
 import time
 
 

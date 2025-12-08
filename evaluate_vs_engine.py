@@ -6,8 +6,9 @@ import chess
 import chess.engine
 import torch
 
-from train import ActorCriticResNet, pick_move_topk_value
 from helper import board_to_tensor
+from models import ActorCriticResNet
+from search import search_select_move, DEFAULT_SEARCH_DEPTH
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,13 +23,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--engine-path",
-        default="./stockfish/stockfish",
-        help="Path to a UCI engine executable (default: /usr/bin/stockfish from RPM install).",
+        default='./stockfish/stockfish',
+        help="Path to a UCI engine executable. If omitted, tries STOCKFISH_PATH env, local ./stockfish, PATH, and common system locations.",
     )
     parser.add_argument(
         "--engine-move-time",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Seconds allowed per engine move (e.g., 0.1 = 100ms).",
     )
     parser.add_argument(
@@ -41,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--games",
         "-g",
         type=int,
-        default=50,
+        default=100,
         help="Number of games to play.",
     )
     parser.add_argument(
@@ -51,26 +52,31 @@ def parse_args() -> argparse.Namespace:
         help="Device override: cpu or cuda. Defaults to auto-detect.",
     )
     parser.add_argument(
-        "--topk",
+        "--search-k",
         type=int,
-        default=3,
-        help="Number of top policy moves to evaluate with the value head.",
+        default=5,
+        help="Top-k policy moves to explore in the lightweight search selector.",
     )
     parser.add_argument(
-        "--policy-temperature",
+        "--search-temperature",
         type=float,
-        default=1.0,
-        help="Softmax temperature for policy selection within top-k; <=0 for greedy.",
+        default=0.01,
+        help="Temperature over search scores; <=0 makes selection greedy.",
+    )
+    parser.add_argument(
+        "--search-depth",
+        type=int,
+        default=DEFAULT_SEARCH_DEPTH,
+        help="Search depth (plies) for the lightweight selector (>=1).",
     )
     return parser.parse_args()
-
 
 def _create_engine(path: str, skill: Optional[int]) -> chess.engine.SimpleEngine:
     engine = chess.engine.SimpleEngine.popen_uci(path)
     if skill is not None:
         try:
             engine.configure({"Skill Level": int(skill)})
-        except Exception as exc:  # pragma: no cover - best-effort only
+        except Exception as exc:  # pragma: no cover
             print(f"[WARN] Could not set engine skill level: {exc}")
     return engine
 
@@ -80,8 +86,9 @@ def _play_game(
     engine: chess.engine.SimpleEngine,
     device: torch.device,
     game_index: int,
-    topk: int,
-    policy_temperature: float,
+    search_k: int,
+    search_temperature: float,
+    search_depth: int,
     engine_move_time: float,
 ) -> Dict[str, int]:
     board = chess.Board()
@@ -96,13 +103,14 @@ def _play_game(
         if policy_turn:
             state = board_to_tensor(board).unsqueeze(0).to(device)
             policy_logits, _ = net(state)
-            move = pick_move_topk_value(
-                board,
-                net,
-                policy_logits[0],
-                k=max(1, topk),
+            move, _, _ = search_select_move(
+                board=board,
+                actor_critic_net=net,
+                logits=policy_logits[0],
                 device=device,
-                temperature=policy_temperature if policy_temperature > 0 else None,
+                k=max(1, search_k),
+                temperature=search_temperature,
+                depth=max(1, search_depth),
             )
             if move is None or move not in board.legal_moves:
                 move = next(iter(board.legal_moves))
@@ -144,10 +152,11 @@ def main() -> None:
     net.load_state_dict(state)
     net.eval()
 
+    engine_path = args.engine_path
     try:
-        engine = _create_engine(args.engine_path, args.engine_skill_level)
+        engine = _create_engine(engine_path, args.engine_skill_level)
     except Exception as exc:
-        print(f"[ERROR] Could not launch engine at '{args.engine_path}': {exc}")
+        print(f"[ERROR] Could not launch engine at '{engine_path}': {exc}")
         raise SystemExit(1)
 
     wins = losses = draws = 0
@@ -161,8 +170,9 @@ def main() -> None:
                 engine=engine,
                 device=device,
                 game_index=g,
-                topk=args.topk,
-                policy_temperature=args.policy_temperature,
+                search_k=args.search_k,
+                search_temperature=args.search_temperature,
+                search_depth=args.search_depth,
                 engine_move_time=args.engine_move_time,
             )
             game_lengths.append(stats["plies"])
@@ -178,7 +188,6 @@ def main() -> None:
             else:
                 draws += 1
 
-            # Progress line
             done = g + 1
             avg_len = sum(game_lengths) / max(1, len(game_lengths))
             print(

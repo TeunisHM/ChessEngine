@@ -181,8 +181,6 @@ def move_to_index(move: chess.Move, board: chess.Board) -> int:
     if player == chess.BLACK:
         from_square = chess.square_mirror(from_square)
         to_square = chess.square_mirror(to_square)
-        
-    # Now, from_square and to_square are the move's squares as if White were making an analogous move.
     
     # Create a temporary move object for this canonical move
     canonical_move = chess.Move(from_square, to_square, promotion=move.promotion)
@@ -218,7 +216,6 @@ def index_to_move(index: int, board: chess.Board) -> chess.Move:
     else:
         # If White, the canonical move is the real move
         return canonical_move
-
 
 def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> chess.Move:
     """
@@ -399,4 +396,3 @@ if __name__ == "__main__":
         print("Skipping non-alternating/illegal opening lines:")
         for k,v in BAD.items():
             print(f"  {k}: {v}")
-

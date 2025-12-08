@@ -2,7 +2,9 @@ import argparse
 import os
 import torch
 
-from train import ActorCriticResNet, evaluate_vs_random
+from models import ActorCriticResNet
+from evaluate_vs_random import evaluate_vs_random
+from search import DEFAULT_SEARCH_DEPTH
 
 
 class NoOpWriter:
@@ -21,6 +23,24 @@ def main():
     )
     parser.add_argument("--games", "-g", type=int, default=100, help="Number of games to play")
     parser.add_argument("--device", type=str, default=None, help="Device override: cpu or cuda")
+    parser.add_argument(
+        "--search-k",
+        type=int,
+        default=5,
+        help="Top-k policy moves to explore in the lightweight search selector.",
+    )
+    parser.add_argument(
+        "--search-temperature",
+        type=float,
+        default=0.01,
+        help="Temperature over search scores; <=0 makes selection greedy.",
+    )
+    parser.add_argument(
+        "--search-depth",
+        type=int,
+        default=DEFAULT_SEARCH_DEPTH,
+        help="Search depth (plies) for the lightweight selector (>=1).",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,7 +63,7 @@ def main():
     net.eval()
 
     writer = NoOpWriter()
-    stats = evaluate_vs_random(net, game_num=0, k=1, num_games=args.games, writer=writer, show_progress=True)
+    stats = evaluate_vs_random(net, game_num=0, num_games=args.games, writer=writer, show_progress=True, search_k=args.search_k, search_depth=args.search_depth)
 
     print("\nSummary:")
     print(f"Wins: {stats['wins']}  Draws: {stats['draws']}  Losses: {stats['losses']}")

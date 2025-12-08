@@ -9,12 +9,14 @@ from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_ma
 import os
 from datetime import datetime
 from Visualize import visualize_game_ascii
-import time
 from torch.utils.tensorboard import SummaryWriter
 from time import perf_counter
 from typing import Optional
+from models import ActorCriticResNet
+from search import search_select_move, DEFAULT_SEARCH_DEPTH
+from evaluate_vs_random import evaluate_vs_random
 
-MODELS_DIR = "small_models"
+MODELS_DIR = "search_models"
 
 # Define Policy Networks
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,91 +26,14 @@ try:
 except AttributeError:
     inference_mode = torch.no_grad
 
-class ResidualBlock(nn.Module):
-    """A standard residual block for a ResNet."""
-    def __init__(self, num_channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(num_channels) # Batch Norm is crucial
-        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(num_channels)
-
-    def forward(self, x):
-        # Store the original input for the skip connection
-        residual = x
-        
-        # First conv layer
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = F.relu(out)
-        
-        # Second conv layer
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        # Add the residual (skip connection)
-        out += residual
-        
-        # Apply final activation
-        out = F.relu(out)
-        
-        return out
-
-class ActorCriticResNet(nn.Module):
-    def __init__(self, num_input_channels=18, num_residual_blocks=4, num_filters=64):
-        super().__init__()
-        
-        # Initial Convolutional Layer (the "stem")
-        self.stem = nn.Sequential(
-            nn.Conv2d(num_input_channels, num_filters, kernel_size=3, padding=1),
-            nn.BatchNorm2d(num_filters),
-            nn.ReLU()
-        )
-        
-        # This creates a list of 'num_residual_blocks' ResidualBlock modules
-        self.residual_tower = nn.Sequential(
-            *[ResidualBlock(num_filters) for _ in range(num_residual_blocks)]
-        )
-        
-        # Actor (Policy) Head
-        self.policy_head = nn.Sequential(
-            nn.Conv2d(num_filters, 2, kernel_size=1), # Reduce to 2 filters
-            nn.BatchNorm2d(2),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(2 * 8 * 8, 4672)
-        )
-        
-        # Critic (Value) Head
-        self.value_head = nn.Sequential(
-            nn.Conv2d(num_filters, 1, kernel_size=1), # Reduce to 1 filter
-            nn.BatchNorm2d(1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(1 * 8 * 8, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, x):
-        # Pass through the initial stem
-        out = self.stem(x)
-        
-        # Pass through the residual tower
-        out = self.residual_tower(out)
-        
-        # Get policy and value outputs
-        policy_logits = self.policy_head(out)
-        state_value = self.value_head(out) # No detach here, following AlphaZero's design
-        
-        return policy_logits, state_value
-
 def generate_self_play_batch(actor_critic_net,
                              batch_size=8,
                              gamma=0.99,
                              gae_lamb=0.95,
                              device="cpu",
-                             temperature: float = 1.0):
+                             search_temperature: float = 1.0,
+                             search_k: int = 3,
+                             search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
     Runs multiple self-play games in parallel and collects trajectories.
     Args:
@@ -128,7 +53,9 @@ def generate_self_play_batch(actor_critic_net,
         white_traj, white_rewards, black_traj, black_rewards, game_moves = train_actor_critic_game(
             actor_critic_net,
             device=device,
-            temperature=temperature,
+            search_temperature=search_temperature,
+            search_k=search_k,
+            search_depth=search_depth,
         )
         if not white_traj or not black_traj:
             continue  # skip broken games
@@ -153,6 +80,88 @@ def generate_self_play_batch(actor_critic_net,
 
     return all_log_probs, all_state_values, all_returns, all_entropies
 
+def train_actor_critic_game(actor_critic_net,
+                            opening_prob=0.7,
+                            device="cpu",
+                            search_temperature: float = 1.0,
+                            search_k: int = 3,
+                            search_depth: int = DEFAULT_SEARCH_DEPTH):
+    """
+    Plays a single game of self-play using the actor-critic network,
+    collecting data for training.
+    """
+    board = chess.Board()
+
+    game_moves = []
+    if random.random() < opening_prob:
+        name, san_line = random.choice(list(OPENINGS.items()))
+        n = random.randint(2, len(san_line))
+        for san in san_line[:n]:
+            board.push_san(san)
+            game_moves.append(board.peek().uci())
+
+    white_trajectory = []
+    black_trajectory = []
+    white_rewards = []
+    black_rewards = []
+    game_moves = []
+
+    while not board.is_game_over():
+        state = board_to_tensor(board).unsqueeze(0).to(device)
+        policy_logits, state_value = actor_critic_net(state)
+
+        move, log_prob, entropy = search_select_move(
+            board=board,
+            actor_critic_net=actor_critic_net,
+            logits=policy_logits[0],
+            device=device,
+            k=search_k,
+            temperature=search_temperature,
+            depth=search_depth,
+        )
+
+        if move is None or log_prob is None or entropy is None:
+            print("No legal moves detected, aborting game.")
+            break
+
+        immediate_reward = 0.0
+
+        if board.turn == chess.WHITE:
+            white_trajectory.append((log_prob, state_value, entropy))
+            white_rewards.append(immediate_reward)
+        else:
+            black_trajectory.append((log_prob, state_value, entropy))
+            black_rewards.append(immediate_reward)
+
+        board.push(move)
+        game_moves.append(move)
+
+    result = board.result()
+    if result == "1-0":
+        final_white_reward = 1
+        final_black_reward = -1
+    elif result == "0-1":
+        final_white_reward = -1
+        final_black_reward = 1
+    else:
+        final_white_reward = 0
+        final_black_reward = 0
+        outcome = board.outcome()
+        if outcome is not None:
+            if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+                final_black_reward -= 0.1
+                final_white_reward -= 0.1
+            elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
+                final_white_reward -= 0.2
+                final_black_reward -= 0.2
+
+    if white_rewards:
+        white_rewards[-1] += final_white_reward
+    if black_rewards:
+        black_rewards[-1] += final_black_reward
+
+    return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
+
 def _load_random_opponent_weights(device: str = "cpu"):
     """Return (state_dict, path) for a random opponent checkpoint, or (None, None) on failure."""
     try:
@@ -170,7 +179,9 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                                   opponent_net=None,
                                   device="cpu",
                                   opponent_temperature: Optional[float] = None,
-                                  policy_temperature: float = 1.0):
+                                  search_temperature: float = 1.0,
+                                  search_k: int = 3,
+                                  search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
     Play one game where the given policy plays against an opponent.
     Collect only the policy's (log_prob, value, entropy) trajectory and rewards.
@@ -198,23 +209,18 @@ def _play_policy_vs_opponent_game(actor_critic_net,
             state = board_to_tensor(board).unsqueeze(0).to(device)
             policy_logits, state_value = actor_critic_net(state)
 
-            mask = legal_moves_mask(board)
-            if mask.sum() == 0:
+            move, log_prob, entropy = search_select_move(
+                board=board,
+                actor_critic_net=actor_critic_net,
+                logits=policy_logits[0],
+                device=device,
+                k=search_k,
+                temperature=search_temperature,
+                depth=search_depth,
+            )
+            if move is None or log_prob is None or entropy is None:
                 print("No legal moves detected for policy; aborting game.")
                 break
-
-            masked_logits = policy_logits[0].masked_fill(mask == 0, -1e9)
-            if policy_temperature != 1.0:
-                masked_logits = masked_logits / max(policy_temperature, 1e-6)
-            probs = torch.softmax(masked_logits, dim=0)
-            dist = torch.distributions.Categorical(probs)
-            move_idx = dist.sample()
-            log_prob = dist.log_prob(move_idx)
-            entropy = dist.entropy()
-
-            move = index_to_move(move_idx.item(), board)
-            if move is None or move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
 
             # No shaping: only terminal outcome rewards are used
             immediate_reward = 0.0
@@ -231,13 +237,14 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                 with inference_mode():
                     state = board_to_tensor(board).unsqueeze(0).to(device)
                     logits, _ = opponent_net(state)
-                    move = pick_move_topk_value(
-                        board,
-                        opponent_net,
-                        logits[0],
-                        k=20,
+                    move, _, _ = search_select_move(
+                        board=board,
+                        actor_critic_net=opponent_net,
+                        logits=logits[0],
                         device=device,
-                        temperature=opponent_temperature,
+                        k=5,
+                        temperature=opponent_temperature if opponent_temperature is not None else 1.0,
+                        depth=1,
                     )
 
             if move is None or move not in board.legal_moves:
@@ -249,17 +256,17 @@ def _play_policy_vs_opponent_game(actor_critic_net,
     # Final outcome-based reward added to the last policy step
     result = board.result()
     if result == "1-0":
-        final_policy_reward = 1.5 if policy_is_white else -1
+        final_policy_reward = 1 if policy_is_white else -1
     elif result == "0-1":
-        final_policy_reward = 1.5 if not policy_is_white else -1
+        final_policy_reward = 1 if not policy_is_white else -1
     else:  # Draw
-        final_policy_reward = -0.25
+        final_policy_reward = 0
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
                 final_policy_reward -= 0.1
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_policy_reward -= 0.25
+                final_policy_reward -= 0.2
 
     if policy_rewards:
         policy_rewards[-1] += final_policy_reward
@@ -271,7 +278,9 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
                                     device="cpu",
                                     engine_move_time: float = 0.05,
                                     engine_skill_level: Optional[int] = None,
-                                    policy_temperature: float = 1.0):
+                                    search_temperature: float = 1.0,
+                                    search_k: int = 3,
+                                    search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
     Play one game where the policy plays a UCI engine (e.g., Stockfish).
     Collect only the policy's (log_prob, value, entropy) trajectory and rewards.
@@ -297,27 +306,20 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
             state = board_to_tensor(board).unsqueeze(0).to(device)
             policy_logits, state_value = actor_critic_net(state)
 
-            mask = legal_moves_mask(board)
-            if mask.sum() == 0:
+            move, log_prob, entropy = search_select_move(
+                board=board,
+                actor_critic_net=actor_critic_net,
+                logits=policy_logits[0],
+                device=device,
+                k=search_k,
+                temperature=search_temperature,
+                depth=search_depth,
+            )
+            if move is None or log_prob is None or entropy is None:
                 print("No legal moves detected for policy; aborting game.")
                 break
 
-            masked_logits = policy_logits[0].masked_fill(mask == 0, -1e9)
-            if policy_temperature != 1.0:
-                masked_logits = masked_logits / max(policy_temperature, 1e-6)
-            probs = torch.softmax(masked_logits, dim=0)
-            dist = torch.distributions.Categorical(probs)
-            move_idx = dist.sample()
-            log_prob = dist.log_prob(move_idx)
-            entropy = dist.entropy()
-
-            move = index_to_move(move_idx.item(), board)
-            if move is None or move not in board.legal_moves:
-                move = random.choice(list(board.legal_moves))
-
-            # No shaping: only terminal outcome rewards are used
             immediate_reward = 0.0
-            
             policy_traj.append((log_prob, state_value, entropy))
             policy_rewards.append(immediate_reward)
 
@@ -340,17 +342,17 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
 
     result = board.result()
     if result == "1-0":
-        final_policy_reward = 1.5 if policy_is_white else -1
+        final_policy_reward = 1 if policy_is_white else -1
     elif result == "0-1":
-        final_policy_reward = 1.5 if not policy_is_white else -1
+        final_policy_reward = 1 if not policy_is_white else -1
     else:
-        final_policy_reward = -0.25
+        final_policy_reward = 0
         outcome = board.outcome()
         if outcome is not None:
             if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
                 final_policy_reward -= 0.1
             elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_policy_reward -= 0.25
+                final_policy_reward -= 0.2
 
     if policy_rewards:
         policy_rewards[-1] += final_policy_reward
@@ -362,7 +364,9 @@ def generate_opponent_play_batch(actor_critic_net,
                                  gamma: float = 0.99,
                                  gae_lamb: float = 0.95,
                                  opponent_temperature: Optional[float] = 1.0,
-                                 policy_temperature: float = 1.0):
+                                 search_temperature: float = 1.0,
+                                 search_k: int = 3,
+                                 search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
     Run multiple games where the policy plays an external opponent and collect trajectories
     for the POLICY ONLY. Output matches generate_self_play_batch: lists of log_probs, values,
@@ -370,7 +374,7 @@ def generate_opponent_play_batch(actor_critic_net,
     A single network is instantiated once per batch and its weights are loaded
     from a randomly chosen checkpoint for the whole batch. No new models are created per game.
     opponent_temperature controls stochasticity of the model opponent's move selection.
-    policy_temperature applies the same softmax temperature used for policy sampling.
+    search_temperature controls softmax over candidate scores during search selection.
     Pass None or a non-positive value to keep the previous deterministic top-k choice.
     """
     all_log_probs = []
@@ -394,7 +398,9 @@ def generate_opponent_play_batch(actor_critic_net,
             opponent_net=opponent_net,
             device=device,
             opponent_temperature=opponent_temperature,
-            policy_temperature=policy_temperature,
+            search_temperature=search_temperature,
+            search_k=search_k,
+            search_depth=search_depth,
         )
 
         if not policy_traj:
@@ -418,7 +424,9 @@ def generate_uci_engine_batch(actor_critic_net,
                               gae_lamb: float = 0.95,
                               engine_move_time: float = 0.05,
                               engine_skill_level: Optional[int] = None,
-                              policy_temperature: float = 1.0,
+                              search_temperature: float = 1.0,
+                              search_k: int = 3,
+                              search_depth: int = DEFAULT_SEARCH_DEPTH,
                               device="cpu"):
     """
     Run multiple games where the policy plays a UCI engine opponent and collect trajectories
@@ -437,7 +445,9 @@ def generate_uci_engine_batch(actor_critic_net,
             device=device,
             engine_move_time=engine_move_time,
             engine_skill_level=engine_skill_level,
-            policy_temperature=policy_temperature,
+            search_temperature=search_temperature,
+            search_k=search_k,
+            search_depth=search_depth,
         )
 
         if not policy_traj:
@@ -453,174 +463,6 @@ def generate_uci_engine_batch(actor_critic_net,
             all_entropies.append(entropy)
 
     return all_log_probs, all_state_values, all_returns, all_entropies
-
-def train_actor_critic_game(actor_critic_net,
-                            opening_prob=0.7,
-                            device="cpu",
-                            temperature: float = 1.0):
-    """
-    Plays a single game of self-play using the actor-critic network,
-    collecting data for training.
-
-    Args:
-        actor_critic_net: The ActorCriticConvNet model.
-        temperature (float): Softmax temperature applied before sampling moves.
-
-    Returns:
-        A tuple containing:
-        - white_trajectory (list): A list of (state, log_prob, value) for white.
-        - white_rewards (list): A list of rewards per move for white.
-        - black_trajectory (list): A list of (state, log_prob, value) for black.
-        - black_rewards (list): A list of rewards per move for black.
-    """
-    board = chess.Board()
-
-    game_moves = []
-    if  random.random() < opening_prob:
-        name, san_line = random.choice(list(OPENINGS.items()))
-        n = random.randint(2, len(san_line))  # random truncation
-        for san in san_line[:n]:
-            board.push_san(san)
-            game_moves.append(board.peek().uci())
-    
-    # Trajectories store data needed for loss calculation; trajectory stores (state, log_prob, state_value)
-    white_trajectory = []  
-    black_trajectory = []
-    white_rewards = []
-    black_rewards = []
-    game_moves = []
-
-    while not board.is_game_over():
-        # Get state, and pass it through the network
-        state = board_to_tensor(board).unsqueeze(0).to(device)
-        policy_logits, state_value = actor_critic_net(state)
-
-        # Select an action (move) based on policy
-        mask = legal_moves_mask(board)
-        if mask.sum() == 0:
-            print("No legal moves detected, aborting game.")
-            break
-            
-        # Apply mask to logits to only consider legal moves
-        masked_logits = policy_logits[0].masked_fill(mask == 0, -1e9)
-        if temperature != 1.0:
-            masked_logits = masked_logits / max(temperature, 1e-6)
-        probs = torch.softmax(masked_logits, dim=0)
-        dist = torch.distributions.Categorical(probs)
-        move_idx = dist.sample() # Sample an action
-        log_prob = dist.log_prob(move_idx) # Get the log probability of the action
-
-        entropy = dist.entropy()
-
-        move = index_to_move(move_idx.item(), board)
-
-        # Fallback for rare cases of invalid moves from the model
-        if move is None or move not in board.legal_moves:
-            print(f"Invalid move {move} proposed! Picking a random legal move.")
-            move = random.choice(list(board.legal_moves))
-
-        # No shaping: only terminal outcome rewards are used
-        immediate_reward = 0.0
-        
-        #Store the trajectory data for the current player
-        if board.turn == chess.WHITE:
-            white_trajectory.append((log_prob, state_value, entropy))
-            white_rewards.append(immediate_reward)
-        else:
-            black_trajectory.append((log_prob, state_value, entropy))
-            black_rewards.append(immediate_reward)
-
-        board.push(move)
-        game_moves.append(move)
-
-    #Determine final game outcome and assign terminal rewards
-    result = board.result()
-    if result == "1-0":
-        final_white_reward = 1.5
-        final_black_reward = -1
-    elif result == "0-1":
-        final_white_reward = -1
-        final_black_reward = 1.5
-    else:  # Draw
-        final_white_reward = -.25
-        final_black_reward = -.25
-        outcome = board.outcome()
-        if outcome is not None:
-            if outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
-                final_black_reward -= .1
-                final_white_reward -= .1
-            elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
-                final_white_reward -= .25
-                final_black_reward -= .25
-
-    #Add the final game outcome reward to the last move's reward
-    if white_rewards:
-        white_rewards[-1] += final_white_reward
-    if black_rewards:
-        black_rewards[-1] += final_black_reward
-    
-    return white_trajectory, white_rewards, black_trajectory, black_rewards, game_moves
-
-@inference_mode()
-def pick_move_topk_value(board, actor_critic_net, logits, k=5, device="cpu", temperature: Optional[float] = None):
-    # Mask illegal moves
-    mask = legal_moves_mask(board)
-    if mask.sum().item() == 0:
-        return None
-
-    masked_logits = logits.masked_fill(mask == 0, -1e9)
-    k_eff = min(k, int(mask.sum().item()))
-    topk = torch.topk(masked_logits, k=k_eff)
-
-    candidate_scores = []
-    candidate_moves = []
-
-    for idx in topk.indices.tolist():
-        move = index_to_move(idx, board)
-        if move is None or move not in board.legal_moves:
-            continue
-
-        board.push(move)
-        # Terminal handling (aligns with your reward scale)
-        if board.is_game_over():
-            result = board.result()
-            mover_is_white = not board.turn  # after push, it flipped
-            if result == "1-0":
-                score = 1.5 if mover_is_white else -1.0
-            elif result == "0-1":
-                score = 1.5 if not mover_is_white else -1.0
-            else:
-                score = 0
-        else:
-            # Value for opponent → negate for current player
-            state_next = board_to_tensor(board).unsqueeze(0).to(device)
-            _, v_next = actor_critic_net(state_next)
-            score = -v_next.item()
-        board.pop()
-
-        candidate_moves.append(move)
-        candidate_scores.append(score)
-
-    if candidate_moves:
-        if temperature is not None and temperature > 1e-6 and len(candidate_moves) > 1:
-            scores_tensor = torch.tensor(candidate_scores, dtype=torch.float32)
-            probs = torch.softmax(scores_tensor / float(temperature), dim=0)
-            choice = torch.distributions.Categorical(probs=probs).sample().item()
-            best_move = candidate_moves[choice]
-        else:
-            best_idx = max(range(len(candidate_scores)), key=candidate_scores.__getitem__)
-            best_move = candidate_moves[best_idx]
-    else:
-        best_move = None
-
-    # Fallback if needed
-    if best_move is None:
-        probs = torch.softmax(masked_logits, dim=0)
-        idx = torch.argmax(probs).item()
-        best_move = index_to_move(idx, board)
-        if best_move is None or best_move not in board.legal_moves:
-            best_move = next(iter(board.legal_moves))
-    return best_move
 
 def calculate_discounted_returns(rewards, gamma=0.99):
     """
@@ -683,6 +525,8 @@ def train_actor_critic(actor_critic_net,
                        opponent_temperature: Optional[float] = 1.0,
                        sampling_temperature: float = 1.2,
                        sampling_temperature_end: Optional[float] = None,
+                       search_k: int = 3,
+                       search_depth: int = DEFAULT_SEARCH_DEPTH,
                        engine_path: Optional[str] = None,
                        engine_ratio: float = 0.0,
                        engine_move_time: float = 0.05,
@@ -708,6 +552,8 @@ def train_actor_critic(actor_critic_net,
             model opponent's moves. None or <= 0 keeps deterministic selection.
         sampling_temperature (float): Temperature applied to policy sampling during training (start).
         sampling_temperature_end (float or None): Optional end temperature for linear annealing.
+        search_k (int): Number of top policy moves to explore in the lightweight search selector.
+        search_depth (int): Fixed search depth (plies) for the lightweight selector (>=1).
         engine_path (str or None): Path to a UCI engine (e.g., Stockfish) for occasional opponent batches.
         engine_ratio (float): Probability [0,1] that a batch uses the UCI engine opponent instead of other modes.
         engine_move_time (float): Seconds allowed per engine move during training batches.
@@ -758,7 +604,9 @@ def train_actor_critic(actor_critic_net,
                     gae_lamb=gae_lamb,
                     engine_move_time=engine_move_time,
                     engine_skill_level=engine_skill_level,
-                    policy_temperature=sampling_temperature_curr,
+                    search_temperature=sampling_temperature_curr,
+                    search_k=search_k,
+                    search_depth=search_depth,
                     device=device,
                 )
             elif use_opponent:
@@ -769,7 +617,9 @@ def train_actor_critic(actor_critic_net,
                     gamma=gamma,
                     gae_lamb=gae_lamb,
                     opponent_temperature=opponent_temperature,
-                    policy_temperature=sampling_temperature_curr,
+                    search_temperature=sampling_temperature_curr,
+                    search_k=search_k,
+                    search_depth=search_depth,
                 )
             else:
                 print(f"[Batch {batch+1}] Self-play batch")
@@ -779,7 +629,9 @@ def train_actor_critic(actor_critic_net,
                     gamma=gamma,
                     gae_lamb=gae_lamb,
                     device=device,
-                    temperature=sampling_temperature_curr,
+                    search_temperature=sampling_temperature_curr,
+                    search_k=search_k,
+                    search_depth=search_depth,
                 )
             t1 = perf_counter()
 
@@ -825,7 +677,7 @@ def train_actor_critic(actor_critic_net,
             
             # Evaluate every X games
             if (batch + 1) % eval_interval == 0:
-                eval_stats = evaluate_vs_random(actor_critic_net, batch, num_games=100, writer=writer, device=device)
+                eval_stats = evaluate_vs_random(actor_critic_net, batch, num_games=100, writer=writer, device=device, search_k=search_k, search_depth=search_depth)
                 print(f"\n[Eval at game {batch}] Wins: {eval_stats['wins']}, Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}\n")
                 torch.save(actor_critic_net.state_dict(), f"{model_name}_checkpoint_{batch}.pt")
     finally:
@@ -835,145 +687,9 @@ def train_actor_critic(actor_critic_net,
             except Exception:
                 pass
 
-def evaluate_vs_random(actor_critic_net, game_num, k=5, num_games=100, writer=None, show_progress=True, device="cpu"):
-    """
-    Evaluates the actor-critic model's policy against a random opponent.
-
-    Args:
-        actor_critic_net: The trained ActorCriticConvNet model.
-        num_games (int): The number of games to play for the evaluation.
-
-    Returns:
-        A dictionary containing evaluation statistics.
-    """
-    entropies = []
-    # Set the network to evaluation mode, # This is important!
-    actor_critic_net.eval() 
-    
-    results = []
-    white_wins, black_wins, ties, policy_white_wins, policy_black_wins = 0, 0, 0, 0, 0
-    game_lengths = []
-
-    # Disable gradients for performance, as they are not needed for evaluation
-    with inference_mode():
-        start_t = perf_counter()
-        for i in range(num_games):
-            board = chess.Board()
-            # The policy model plays as white in even games, and black in odd games
-            is_policy_white = i % 2 == 0
-            move_count = 0
-
-            while not board.is_game_over():
-                # Check if it's the policy's turn to move
-                if (board.turn == chess.WHITE and is_policy_white) or \
-                   (board.turn == chess.BLACK and not is_policy_white):
-                    
-                    # --- MODEL INFERENCE ---
-                    state = board_to_tensor(board).unsqueeze(0).to(device)
-                    policy_logits, _ = actor_critic_net(state)
-                    logits = policy_logits[0]
-                    
-                    mask = legal_moves_mask(board)
-                    if mask.sum() == 0:
-                        print("Evaluation game aborted: No legal moves for policy.")
-                        break
-                        
-                    masked_logits = logits.masked_fill(mask == 0, -1e9)
-                    probs = torch.softmax(masked_logits, dim=0)
-                    
-                    dist = torch.distributions.Categorical(probs)
-                    entropy = dist.entropy().item()
-                    entropies.append(entropy)
-                    
-                    move = pick_move_topk_value(board, actor_critic_net, logits, k=k, device=device)
-                    
-                    if move is None or move not in board.legal_moves:
-                        # Needs more loggins, this should not really happen
-                        print("wrong move found, look into this")
-                        move = random.choice(list(board.legal_moves))
-                else:
-                    move = random.choice(list(board.legal_moves))
-                
-                board.push(move)
-                move_count += 1
-
-            # --- RECORD GAME RESULTS ---
-            game_lengths.append(move_count)
-            result = board.result()
-            outcome = 0 # Default to draw
-            
-            if result == "1-0": # White won
-                white_wins += 1
-                if is_policy_white:
-                    outcome = 1
-                    policy_white_wins += 1
-                else:
-                    outcome = -1
-            elif result == "0-1": # Black won
-                black_wins += 1
-                if not is_policy_white:
-                    outcome = 1
-                    policy_black_wins += 1
-                else:
-                    outcome = -1
-            else: # Draw
-                ties += 1
-            
-            results.append(outcome)
-
-            # --- Progress bar update ---
-            if show_progress:
-                done = i + 1
-                frac = done / max(1, num_games)
-                bar_len = 30
-                filled = int(frac * bar_len)
-                bar = "=" * filled + "-" * (bar_len - filled)
-                elapsed = perf_counter() - start_t
-                rate = done / elapsed if elapsed > 0 else 0.0
-                eta = (num_games - done) / rate if rate > 0 else 0.0
-                print(f"\rEvaluating [{bar}] {done}/{num_games} | {elapsed:5.1f}s elapsed | ETA {eta:5.1f}s", end="", flush=True)
-
-    # Set the network back to training mode
-    actor_critic_net.train()
-
-    if show_progress:
-        # End the progress line cleanly
-        print()
-
-    wins = results.count(1)
-    losses = results.count(-1)
-    
-    print(f"\n--- Evaluation Results ---")
-    print(f"Policy vs Random: {wins} Wins / {ties} Draws / {losses} Losses")
-    print(f"Policy as White Wins: {policy_white_wins}, Policy as Black Wins: {policy_black_wins}")
-    print(f"--------------------------\n")
-
-    writer.add_scalar("Eval/Wins", wins, game_num)
-    writer.add_scalar("Eval/Losses", losses, game_num)
-    writer.add_scalar("Eval/Draws", ties, game_num)
-    writer.add_scalar("Eval/PolicyWhiteWins", policy_white_wins, game_num)
-    writer.add_scalar("Eval/PolicyBlackWins", policy_black_wins, game_num)
-    writer.add_scalar("Eval/AvgGameLength", sum(game_lengths) / len(game_lengths), game_num)
-    writer.add_scalar("Eval/AvgEntropy", sum(entropies) / len(entropies), game_num)
-
-    return {
-        "white_wins": white_wins,
-        "black_wins": black_wins,
-        "draws": ties,
-        "wins": wins,
-        "losses": losses,
-        "policy_white_wins": policy_white_wins,
-        "policy_black_wins": policy_black_wins,
-        "avg_game_length": sum(game_lengths) / len(game_lengths) if game_lengths else 0,
-        "avg_entropy": sum(entropies) / len(entropies) if entropies else 0
-    }
-
-def evaluateVsStockfish():
-    pass
-
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet().to(device)    
-    model_name = 'small_net'
+    model_name = 'search_net'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -982,9 +698,6 @@ if __name__ == "__main__":
         actor_critic_net.load_state_dict(torch.load(model_filename))
     else:
         print("Initializing a new model.")
-        # Write the model graph to the TensorBoard log
-        #dummy_input = torch.zeros(1, 18, 8, 8)
-        #writer.add_graph(actor_critic_net, dummy_input)
         
     # Split parameters into policy (actor) and value (critic) heads
     actor_params = list(actor_critic_net.policy_head.parameters())
@@ -1010,21 +723,23 @@ if __name__ == "__main__":
         device=device,
         gamma=0.99,
         gae_lamb=0.9,
-        num_batches=2500,
-        eval_interval=250,
+        num_batches=1000,
+        eval_interval=100,
         entropy_weight=0.025,
         critic_loss_weight=0.5,
         writer=writer,
-        batch_size=128,
+        batch_size=64,
         opponent_ratio=0.4,
         opponent_temperature=1.3,
         sampling_temperature=1.5,
         engine_path= "./stockfish/stockfish",
-        engine_ratio=0.33,
+        engine_ratio=0.4,
         engine_move_time=0.01,
         engine_skill_level=0,
         sampling_temperature_end=0.8,
-        entropy_weight_end=0.001
+        entropy_weight_end=0.001,
+        search_k = 5,
+        search_depth = DEFAULT_SEARCH_DEPTH
     )
 
     print(f"Training finished. Saving final model to: {model_filename}")
