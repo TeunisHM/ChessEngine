@@ -2,7 +2,7 @@ import argparse
 import os
 import torch
 
-from models import ActorCriticResNet
+from models import ActorCriticResNet, load_actor_critic_state_dict
 from evaluate_vs_random import evaluate_vs_random
 from search import DEFAULT_SEARCH_DEPTH
 
@@ -59,7 +59,7 @@ def main():
         net = ActorCriticResNet().to(device)
         print(f"Loading model: {args.model}")
         state = torch.load(args.model, map_location=device)
-        net.load_state_dict(state)
+        load_actor_critic_state_dict(net, state)
     net.eval()
 
     writer = NoOpWriter()

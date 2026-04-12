@@ -7,7 +7,7 @@ import chess.engine
 import torch
 
 from helper import board_to_tensor
-from models import ActorCriticResNet
+from models import ActorCriticResNet, load_actor_critic_state_dict
 from search import search_select_move, DEFAULT_SEARCH_DEPTH
 
 
@@ -149,7 +149,7 @@ def main() -> None:
     print(f"[INFO] Loading model from {args.model}")
     net = ActorCriticResNet().to(device)
     state = torch.load(args.model, map_location=device)
-    net.load_state_dict(state)
+    load_actor_critic_state_dict(net, state)
     net.eval()
 
     engine_path = args.engine_path

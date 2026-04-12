@@ -106,6 +106,7 @@ KNIGHT_DIRS = [
 ]
 
 PROMOTION_PIECES = ['n', 'r', 'q']  # Promotion piece order (standard)
+BOARD_TENSOR_PLANES = 20
 
 def square_to_coords(square):
     return chess.square_file(square), chess.square_rank(square)
@@ -308,10 +309,10 @@ def piece_planes(board: chess.Board) -> torch.Tensor:
 
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """
-    Converts the board state to a canonical tensor representation (18, 8, 8).
+    Converts the board state to a canonical tensor representation (20, 8, 8).
     The board is always viewed from the perspective of the current player.
     """
-    tensor = torch.zeros((18, 8, 8), dtype=torch.float32)
+    tensor = torch.zeros((BOARD_TENSOR_PLANES, 8, 8), dtype=torch.float32)
     player = board.turn
 
     # --- Planes 0-11: Piece Positions (own pieces 0-5, opp pieces 6-11) ---
@@ -343,10 +344,14 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
         opp_ks = board.has_kingside_castling_rights(chess.WHITE)
         opp_qs = board.has_queenside_castling_rights(chess.WHITE)
 
-    if our_ks: tensor[12, :, :] = 1.0
-    if our_qs: tensor[13, :, :] = 1.0
-    if opp_ks: tensor[14, :, :] = 1.0
-    if opp_qs: tensor[15, :, :] = 1.0
+    if our_ks:
+        tensor[12, :, :] = 1.0
+    if our_qs:
+        tensor[13, :, :] = 1.0
+    if opp_ks:
+        tensor[14, :, :] = 1.0
+    if opp_qs:
+        tensor[15, :, :] = 1.0
 
     # --- Plane 16: PLAYER-TO-MOVE indicator (canonical perspective -> always 1.0) ---
     tensor[16, :, :] = 1.0
@@ -354,6 +359,19 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     # --- Plane 17: Total Move Count (scaled) ---
     move_count_scaled = min(board.fullmove_number / 100.0, 1.0)
     tensor[17, :, :] = move_count_scaled
+
+    # --- Plane 18: En passant target square ---
+    if board.ep_square is not None:
+        ep_square = board.ep_square
+        if player == chess.BLACK:
+            ep_square = chess.square_mirror(ep_square)
+        ep_rank = chess.square_rank(ep_square)
+        ep_file = chess.square_file(ep_square)
+        tensor[18, ep_rank, ep_file] = 1.0
+
+    # --- Plane 19: Repetition indicator ---
+    if board.is_repetition(2):
+        tensor[19, :, :] = 1.0
 
     return tensor
 

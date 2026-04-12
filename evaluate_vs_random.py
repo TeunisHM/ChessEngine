@@ -16,7 +16,6 @@ except AttributeError:
 
 def evaluate_vs_random(actor_critic_net,
                       game_num,
-                      k: int = 5,
                       num_games: int = 100,
                       writer=None,
                       show_progress: bool = True,

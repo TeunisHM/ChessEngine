@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from helper import board_to_tensor, move_to_index
-from models import ActorCriticResNet
+from models import ActorCriticResNet, load_actor_critic_state_dict
 
 
 def _result_to_value(result: str) -> Optional[float]:
@@ -270,7 +270,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=2500000,
+        default=250000,
         help="Maximum number of positions to keep for training.",
     )
     parser.add_argument(
@@ -285,7 +285,7 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="Supervised batch size.",
     )
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument(
@@ -310,7 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-model",
         type=str,
-        default="actor_critic_chess_resnet_pgn.pt",
+        default="pretrained_net.pt",
         help="Where to save the pretrained weights.",
     )
     return parser.parse_args()
@@ -339,7 +339,7 @@ def main() -> None:
         if os.path.exists(args.init_model):
             print(f"[INFO] Loading initial weights from {args.init_model}")
             state_dict = torch.load(args.init_model, map_location="cpu")
-            model.load_state_dict(state_dict, strict=False)
+            load_actor_critic_state_dict(model, state_dict, strict=False)
         else:
             print(f"[WARN] init-model path not found: {args.init_model}")
 

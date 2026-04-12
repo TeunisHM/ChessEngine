@@ -5,7 +5,7 @@ import chess
 import torch
 from typing import Optional
 from helper import board_to_tensor, legal_moves_mask, index_to_move, PIECE_VALUES
-from models import ActorCriticResNet
+from models import ActorCriticResNet, load_actor_critic_state_dict
 import time
 
 
@@ -17,7 +17,7 @@ def load_network(model_path: Optional[str], device: torch.device) -> ActorCritic
     if model_path and os.path.exists(model_path):
         print(f"Loading model: {model_path}")
         state = torch.load(model_path, map_location=device)
-        net.load_state_dict(state)
+        load_actor_critic_state_dict(net, state)
     else:
         if model_path:
             print(f"Model file '{model_path}' not found; using randomly initialized network.")
