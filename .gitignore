@@ -47,3 +47,8 @@ stockfish*
 
 # Training data
 *.pgn
+
+#claude stuff
+claude.md
+train_explanation.txt
+train_improvements.md

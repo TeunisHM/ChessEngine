@@ -7,6 +7,7 @@ import chess.engine
 import random
 from helper import move_to_index, index_to_move, board_to_tensor, legal_moves_mask, eval_material, PIECE_VALUES, OPENINGS
 import os
+from contextlib import contextmanager
 from datetime import datetime
 from Visualize import visualize_game_ascii
 from torch.utils.tensorboard import SummaryWriter
@@ -36,12 +37,67 @@ def _make_rollout_step(board, state_tensor, legal_mask, move, old_log_prob, stat
         state_value.detach().view(-1).cpu(),
     )
 
+
+@contextmanager
+def _module_eval(module):
+    was_training = module.training
+    module.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            module.train()
+
+
+def _select_policy_move(board,
+                        logits,
+                        legal_mask,
+                        actor_critic_net,
+                        device,
+                        temperature: float,
+                        search_k: int,
+                        search_depth: int,
+                        use_search: bool):
+    mask = legal_mask.to(device)
+    if mask.sum() == 0:
+        return None, None, None
+
+    if use_search:
+        return search_select_move(
+            board=board,
+            actor_critic_net=actor_critic_net,
+            logits=logits,
+            device=device,
+            k=search_k,
+            temperature=temperature,
+            depth=search_depth,
+        )
+
+    masked_logits = logits.masked_fill(~mask, -1e9)
+    base_dist = torch.distributions.Categorical(logits=masked_logits)
+
+    if temperature is None or temperature <= 1e-6:
+        move_idx = torch.argmax(masked_logits)
+    else:
+        sample_logits = masked_logits / float(temperature)
+        sample_dist = torch.distributions.Categorical(logits=sample_logits)
+        move_idx = sample_dist.sample()
+
+    move = index_to_move(int(move_idx.item()), board)
+    if move is None or move not in board.legal_moves:
+        return None, None, None
+
+    log_prob = base_dist.log_prob(move_idx)
+    entropy = base_dist.entropy()
+    return move, log_prob, entropy
+
 def generate_self_play_batch(actor_critic_net,
                              batch_size=8,
                              gamma=0.99,
                              gae_lamb=0.95,
                              device="cpu",
                              search_temperature: float = 1.0,
+                             search_game_ratio: float = 1.0,
                              search_k: int = 3,
                              search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
@@ -55,10 +111,12 @@ def generate_self_play_batch(actor_critic_net,
     all_returns = []
 
     for _ in range(batch_size):
+        use_search = random.random() < max(0.0, min(1.0, float(search_game_ratio)))
         white_traj, white_rewards, black_traj, black_rewards, game_moves = train_actor_critic_game(
             actor_critic_net,
             device=device,
             search_temperature=search_temperature,
+            use_search=use_search,
             search_k=search_k,
             search_depth=search_depth,
         )
@@ -91,6 +149,7 @@ def train_actor_critic_game(actor_critic_net,
                             opening_prob=0.7,
                             device="cpu",
                             search_temperature: float = 1.0,
+                            use_search: bool = True,
                             search_k: int = 3,
                             search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
@@ -111,22 +170,22 @@ def train_actor_critic_game(actor_critic_net,
     black_trajectory = []
     white_rewards = []
     black_rewards = []
-    game_moves = []
-
     while not board.is_game_over():
         state_tensor = board_to_tensor(board)
         legal_mask = legal_moves_mask(board)
         with inference_mode():
             state = state_tensor.unsqueeze(0).to(device)
             policy_logits, state_value = actor_critic_net(state)
-            move, log_prob, _ = search_select_move(
+            move, log_prob, _ = _select_policy_move(
                 board=board,
-                actor_critic_net=actor_critic_net,
                 logits=policy_logits[0],
+                legal_mask=legal_mask,
+                actor_critic_net=actor_critic_net,
                 device=device,
-                k=search_k,
                 temperature=search_temperature,
-                depth=search_depth,
+                search_k=search_k,
+                search_depth=search_depth,
+                use_search=use_search,
             )
 
         if move is None or log_prob is None:
@@ -190,6 +249,7 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                                   device="cpu",
                                   opponent_temperature: Optional[float] = None,
                                   search_temperature: float = 1.0,
+                                  use_search: bool = True,
                                   search_k: int = 3,
                                   search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
@@ -203,7 +263,6 @@ def _play_policy_vs_opponent_game(actor_critic_net,
     policy_traj = []
     policy_rewards = []
     game_moves = []
-
     while not board.is_game_over():
         policy_to_move = ((board.turn == chess.WHITE and policy_is_white) or
                           (board.turn == chess.BLACK and not policy_is_white))
@@ -214,15 +273,18 @@ def _play_policy_vs_opponent_game(actor_critic_net,
             with inference_mode():
                 state = state_tensor.unsqueeze(0).to(device)
                 policy_logits, state_value = actor_critic_net(state)
-                move, log_prob, _ = search_select_move(
+                move, log_prob, _ = _select_policy_move(
                     board=board,
-                    actor_critic_net=actor_critic_net,
                     logits=policy_logits[0],
+                    legal_mask=legal_mask,
+                    actor_critic_net=actor_critic_net,
                     device=device,
-                    k=search_k,
                     temperature=search_temperature,
-                    depth=search_depth,
+                    search_k=search_k,
+                    search_depth=search_depth,
+                    use_search=use_search,
                 )
+
             if move is None or log_prob is None:
                 print("No legal moves detected for policy; aborting game.")
                 break
@@ -239,14 +301,16 @@ def _play_policy_vs_opponent_game(actor_critic_net,
                 with inference_mode():
                     state = board_to_tensor(board).unsqueeze(0).to(device)
                     logits, _ = opponent_net(state)
-                    move, _, _ = search_select_move(
+                    move, _, _ = _select_policy_move(
                         board=board,
-                        actor_critic_net=opponent_net,
                         logits=logits[0],
+                        legal_mask=legal_moves_mask(board),
+                        actor_critic_net=opponent_net,
                         device=device,
-                        k=5,
                         temperature=opponent_temperature if opponent_temperature is not None else 1.0,
-                        depth=1,
+                        search_k=5,
+                        search_depth=1,
+                        use_search=use_search,
                     )
 
             if move is None or move not in board.legal_moves:
@@ -280,6 +344,7 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
                                     engine_move_time: float = 0.05,
                                     engine_skill_level: Optional[int] = None,
                                     search_temperature: float = 1.0,
+                                    use_search: bool = True,
                                     search_k: int = 3,
                                     search_depth: int = DEFAULT_SEARCH_DEPTH):
     """
@@ -291,7 +356,6 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
     policy_traj = []
     policy_rewards = []
     game_moves = []
-
     if engine_skill_level is not None:
         try:
             engine.configure({"Skill Level": int(engine_skill_level)})
@@ -308,15 +372,18 @@ def _play_policy_vs_uci_engine_game(actor_critic_net,
             with inference_mode():
                 state = state_tensor.unsqueeze(0).to(device)
                 policy_logits, state_value = actor_critic_net(state)
-                move, log_prob, _ = search_select_move(
+                move, log_prob, _ = _select_policy_move(
                     board=board,
-                    actor_critic_net=actor_critic_net,
                     logits=policy_logits[0],
+                    legal_mask=legal_mask,
+                    actor_critic_net=actor_critic_net,
                     device=device,
-                    k=search_k,
                     temperature=search_temperature,
-                    depth=search_depth,
+                    search_k=search_k,
+                    search_depth=search_depth,
+                    use_search=use_search,
                 )
+
             if move is None or log_prob is None:
                 print("No legal moves detected for policy; aborting game.")
                 break
@@ -367,6 +434,7 @@ def generate_opponent_play_batch(actor_critic_net,
                                  gae_lamb: float = 0.95,
                                  opponent_temperature: Optional[float] = 1.0,
                                  search_temperature: float = 1.0,
+                                 search_game_ratio: float = 1.0,
                                  search_k: int = 3,
                                  search_depth: int = DEFAULT_SEARCH_DEPTH,
                                  device="cpu"):
@@ -391,12 +459,14 @@ def generate_opponent_play_batch(actor_critic_net,
         print("[WARN] No model opponent available; falling back to random moves.")
 
     for _ in range(batch_size):
+        use_search = random.random() < max(0.0, min(1.0, float(search_game_ratio)))
         policy_traj, policy_rewards, _ = _play_policy_vs_opponent_game(
             actor_critic_net,
             opponent_net=opponent_net,
             device=device,
             opponent_temperature=opponent_temperature,
             search_temperature=search_temperature,
+            use_search=use_search,
             search_k=search_k,
             search_depth=search_depth,
         )
@@ -425,6 +495,7 @@ def generate_uci_engine_batch(actor_critic_net,
                               engine_move_time: float = 0.05,
                               engine_skill_level: Optional[int] = None,
                               search_temperature: float = 1.0,
+                              search_game_ratio: float = 1.0,
                               search_k: int = 3,
                               search_depth: int = DEFAULT_SEARCH_DEPTH,
                               device="cpu"):
@@ -439,6 +510,7 @@ def generate_uci_engine_batch(actor_critic_net,
     all_returns = []
 
     for _ in range(batch_size):
+        use_search = random.random() < max(0.0, min(1.0, float(search_game_ratio)))
         policy_traj, policy_rewards, _ = _play_policy_vs_uci_engine_game(
             actor_critic_net,
             engine=engine,
@@ -446,6 +518,7 @@ def generate_uci_engine_batch(actor_critic_net,
             engine_move_time=engine_move_time,
             engine_skill_level=engine_skill_level,
             search_temperature=search_temperature,
+            use_search=use_search,
             search_k=search_k,
             search_depth=search_depth,
         )
@@ -534,6 +607,7 @@ def train_actor_critic(actor_critic_net,
                        engine_move_time: float = 0.05,
                        engine_skill_level: Optional[int] = None,
                        entropy_weight_end: Optional[float] = None,
+                       search_game_ratio: float = 1.0,
                        ppo_clip_ratio: float = 0.2,
                        ppo_epochs: int = 4):
     """
@@ -573,44 +647,50 @@ def train_actor_critic(actor_critic_net,
 
             if use_engine:
                 print(f"[Batch {batch+1}] UCI engine batch (Stockfish)")
-                states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_uci_engine_batch(
-                    actor_critic_net,
-                    engine=engine,
-                    batch_size=batch_size,
-                    gamma=gamma,
-                    gae_lamb=gae_lamb,
-                    engine_move_time=engine_move_time,
-                    engine_skill_level=engine_skill_level,
-                    search_temperature=sampling_temperature_curr,
-                    search_k=search_k,
-                    search_depth=search_depth,
-                    device=device,
-                )
+                with _module_eval(actor_critic_net):
+                    states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_uci_engine_batch(
+                        actor_critic_net,
+                        engine=engine,
+                        batch_size=batch_size,
+                        gamma=gamma,
+                        gae_lamb=gae_lamb,
+                        engine_move_time=engine_move_time,
+                        engine_skill_level=engine_skill_level,
+                        search_temperature=sampling_temperature_curr,
+                        search_game_ratio=search_game_ratio,
+                        search_k=search_k,
+                        search_depth=search_depth,
+                        device=device,
+                    )
             elif use_opponent:
                 print(f"[Batch {batch+1}] Opponent batch: model")
-                states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_opponent_play_batch(
-                    actor_critic_net,
-                    batch_size=batch_size,
-                    gamma=gamma,
-                    gae_lamb=gae_lamb,
-                    opponent_temperature=opponent_temperature,
-                    search_temperature=sampling_temperature_curr,
-                    search_k=search_k,
-                    search_depth=search_depth,
-                    device=device,
-                )
+                with _module_eval(actor_critic_net):
+                    states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_opponent_play_batch(
+                        actor_critic_net,
+                        batch_size=batch_size,
+                        gamma=gamma,
+                        gae_lamb=gae_lamb,
+                        opponent_temperature=opponent_temperature,
+                        search_temperature=sampling_temperature_curr,
+                        search_game_ratio=search_game_ratio,
+                        search_k=search_k,
+                        search_depth=search_depth,
+                        device=device,
+                    )
             else:
                 print(f"[Batch {batch+1}] Self-play batch")
-                states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_self_play_batch(
-                    actor_critic_net,
-                    batch_size=batch_size,
-                    gamma=gamma,
-                    gae_lamb=gae_lamb,
-                    device=device,
-                    search_temperature=sampling_temperature_curr,
-                    search_k=search_k,
-                    search_depth=search_depth,
-                )
+                with _module_eval(actor_critic_net):
+                    states, legal_masks, actions, old_log_probs, old_state_values, returns = generate_self_play_batch(
+                        actor_critic_net,
+                        batch_size=batch_size,
+                        gamma=gamma,
+                        gae_lamb=gae_lamb,
+                        device=device,
+                        search_temperature=sampling_temperature_curr,
+                        search_game_ratio=search_game_ratio,
+                        search_k=search_k,
+                        search_depth=search_depth,
+                    )
             t1 = perf_counter()
 
             if not actions:
@@ -679,6 +759,7 @@ def train_actor_critic(actor_critic_net,
                 writer.add_scalar("Loss/Entropy", avg_entropy_loss, batch)
                 writer.add_scalar("Schedule/EntropyWeight", entropy_weight_curr, batch)
                 writer.add_scalar("Schedule/SamplingTemperature", sampling_temperature_curr, batch)
+                writer.add_scalar("Schedule/SearchGameRatio", search_game_ratio, batch)
                 writer.add_scalar("PPO/ApproxKL", avg_approx_kl, batch)
                 writer.add_scalar("PPO/ClipFraction", avg_clip_frac, batch)
 
@@ -706,9 +787,12 @@ def train_actor_critic(actor_critic_net,
             except Exception:
                 pass
 
+
+train_ppo = train_actor_critic
+
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet().to(device)    
-    model_name = 'search_k3'
+    model_name = 'heavy_pretrained'
     model_filename = model_name + ".pt"
 
     # Load pre-trained weights if they exist
@@ -747,7 +831,7 @@ if __name__ == "__main__":
         entropy_weight=0.02,
         critic_loss_weight=0.5,
         writer=writer,
-        batch_size=64,
+        batch_size=32,
         opponent_ratio=0.33,
         opponent_temperature=1.3,
         sampling_temperature=1.2,
@@ -757,6 +841,7 @@ if __name__ == "__main__":
         engine_skill_level=0,
         sampling_temperature_end=0.8,
         entropy_weight_end=0.001,
+        search_game_ratio=0.25,
         ppo_clip_ratio=0.2,
         ppo_epochs=4,
         search_k = 3,
