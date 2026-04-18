@@ -52,3 +52,4 @@ stockfish*
 claude.md
 train_explanation.txt
 train_improvements.md
+.claude/

@@ -26,7 +26,7 @@ def main():
     parser.add_argument(
         "--search-k",
         type=int,
-        default=5,
+        default=3,
         help="Top-k policy moves to explore in the lightweight search selector.",
     )
     parser.add_argument(

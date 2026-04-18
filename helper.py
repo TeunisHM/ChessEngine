@@ -107,6 +107,7 @@ KNIGHT_DIRS = [
 
 PROMOTION_PIECES = ['n', 'r', 'q']  # Promotion piece order (standard)
 BOARD_TENSOR_PLANES = 20
+ACTION_SPACE_SIZE = 64 * 73
 
 def square_to_coords(square):
     return chess.square_file(square), chess.square_rank(square)
@@ -376,7 +377,7 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     return tensor
 
 def legal_moves_mask(board: chess.Board) -> torch.Tensor:
-    mask = torch.zeros(4672, dtype=torch.bool)
+    mask = torch.zeros(ACTION_SPACE_SIZE, dtype=torch.bool)
     for move in board.legal_moves:
         try:
             # Pass the board to correctly canonicalize the move
@@ -395,6 +396,140 @@ def eval_material(board):
             value = PIECE_VALUES[piece.piece_type]
             score += value if piece.color == chess.WHITE else -value
     return score
+
+
+# --- Horizontal mirror augmentation ---------------------------------------
+# A horizontal (file) mirror of a chess position is strategically equivalent
+# except for castling rights (king-side <-> queen-side). We use this to
+# double training data. The mapping is precomputed at module load.
+
+_SLIDE_DIRECTION_MAP = {
+    0: (1, 0), 1: (1, 1), 2: (0, 1), 3: (-1, 1),
+    4: (-1, 0), 5: (-1, -1), 6: (0, -1), 7: (1, -1)
+}
+_SLIDE_DIR_REVERSE = {v: k for k, v in _SLIDE_DIRECTION_MAP.items()}
+_KNIGHT_MAP = {
+    0: (2, 1), 1: (1, 2), 2: (-1, 2), 3: (-2, 1),
+    4: (-2, -1), 5: (-1, -2), 6: (1, -2), 7: (2, -1)
+}
+_KNIGHT_REVERSE = {v: k for k, v in _KNIGHT_MAP.items()}
+
+
+def _mirror_plane(plane: int) -> int:
+    """Return the plane index for the horizontally-mirrored move."""
+    if plane < 56:
+        direction_idx = plane // 7
+        distance = plane % 7
+        dr, df = _SLIDE_DIRECTION_MAP[direction_idx]
+        new_dir_idx = _SLIDE_DIR_REVERSE[(dr, -df)]
+        return new_dir_idx * 7 + distance
+    if plane < 64:
+        dr, df = _KNIGHT_MAP[plane - 56]
+        new_idx = _KNIGHT_REVERSE[(dr, -df)]
+        return 56 + new_idx
+    # Underpromotions: base 64=capture-left, 67=forward, 70=capture-right
+    promo_offset = (plane - 64) % 3
+    base = ((plane - 64) // 3) * 3 + 64
+    if base == 64:
+        new_base = 70
+    elif base == 70:
+        new_base = 64
+    else:
+        new_base = 67
+    return new_base + promo_offset
+
+
+def _build_mirror_action_permutation() -> torch.Tensor:
+    perm = torch.zeros(ACTION_SPACE_SIZE, dtype=torch.long)
+    for idx in range(ACTION_SPACE_SIZE):
+        from_sq = idx // 73
+        plane = idx % 73
+        from_rank = chess.square_rank(from_sq)
+        from_file = chess.square_file(from_sq)
+        mirror_from_sq = chess.square(7 - from_file, from_rank)
+        perm[idx] = mirror_from_sq * 73 + _mirror_plane(plane)
+    return perm
+
+
+MIRROR_ACTION_PERM = _build_mirror_action_permutation()
+
+# --- Endgame starting positions (curriculum) ------------------------------
+# Random legal positions from simple endgame material classes. Used to expose
+# the value head to clean, ground-truth-winning positions.
+
+_ENDGAME_MATERIAL = [
+    # (white_pieces, black_pieces) not counting kings. None of these setups
+    # is in stalemate/check-at-start; we resample until valid.
+    ((chess.QUEEN,), ()),            # KQvK
+    ((chess.ROOK,), ()),             # KRvK
+    ((chess.PAWN,), ()),             # KPvK
+    ((chess.ROOK, chess.PAWN), ()),  # KRPvK
+]
+
+
+def random_endgame_board(max_attempts: int = 40) -> chess.Board:
+    """Generate a random simple-endgame starting position. Returns Board()
+    as a fallback if a valid legal position cannot be constructed.
+    """
+    for _ in range(max_attempts):
+        setup = random.choice(_ENDGAME_MATERIAL)
+        white_pieces, black_pieces = setup
+        squares = random.sample(range(64), 2 + len(white_pieces) + len(black_pieces))
+        board = chess.Board.empty()
+        try:
+            board.set_piece_at(squares[0], chess.Piece(chess.KING, chess.WHITE))
+            board.set_piece_at(squares[1], chess.Piece(chess.KING, chess.BLACK))
+            i = 2
+            for pt in white_pieces:
+                # Pawns cannot be on rank 1 or 8.
+                sq = squares[i]
+                if pt == chess.PAWN:
+                    rank = chess.square_rank(sq)
+                    if rank == 0 or rank == 7:
+                        raise ValueError("pawn on back rank")
+                board.set_piece_at(sq, chess.Piece(pt, chess.WHITE))
+                i += 1
+            for pt in black_pieces:
+                sq = squares[i]
+                if pt == chess.PAWN:
+                    rank = chess.square_rank(sq)
+                    if rank == 0 or rank == 7:
+                        raise ValueError("pawn on back rank")
+                board.set_piece_at(sq, chess.Piece(pt, chess.BLACK))
+                i += 1
+            board.turn = random.choice([chess.WHITE, chess.BLACK])
+            if board.is_valid() and not board.is_game_over():
+                return board
+        except (ValueError, AssertionError):
+            continue
+    return chess.Board()
+
+
+def mirror_board_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Horizontal mirror of a canonical (C,8,8) board tensor.
+
+    Flips the file axis and swaps our KS<->QS and opp KS<->QS castling planes.
+    """
+    out = t.flip(-1).clone()
+    # planes 12=our_ks, 13=our_qs, 14=opp_ks, 15=opp_qs
+    out[[12, 13, 14, 15]] = out[[13, 12, 15, 14]]
+    return out
+
+
+def mirror_board_tensor_batch(batch: torch.Tensor) -> torch.Tensor:
+    """Horizontal mirror on a (B,C,8,8) tensor."""
+    out = batch.flip(-1).clone()
+    out[:, [12, 13, 14, 15]] = out[:, [13, 12, 15, 14]]
+    return out
+
+
+def mirror_legal_mask_batch(mask: torch.Tensor) -> torch.Tensor:
+    """Reorder a (B,4672) legal-move mask into its mirrored positions."""
+    return mask[:, MIRROR_ACTION_PERM.to(mask.device)]
+
+
+def mirror_action_index(idx: int) -> int:
+    return int(MIRROR_ACTION_PERM[idx].item())
 
 if __name__ == "__main__":
     import chess
