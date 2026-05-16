@@ -6,9 +6,9 @@ import chess
 import chess.engine
 import torch
 
-from helper import board_to_tensor
+from helper import index_to_move
+from lookahead import select_moves_with_lookahead
 from models import ActorCriticResNet, load_actor_critic_state_dict
-from search import search_select_move, DEFAULT_SEARCH_DEPTH
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,22 +52,22 @@ def parse_args() -> argparse.Namespace:
         help="Device override: cpu or cuda. Defaults to auto-detect.",
     )
     parser.add_argument(
-        "--search-k",
-        type=int,
-        default=5,
-        help="Top-k policy moves to explore in the lightweight search selector.",
-    )
-    parser.add_argument(
-        "--search-temperature",
+        "--temperature",
         type=float,
-        default=0.01,
-        help="Temperature over search scores; <=0 makes selection greedy.",
+        default=0.0,
+        help="Sampling temperature for policy moves; <=0 is greedy.",
     )
     parser.add_argument(
-        "--search-depth",
+        "--lookahead-k",
         type=int,
-        default=DEFAULT_SEARCH_DEPTH,
-        help="Search depth (plies) for the lightweight selector (>=1).",
+        default=8,
+        help="Top-k policy candidates considered by 1-ply value lookahead.",
+    )
+    parser.add_argument(
+        "--lookahead-alpha",
+        type=float,
+        default=0.33,
+        help="Weight on log pi(a) in the lookahead score: -V(child) + alpha*log pi.",
     )
     return parser.parse_args()
 
@@ -86,10 +86,10 @@ def _play_game(
     engine: chess.engine.SimpleEngine,
     device: torch.device,
     game_index: int,
-    search_k: int,
-    search_temperature: float,
-    search_depth: int,
+    temperature: float,
     engine_move_time: float,
+    lookahead_k: int = 8,
+    lookahead_alpha: float = 0.33,
 ) -> Dict[str, int]:
     board = chess.Board()
     is_policy_white = (game_index % 2 == 0)
@@ -101,17 +101,12 @@ def _play_game(
         )
 
         if policy_turn:
-            state = board_to_tensor(board).unsqueeze(0).to(device)
-            policy_logits, _ = net(state)
-            move, _, _ = search_select_move(
-                board=board,
-                actor_critic_net=net,
-                logits=policy_logits[0],
-                device=device,
-                k=max(1, search_k),
-                temperature=search_temperature,
-                depth=max(1, search_depth),
+            idxs, *_ = select_moves_with_lookahead(
+                net, [board], device,
+                top_k=lookahead_k, alpha=lookahead_alpha,
+                temperature=temperature,
             )
+            move = index_to_move(int(idxs[0].item()), board)
             if move is None or move not in board.legal_moves:
                 move = next(iter(board.legal_moves))
         else:
@@ -170,10 +165,10 @@ def main() -> None:
                 engine=engine,
                 device=device,
                 game_index=g,
-                search_k=args.search_k,
-                search_temperature=args.search_temperature,
-                search_depth=args.search_depth,
+                temperature=args.temperature,
                 engine_move_time=args.engine_move_time,
+                lookahead_k=args.lookahead_k,
+                lookahead_alpha=args.lookahead_alpha,
             )
             game_lengths.append(stats["plies"])
             result = stats["result"]

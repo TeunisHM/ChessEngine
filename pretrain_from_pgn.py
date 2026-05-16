@@ -77,6 +77,7 @@ class PGNSupervisedDataset(Dataset):
         max_games: Optional[int] = None,
         max_positions: Optional[int] = None,
         min_result: float = -1.0,
+        value_discount: float = 0.99,
     ) -> None:
         self.fens: List[str] = []
         self.policy_targets: List[int] = []
@@ -86,6 +87,7 @@ class PGNSupervisedDataset(Dataset):
             max_games=max_games,
             max_positions=max_positions,
             min_result=min_result,
+            value_discount=value_discount,
         )
 
     def _load_games(
@@ -94,6 +96,7 @@ class PGNSupervisedDataset(Dataset):
         max_games: Optional[int],
         max_positions: Optional[int],
         min_result: float,
+        value_discount: float,
     ) -> None:
         games_loaded = 0
         pos_loaded = 0
@@ -121,9 +124,11 @@ class PGNSupervisedDataset(Dataset):
                     if result is None:
                         continue
 
+                    moves = list(game.mainline_moves())
+                    total_plies = len(moves)
                     board = game.board()
                     drop_game = False
-                    for move in game.mainline_moves():
+                    for t, move in enumerate(moves):
                         try:
                             fen = board.fen()
                             move_idx = move_to_index(move, board)
@@ -133,7 +138,8 @@ class PGNSupervisedDataset(Dataset):
                             break
 
                         current_player = 1.0 if board.turn == chess.WHITE else -1.0
-                        value_target = result * current_player
+                        plies_to_end = total_plies - t
+                        value_target = result * current_player * (value_discount ** plies_to_end)
 
                         if value_target >= min_result:
                             self.fens.append(fen)
@@ -270,13 +276,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=250000,
+        default=500000,
         help="Maximum number of positions to keep for training.",
     )
     parser.add_argument(
         "--min-result",
         type=float,
-        default=-0.01,
+        default=-1.5,
         help="Minimum eventual outcome for the side to move (-1 loss, 0 draw, 1 win).",
     )
     parser.add_argument(
@@ -291,8 +297,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--value-loss-weight",
         type=float,
-        default=0.5,
+        default=1.5,
         help="Relative weight for the value regression term.",
+    )
+    parser.add_argument(
+        "--value-discount",
+        type=float,
+        default=0.99,
+        help="Per-ply discount applied to the terminal outcome when forming "
+             "value targets, so positions far from the end aren't fit to ±1.",
     )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
@@ -329,6 +342,7 @@ def main() -> None:
         max_games=args.max_games,
         max_positions=args.max_positions,
         min_result=args.min_result,
+        value_discount=args.value_discount,
     )
     if len(dataset) == 0:
         print("[ERROR] No training samples were loaded from the PGNs.")

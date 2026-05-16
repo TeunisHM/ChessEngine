@@ -47,6 +47,8 @@ stockfish*
 
 # Training data
 *.pgn
+syzygy/
+lichess_db_puzzle.csv
 
 #claude stuff
 claude.md
