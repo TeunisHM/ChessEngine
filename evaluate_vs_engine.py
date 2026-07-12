@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lookahead-k",
         type=int,
-        default=8,
+        default=5,
         help="Top-k policy candidates considered by 1-ply value lookahead.",
     )
     parser.add_argument(

@@ -50,6 +50,9 @@ stockfish*
 syzygy/
 lichess_db_puzzle.csv
 
+# Orphaned debug artifacts
+conv_white_capture/
+
 #claude stuff
 claude.md
 train_explanation.txt

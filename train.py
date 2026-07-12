@@ -68,9 +68,9 @@ def _terminal_rewards(board: chess.Board, draw_penalty: float = 0.1):
     """
     result = board.result() if board.is_game_over() else "*"
     if result == "1-0":
-        return 1.0, -1.0
+        return 1.25, -1.0
     if result == "0-1":
-        return -1.0, 1.0
+        return -1.0, 1.25
     return -draw_penalty, -draw_penalty
 
 
@@ -434,6 +434,25 @@ def generate_batch(actor_critic_net,
             "mean_delta_logp_at_chosen": search_delta_logp_sum / n,
         }
 
+    # Trainee outcomes (W/D/L/T) for opponent batches. In self-play the trainee
+    # plays both colors so per-game outcomes are ambiguous from its perspective;
+    # we skip recording in that case.
+    if not self_play:
+        outcomes = {"W": 0, "D": 0, "L": 0, "T": 0}
+        for gid in range(batch_size):
+            board = boards[gid]
+            if not board.is_game_over():
+                outcomes["T"] += 1
+                continue
+            r = board.result()
+            if r == "1/2-1/2":
+                outcomes["D"] += 1
+            elif (r == "1-0") == policy_is_white[gid]:
+                outcomes["W"] += 1
+            else:
+                outcomes["L"] += 1
+        stats["trainee_outcomes"] = outcomes
+
     return (all_states, all_masks, all_actions, all_old_log_probs,
             all_old_values, all_returns, all_topk_idx, all_log_b_topk, stats)
 
@@ -566,6 +585,9 @@ def train_actor_critic(actor_critic_net,
     log_writer.writerow(["batch", "wins", "draws", "losses"])
     print(f"[INFO] eval log: {log_path}")
 
+    # Cumulative trainee-vs-Stockfish-engine outcomes across the run.
+    engine_cum = {"W": 0, "D": 0, "L": 0, "T": 0}
+
     try:
         baseline = evaluate_vs_random(
             actor_critic_net, num_games=eval_games, device=device,
@@ -580,6 +602,7 @@ def train_actor_critic(actor_critic_net,
             t0 = perf_counter()
 
             r = random.random()
+            trainee_search_now = False
             if engine_pool is not None and r < engine_ratio:
                 opponent_fn = _engine_opponent_fn(engine_pool, engine_move_time)
                 source = "engine"
@@ -594,6 +617,9 @@ def train_actor_critic(actor_critic_net,
                         top_k=lookahead_k, alpha=lookahead_alpha,
                     )
                     source = f"checkpoint ({os.path.basename(opp_path)})"
+                    # Trainee uses widened search only against past checkpoints;
+                    # pure π in self-play and against the engine.
+                    trainee_search_now = trainee_search
             else:
                 opponent_fn = None
                 source = "self-play"
@@ -608,7 +634,7 @@ def train_actor_critic(actor_critic_net,
                 material_shaping_per_pawn=material_shaping_per_pawn,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
-                trainee_search=trainee_search,
+                trainee_search=trainee_search_now,
                 trainee_top_k=lookahead_k,
                 trainee_alpha=lookahead_alpha,
                 progress_label=f"[Batch {batch+1}/{num_batches}] {source}",
@@ -629,8 +655,30 @@ def train_actor_critic(actor_critic_net,
                 and topk_idxs and topk_idxs[0] is not None
             )
             if distill_on:
-                topk_idx_t = torch.stack(topk_idxs).to(device).long()
-                log_b_topk_t = torch.stack(log_b_topks).to(device).float()
+                # Per-ply candidate sets have variable length (widened lookahead
+                # unions top-k(π) with captures/checks, which differs per board).
+                # Pad to the rollout-global max so torch.stack works; padding
+                # slots get b ≈ 0 via -1e9, so they contribute nothing to the
+                # distill cross-entropy.
+                max_k_global = max(t.shape[0] for t in topk_idxs)
+                padded_idxs, padded_logbs = [], []
+                for idx, lb in zip(topk_idxs, log_b_topks):
+                    cur_k = idx.shape[0]
+                    if cur_k < max_k_global:
+                        pad_idx = torch.zeros(
+                            max_k_global - cur_k, dtype=idx.dtype, device=idx.device,
+                        )
+                        pad_lb = torch.full(
+                            (max_k_global - cur_k,), -1e9,
+                            dtype=lb.dtype, device=lb.device,
+                        )
+                        padded_idxs.append(torch.cat([idx, pad_idx]))
+                        padded_logbs.append(torch.cat([lb, pad_lb]))
+                    else:
+                        padded_idxs.append(idx)
+                        padded_logbs.append(lb)
+                topk_idx_t = torch.stack(padded_idxs).to(device).long()
+                log_b_topk_t = torch.stack(padded_logbs).to(device).float()
             else:
                 topk_idx_t = None
                 log_b_topk_t = None
@@ -704,12 +752,21 @@ def train_actor_critic(actor_critic_net,
                         entropy_loss = -entropies.mean()
                         if distill_on:
                             # Soft cross-entropy toward the search distribution b:
-                            #   loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
-                            # H(b) has no gradient → equivalent to minimizing KL(b ‖ π_new).
+                            #   per-state loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
+                            # Outcome-filtered: only states where the search-chosen action
+                            # had positive advantage contribute. This aligns the distill
+                            # gradient with the PPO actor signal (also advantage-weighted)
+                            # — search picks that the rollout vindicated reinforce π;
+                            # search picks that lost don't get copied. Without this filter,
+                            # the asymmetric clip protects the actor but distill flows
+                            # unrestricted, dragging π toward b's biased choices.
                             new_log_pi = F.log_softmax(masked, dim=1)
                             new_log_pi_topk = new_log_pi.gather(1, topk_idx_t[mb])
                             mb_b_topk = log_b_topk_t[mb].exp()
-                            distill_loss = -(mb_b_topk * new_log_pi_topk).sum(dim=1).mean()
+                            distill_per_state = -(mb_b_topk * new_log_pi_topk).sum(dim=1)
+                            pos_mask = (mb_adv > 0).float()
+                            n_pos = pos_mask.sum().clamp(min=1.0)
+                            distill_loss = (distill_per_state * pos_mask).sum() / n_pos
                         else:
                             distill_loss = torch.zeros((), device=device)
                         total_loss = (
@@ -733,7 +790,9 @@ def train_actor_critic(actor_critic_net,
 
                     with torch.no_grad():
                         # Trust-region check: drift of π_new from π_old, NOT from b.
-                        approx_kl = (mb_pi_old_lp - new_lp).mean().item()
+                        # Schulman k3 estimator: unbiased, non-negative.
+                        log_r_pi = new_lp - mb_pi_old_lp
+                        approx_kl = (torch.exp(log_r_pi) - 1 - log_r_pi).mean().item()
                         clip_frac = ((ratios - 1.0).abs() > ppo_clip_ratio).float().mean().item()
 
                     actor_loss_sum += actor_loss.item()
@@ -771,6 +830,22 @@ def train_actor_critic(actor_critic_net,
                     f"Δlogp@a: {s['mean_delta_logp_at_chosen']:+.3f}"
                 )
             distill_info = f" Distill: {avg_distill:.4f}" if distill_weight > 0 else ""
+            outcome_info = ""
+            outcomes = rollout_stats.get("trainee_outcomes")
+            if outcomes is not None:
+                if source == "engine":
+                    engine_cum["W"] += outcomes["W"]
+                    engine_cum["D"] += outcomes["D"]
+                    engine_cum["L"] += outcomes["L"]
+                    engine_cum["T"] += outcomes["T"]
+                    outcome_info = (
+                        f" | vs SF: {outcomes['W']}W/{outcomes['D']}D/{outcomes['L']}L"
+                        f" (cum {engine_cum['W']}/{engine_cum['D']}/{engine_cum['L']})"
+                    )
+                else:
+                    outcome_info = (
+                        f" | trainee: {outcomes['W']}W/{outcomes['D']}D/{outcomes['L']}L"
+                    )
             print(
                 f"[Batch {batch+1}] {source} | DataGen: {t1 - t0:.2f}s "
                 f"Train: {t2 - t1:.2f}s{suffix} | "
@@ -778,6 +853,7 @@ def train_actor_critic(actor_critic_net,
                 f"Entropy: {avg_entropy:.4f}{distill_info} "
                 f"KL: {avg_kl:.4f} Clip: {avg_clip:.3f}"
                 f"{search_info}"
+                f"{outcome_info}"
             )
 
             if (batch + 1) % eval_interval == 0:
@@ -804,8 +880,8 @@ def train_actor_critic(actor_critic_net,
 
 if __name__ == "__main__":
     actor_critic_net = ActorCriticResNet().to(device)
-    model_name = "ppo_search_v5"
-    init_from = "models/ppo_search_v4_checkpoint_599.pt"
+    model_name = "ppo_search_v10"
+    init_from = "models/ppo_search_v9_checkpoint_249.pt"
 
     if os.path.exists(init_from):
         print(f"Loading initial weights from: {init_from}")
@@ -827,21 +903,21 @@ if __name__ == "__main__":
         model_name=model_name,
         optimizer=optimizer,
         device=device,
-        num_batches=900,
-        eval_interval=100,
+        num_batches=400,
+        eval_interval=50,
         eval_games=100,
         gamma=0.98,
         gae_lamb=0.95,
         critic_loss_weight=0.5,
         entropy_weight=0.005,
-        batch_size=24,
+        batch_size=32,
         opening_prob=0.6,
-        temperature=1.25,
-        ppo_clip_ratio=0.33,
+        temperature=1.0,
+        ppo_clip_ratio=0.2,
         ppo_epochs=4,
         ppo_minibatch_size=256,
         target_kl=0.015,
-        opponent_ratio=0.4,
+        opponent_ratio=0.45,
         opponent_temperature=1.0,
         engine_ratio=0.1,
         engine_path="./stockfish/stockfish",
@@ -850,10 +926,10 @@ if __name__ == "__main__":
         engine_skill_level=0,
         step_penalty=0.001,
         draw_penalty=0.1,
-        material_shaping_per_pawn=0.025,  # 1 pawn capture ≈ 10 step penalties.
+        material_shaping_per_pawn=0.025,  
         lookahead_k=4,
         lookahead_alpha=0.3,
-        trainee_search=True,
-        distill_weight=0.4,
-        tablebase_terminate_prob=0.33,
+        trainee_search=True,  # only fires in checkpoint-opponent batches; pure π elsewhere.
+        distill_weight=0.025,
+        tablebase_terminate_prob=0.25,
     )

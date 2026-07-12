@@ -17,7 +17,7 @@ import chess
 import torch
 import torch.nn.functional as F
 
-from helper import board_to_tensor, index_to_move, legal_moves_mask
+from helper import board_to_tensor, index_to_move, legal_moves_mask, move_to_index
 
 
 @torch.inference_mode()
@@ -30,22 +30,28 @@ def select_moves_from_policy(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample a move per board directly from the masked policy distribution.
 
-    Same return signature as select_moves_with_lookahead so call sites can swap.
-    Used in PPO rollouts so the action distribution actually equals pi(a|s) and
-    old_log_prob = log_pi[action] is a correct importance-sampling baseline.
+    Returned `log_pi` is the log-softmax of `logits / temperature`, i.e. the
+    log-probs *under the actual sampling distribution*. Caller's
+    `log_pi[chosen]` is therefore a correct PPO old_log_prob — the IS ratio
+    π_new_T(a) / π_old_T(a) refers to the same tempered policy on both sides.
     """
     states = torch.stack([board_to_tensor(b) for b in boards]).to(device)
     masks = torch.stack([legal_moves_mask(b) for b in boards]).to(device)
 
     logits, root_values = net(states)
     masked = logits.masked_fill(~masks, -1e9)
-    log_pi = F.log_softmax(masked, dim=1)
 
     if temperature is None or temperature <= 1e-6:
+        # Argmax: behavior policy is a delta on the argmax; for downstream
+        # consumers we still return log softmax at T=1 (the chosen-action
+        # log-prob extracted from it is the T=1 log π for that action, which
+        # under a delta behavior is a benign stand-in that won't affect
+        # gradient direction).
+        log_pi = F.log_softmax(masked, dim=1)
         chosen = log_pi.argmax(dim=1)
     else:
-        probs = F.softmax(masked / float(temperature), dim=1)
-        chosen = torch.distributions.Categorical(probs=probs).sample()
+        log_pi = F.log_softmax(masked / float(temperature), dim=1)
+        chosen = torch.distributions.Categorical(logits=log_pi).sample()
 
     return chosen, log_pi, masks, root_values.view(-1), states
 
@@ -192,7 +198,13 @@ def select_moves_with_lookahead(
     max_qdepth: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pick a move per board via top-k policy + value quiescence at the children.
+    """Pick a move per board via *widened* candidate set + value quiescence.
+
+    Candidate set per board = top-k by π  ∪  all legal captures  ∪  all legal
+    non-capture checks. The widening ensures forcing tactical moves are always
+    in the search support even when π undervalues them — addressing the
+    structural limit where top-k by π alone can't escape the policy's blind
+    spots.
 
     Returns (action_idx, log_pi, masks, root_values, states,
              log_b_chosen, kl_b_pi, pick_rank, topk_idx, log_b_topk),
@@ -203,12 +215,15 @@ def select_moves_with_lookahead(
         chosen action — i.e. the *behavior* policy log-prob. Use as PPO
         old_log_prob when sampling actions through this function so the IS
         ratio π_new(a|s) / b(a|s) is well-formed.
-    kl_b_pi: per-state KL(b || π) over the top-k support; how much the search
-        distribution disagrees with the raw policy at that state.
-    pick_rank: 0-indexed rank of the chosen action in π's top-k (0 = π's #1).
-    topk_idx: (n, k) action indices that make up the search support.
-    log_b_topk: (n, k) log b over those indices; with temperature<=0, b is a
-        delta on the chosen action (one-hot row).
+    kl_b_pi: per-state KL(b || π) over the candidate support; how much the
+        search distribution disagrees with the raw policy at that state.
+    pick_rank: 0-indexed rank of the chosen action in the candidate set,
+        ordered by descending log π. (0 = highest-π candidate.)
+    topk_idx: (n, max_cand) action indices that make up the search support,
+        padded per row. Invalid/padding slots are scored at -inf so they
+        cannot be selected.
+    log_b_topk: (n, max_cand) log b over those indices; with temperature<=0,
+        b is a delta on the chosen action (one-hot row).
     """
     states = torch.stack([board_to_tensor(b) for b in boards]).to(device)
     masks = torch.stack([legal_moves_mask(b) for b in boards]).to(device)
@@ -218,18 +233,47 @@ def select_moves_with_lookahead(
     log_pi = F.log_softmax(masked, dim=1)
 
     n = len(boards)
-    k = min(top_k, log_pi.shape[1])
-    topk_logp, topk_idx = log_pi.topk(k, dim=1)
+    k_base = min(top_k, log_pi.shape[1])
+
+    # Per-board candidate set: top-k(π) ∪ captures ∪ non-capture checks.
+    # Order each board's candidate list by descending log π so pick_rank
+    # remains interpretable (0 = π's highest-prob candidate).
+    log_pi_cpu = log_pi.detach().cpu()
+    candidate_sets: List[List[int]] = []
+    for i, board in enumerate(boards):
+        topk_idx_i = log_pi_cpu[i].topk(k_base).indices.tolist()
+        cands = set(topk_idx_i)
+        for move in board.legal_moves:
+            if board.is_capture(move) or board.gives_check(move):
+                cands.add(move_to_index(move, board))
+        cands_sorted = sorted(cands, key=lambda a: -float(log_pi_cpu[i, a]))
+        candidate_sets.append(cands_sorted)
+
+    max_k = max((len(c) for c in candidate_sets), default=k_base)
+    if max_k == 0:
+        max_k = k_base  # all-empty edge case (game over boards); pad zeros
+
+    topk_idx = torch.zeros(n, max_k, dtype=torch.long, device=device)
+    topk_logp = torch.full((n, max_k), -1e9, device=device)
+    is_invalid = torch.ones(n, max_k, dtype=torch.bool, device=device)
+    for i, cs in enumerate(candidate_sets):
+        if not cs:
+            continue
+        cs_t = torch.tensor(cs, device=device, dtype=torch.long)
+        topk_idx[i, :len(cs)] = cs_t
+        topk_logp[i, :len(cs)] = log_pi[i].index_select(0, cs_t)
+        is_invalid[i, :len(cs)] = False
 
     topk_idx_cpu = topk_idx.cpu().tolist()
-    is_invalid = torch.zeros(n, k, dtype=torch.bool, device=device)
-    neg_v = torch.zeros(n, k, device=device)
+    neg_v = torch.zeros(n, max_k, device=device)
     child_boards: List[chess.Board] = []
     child_rows: List[int] = []
     child_cols: List[int] = []
 
     for i, board in enumerate(boards):
-        for j in range(k):
+        for j in range(max_k):
+            if is_invalid[i, j]:
+                continue
             action_idx = topk_idx_cpu[i][j]
             move = index_to_move(action_idx, board)
             if move is None or move not in board.legal_moves:
@@ -261,7 +305,7 @@ def select_moves_with_lookahead(
         kl_b_pi = -topk_logp.gather(1, sel.view(-1, 1)).view(-1)
         # log_b_topk: one-hot row on `sel` (log 1 = 0 at sel, -inf elsewhere).
         # Use a large negative instead of -inf so downstream exp gives 0 cleanly.
-        log_b_topk = torch.full((n, k), -1e9, device=device)
+        log_b_topk = torch.full((n, max_k), -1e9, device=device)
         log_b_topk.scatter_(1, sel.view(-1, 1), 0.0)
     else:
         log_b_topk = F.log_softmax(score / float(temperature), dim=1)

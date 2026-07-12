@@ -8,7 +8,6 @@ from helper import board_to_tensor, legal_moves_mask, index_to_move, PIECE_VALUE
 from models import ActorCriticResNet, load_actor_critic_state_dict
 import time
 
-
 def load_network(model_path: Optional[str], device: torch.device) -> ActorCriticResNet:
     """
     Initialize an ActorCriticResNet and (optionally) load weights from disk.
@@ -245,7 +244,7 @@ def play_and_explain(net: Optional[ActorCriticResNet] = None,
 
         board.push(move)
         ply += 1
-        time.sleep(1.5)
+        time.sleep(.5)
         
     print("\nFinal position:")
     print(board)
