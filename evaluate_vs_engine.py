@@ -8,7 +8,7 @@ import torch
 
 from helper import index_to_move
 from lookahead import select_moves_with_lookahead
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import ActorCriticResNet, net_from_state_dict
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,9 +142,8 @@ def main() -> None:
         raise SystemExit(1)
 
     print(f"[INFO] Loading model from {args.model}")
-    net = ActorCriticResNet().to(device)
     state = torch.load(args.model, map_location=device)
-    load_actor_critic_state_dict(net, state)
+    net = net_from_state_dict(state, device)
     net.eval()
 
     engine_path = args.engine_path

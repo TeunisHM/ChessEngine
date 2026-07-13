@@ -22,7 +22,7 @@ from helper import (
     mirror_board_tensor_batch,
 )
 from lookahead import select_moves_from_policy, select_moves_with_lookahead
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import ActorCriticResNet, load_actor_critic_state_dict, net_from_state_dict
 from evaluate_vs_random import evaluate_vs_random
 
 MODELS_DIR = "models"
@@ -129,8 +129,9 @@ def _load_random_opponent(device: str):
         path = os.path.join(MODELS_DIR, filename)
         try:
             state = torch.load(path, map_location=device)
-            net = ActorCriticResNet().to(device)
-            load_actor_critic_state_dict(net, state)
+            # Match the checkpoint's head architecture so legacy dense-head
+            # opponents keep their trained policy instead of a fresh head.
+            net = net_from_state_dict(state, device)
             net.eval()
             return net, path
         except Exception as exc:
@@ -879,9 +880,12 @@ def train_actor_critic(actor_critic_net,
 
 
 if __name__ == "__main__":
+    # v11: conv policy head, seeded by fresh PGN pretraining (pretrained_conv.pt,
+    # two 3-epoch passes over the lichess elite files — see pretrain_and_train.sh
+    # recipe). New lineage: does NOT warm-start from v10's weights.
     actor_critic_net = ActorCriticResNet().to(device)
-    model_name = "ppo_search_v10"
-    init_from = "models/ppo_search_v9_checkpoint_249.pt"
+    model_name = "ppo_search_v11"
+    init_from = "pretrained_conv.pt"
 
     if os.path.exists(init_from):
         print(f"Loading initial weights from: {init_from}")

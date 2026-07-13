@@ -8,7 +8,7 @@ import torch
 
 from helper import index_to_move
 from lookahead import select_moves_with_lookahead
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import net_from_state_dict
 
 
 def evaluate_vs_random(actor_critic_net,
@@ -137,9 +137,8 @@ def main():
     if not os.path.exists(args.model):
         raise SystemExit(f"Model file not found: {args.model}")
 
-    net = ActorCriticResNet().to(device)
     print(f"Loading model: {args.model}")
-    load_actor_critic_state_dict(net, torch.load(args.model, map_location=device))
+    net = net_from_state_dict(torch.load(args.model, map_location=device), device)
     net.eval()
 
     evaluate_vs_random(

@@ -7,7 +7,7 @@ import torch
 
 from helper import index_to_move
 from lookahead import select_moves_with_lookahead
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import net_from_state_dict
 
 
 def play_game(net_a, net_b, device, *, a_is_white: bool,
@@ -48,8 +48,7 @@ def main():
     for path in (args.model_a, args.model_b):
         if not os.path.exists(path):
             raise SystemExit(f"Model file not found: {path}")
-        n = ActorCriticResNet().to(device)
-        load_actor_critic_state_dict(n, torch.load(path, map_location=device))
+        n = net_from_state_dict(torch.load(path, map_location=device), device)
         n.eval()
         nets[path] = n
 
