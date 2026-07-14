@@ -315,6 +315,11 @@ def parse_args() -> argparse.Namespace:
         help="cpu or cuda device string. Defaults to auto-detect.",
     )
     parser.add_argument(
+        "--se",
+        action="store_true",
+        help="Build the net with squeeze-excitation blocks in the residual tower.",
+    )
+    parser.add_argument(
         "--init-model",
         type=str,
         default=None,
@@ -348,7 +353,7 @@ def main() -> None:
         print("[ERROR] No training samples were loaded from the PGNs.")
         return
 
-    model = ActorCriticResNet()
+    model = ActorCriticResNet(use_se=args.se)
     if args.init_model:
         if os.path.exists(args.init_model):
             print(f"[INFO] Loading initial weights from {args.init_model}")

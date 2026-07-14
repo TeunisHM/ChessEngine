@@ -4,7 +4,7 @@ Last updated: 2026-07-12. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
-Nothing running. **v11 is the strongest known model and the new generational baseline.**
+Nothing running. **v11 is the strongest known model and the generational baseline.** (v12 = v11 + SE blocks tied it at +17 Elo, CI [−26,+61] — see recipe table; SE judged not worth keeping.)
 
 - **v11** = two changes over v10: (1) **conv policy head** (`ConvPolicyHead` in `models.py`: 3×3 conv → GN → ReLU → 1×1 conv to 73 planes, square-major reshape; 157k params vs the legacy dense head's 603k), and (2) **fresh lineage** — seeded from `pretrained_conv.pt` (two 3-epoch PGN passes over the lichess elite files; 42.2% top-1 move accuracy vs 37.5% for the dense head on the identical recipe), *not* warm-started from v10. Trained 2026-07-12/13, 400 batches of the v10 recipe, clean exit.
 - **H2H run 2026-07-13** (`logs/h2h_v11-399_vs_v10-399_*.log`), 101 games, temp=1.0, k=4, α=0.3:
@@ -19,13 +19,17 @@ Nothing running. **v11 is the strongest known model and the new generational bas
 
 ## Next steps
 
-1. **v12**: init from `models/ppo_search_v11_checkpoint_399.pt` (same conv architecture now, so warm start is full-fidelity), keep the validated recipe. Tests whether within-lineage PPO stacks on the new head.
-2. H2H new model vs **v11@399** — that's the bar now.
+v12 (SE blocks) already ran and tied v11 — the v12 name is consumed. Candidate v13 experiments, one variable each, H2H vs **v11@399** as the bar:
+
+1. **Within-lineage continuation**: init from `models/ppo_search_v11_checkpoint_399.pt` (full-fidelity warm start, same architecture), unchanged recipe. Tests whether PPO stacks gains on the conv head.
+2. **WDL value head** (3-way W/D/L softmax, expectation fed to search): directly targets draw awareness; needs the same fresh-seed pipeline as v11/v12.
+3. Deeper search structure (multi-ply beyond quiescence) — the handover's long-standing "deep limit" candidate.
 
 ## Recipe history (most recent first)
 
 | Run | Init | Recipe change | Result |
 |---|---|---|---|
+| v12 (neutral) | `pretrained_conv_se.pt` (fresh PGN seed) | **SE blocks** in residual tower (+34k params); otherwise identical to v11 pipeline | H2H **23W/60D/18L vs v11@399** (+17 Elo, CI [−26,+61], LOS 78%) — statistical tie; SE not worth keeping on current evidence |
 | **v11 (succeeded, +114 Elo)** | `pretrained_conv.pt` (fresh PGN seed) | **Conv policy head**; fresh lineage; recipe hparams unchanged from v10 | H2H **43W/47D/11L vs v10@399** (LOS ≈ 1.0); **current generational baseline** |
 | v10 (succeeded, +137 Elo) | v9@249 | `opponent_ratio` 0.6 → **0.45**; `distill_weight` 0.05 → **0.025**; `batch_size` 24 → 32; `tablebase_terminate_prob` 0.33 → 0.25 | H2H **45W/49D/7L vs v6@399** (LOS ≈ 1.0) |
 | v9 (killed @ b249) | v8@249 | `opponent_ratio` 0.4 → **0.6**; added engine W/D/L tracking (per-batch + cumulative) | Draws climbed 1→7 by b250 (late-onset v7 signature); killed, v10 launched from v9@249 |
@@ -63,7 +67,7 @@ Nothing running. **v11 is the strongest known model and the new generational bas
 
 ## Models folder
 
-After the conservative cleanup on 2026-05-18, `models/` contains v4 (9 checkpoints 99–899), v6 (8 checkpoints 49–399), v8 (5 checkpoints 49–249), `pretrained-76-0.pt`, plus v9's checkpoints as they save. `_load_random_opponent` reads any `.pt` here — these are the curriculum.
+After the 60% cleanup on 2026-07-14, `models/` holds 18 checkpoints (209 MB): `pretrained-76-0.pt`; v4 @99/899; v6 @149/399; v8 @249; v9 @249; v10 @199/299/399; v11 @99/199/299/349/399; v12 @199/299/399. Kept: every lineage's strongest, the documented init/reference points, and a weak-to-strong spread for curriculum variation. `_load_random_opponent` reads any `.pt` here — these are the curriculum.
 
 **Strongest known models**: v11@399 (proven baseline, +114 Elo over v10@399), then v10@399 (+137 over v6@399), then v6@399. The opponent pool holds v4/v6/v8/v9/v10/v11 checkpoints plus `pretrained-76-0.pt`; mixed head architectures all load via `net_from_state_dict`.
 

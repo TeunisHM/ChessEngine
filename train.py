@@ -880,12 +880,12 @@ def train_actor_critic(actor_critic_net,
 
 
 if __name__ == "__main__":
-    # v11: conv policy head, seeded by fresh PGN pretraining (pretrained_conv.pt,
-    # two 3-epoch passes over the lichess elite files — see pretrain_and_train.sh
-    # recipe). New lineage: does NOT warm-start from v10's weights.
-    actor_critic_net = ActorCriticResNet().to(device)
-    model_name = "ppo_search_v11"
-    init_from = "pretrained_conv.pt"
+    # v12: SE blocks in the residual tower on top of v11's conv policy head.
+    # Same pipeline as v11: fresh PGN-pretrained seed, one 400-batch run,
+    # H2H vs v11@399. One variable (SE), one bar to clear.
+    actor_critic_net = ActorCriticResNet(use_se=True).to(device)
+    model_name = "ppo_search_v12"
+    init_from = "pretrained_conv_se.pt"
 
     if os.path.exists(init_from):
         print(f"Loading initial weights from: {init_from}")

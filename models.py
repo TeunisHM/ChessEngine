@@ -18,15 +18,37 @@ def _norm2d(num_channels):
     return nn.GroupNorm(num_groups, num_channels)
 
 
-class ResidualBlock(nn.Module):
-    """A standard residual block for a ResNet."""
+class SqueezeExcitation(nn.Module):
+    """Channel-wise attention conditioned on a global board summary.
 
-    def __init__(self, num_channels):
+    Squeeze: per-channel spatial mean (a global census of each feature).
+    Excitation: bottleneck MLP -> sigmoid gates in [0,1], one per channel.
+    The block's feature maps are rescaled by these gates, letting global
+    facts (material balance, king danger) modulate local conv features.
+    """
+
+    def __init__(self, num_channels, reduction=8):
+        super().__init__()
+        hidden = max(1, num_channels // reduction)
+        self.fc1 = nn.Linear(num_channels, hidden)
+        self.fc2 = nn.Linear(hidden, num_channels)
+
+    def forward(self, x):
+        s = x.mean(dim=(2, 3))
+        g = torch.sigmoid(self.fc2(F.relu(self.fc1(s))))
+        return x * g.unsqueeze(-1).unsqueeze(-1)
+
+
+class ResidualBlock(nn.Module):
+    """A standard residual block for a ResNet, optionally with SE gating."""
+
+    def __init__(self, num_channels, use_se=False):
         super().__init__()
         self.conv1 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.bn1 = _norm2d(num_channels)
         self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
         self.bn2 = _norm2d(num_channels)
+        self.se = SqueezeExcitation(num_channels) if use_se else None
 
     def forward(self, x):
         residual = x
@@ -37,6 +59,8 @@ class ResidualBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
 
+        if self.se is not None:
+            out = self.se(out)
         out += residual
         out = F.relu(out)
         return out
@@ -98,6 +122,7 @@ class ActorCriticResNet(nn.Module):
         num_filters=DEFAULT_NUM_FILTERS,
         transformer_heads=DEFAULT_TRANSFORMER_HEADS,
         policy_head_style="conv",
+        use_se=False,
     ):
         super().__init__()
 
@@ -108,7 +133,7 @@ class ActorCriticResNet(nn.Module):
         )
 
         self.residual_tower = nn.Sequential(
-            *[ResidualBlock(num_filters) for _ in range(num_residual_blocks)]
+            *[ResidualBlock(num_filters, use_se=use_se) for _ in range(num_residual_blocks)]
         )
 
         self.transformer = BoardTransformerLayer(num_filters, num_heads=transformer_heads)
@@ -170,10 +195,18 @@ def infer_policy_head_style(state_dict) -> str:
     return "dense" if "policy_head.4.weight" in state_dict else "conv"
 
 
+def infer_use_se(state_dict) -> bool:
+    return any(".se." in key for key in state_dict)
+
+
 def net_from_state_dict(state_dict, device="cpu") -> ActorCriticResNet:
-    """Build a net whose policy-head architecture matches the checkpoint, so
-    old (dense-head) and new (conv-head) checkpoints both load at full fidelity.
+    """Build a net whose architecture matches the checkpoint (policy-head style
+    and SE blocks auto-detected), so checkpoints from every generation load at
+    full fidelity.
     """
-    net = ActorCriticResNet(policy_head_style=infer_policy_head_style(state_dict)).to(device)
+    net = ActorCriticResNet(
+        policy_head_style=infer_policy_head_style(state_dict),
+        use_se=infer_use_se(state_dict),
+    ).to(device)
     load_actor_critic_state_dict(net, state_dict)
     return net
