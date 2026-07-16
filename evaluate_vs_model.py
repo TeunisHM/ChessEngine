@@ -5,23 +5,40 @@ from time import perf_counter
 import chess
 import torch
 
-from helper import index_to_move
+from helper import board_to_tensor, index_to_move, legal_moves_mask
 from lookahead import select_moves_with_lookahead
 from models import net_from_state_dict
 
 
+def _raw_policy_index(net, board, device, temperature: float) -> int:
+    """Sample a canonical move index straight from the masked policy (no search)."""
+    state = board_to_tensor(board).unsqueeze(0).to(device)
+    logits, _ = net(state)
+    masked = logits[0].masked_fill(~legal_moves_mask(board).to(device), -1e9)
+    if temperature > 0:
+        dist = torch.distributions.Categorical(logits=masked / temperature)
+        return int(dist.sample().item())
+    return int(masked.argmax().item())
+
+
 def play_game(net_a, net_b, device, *, a_is_white: bool,
-              lookahead_k: int, lookahead_alpha: float, temperature: float):
+              lookahead_k: int, lookahead_alpha: float, temperature: float,
+              raw_a: bool = False, raw_b: bool = False,
+              value_weight: float = 1.0):
     board = chess.Board()
     while not board.is_game_over():
         a_turn = (board.turn == chess.WHITE) == a_is_white
         net = net_a if a_turn else net_b
-        idxs, *_ = select_moves_with_lookahead(
-            net, [board], device,
-            top_k=lookahead_k, alpha=lookahead_alpha,
-            temperature=temperature,
-        )
-        move = index_to_move(int(idxs[0].item()), board)
+        if raw_a if a_turn else raw_b:
+            idx = _raw_policy_index(net, board, device, temperature)
+        else:
+            idxs, *_ = select_moves_with_lookahead(
+                net, [board], device,
+                top_k=lookahead_k, alpha=lookahead_alpha,
+                temperature=temperature, value_weight=value_weight,
+            )
+            idx = int(idxs[0].item())
+        move = index_to_move(idx, board)
         if move is None or move not in board.legal_moves:
             break
         board.push(move)
@@ -37,6 +54,14 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--lookahead-k", type=int, default=8)
     parser.add_argument("--lookahead-alpha", type=float, default=0.33)
+    parser.add_argument("--raw-a", action="store_true",
+                        help="Model A plays the raw policy (no lookahead).")
+    parser.add_argument("--raw-b", action="store_true",
+                        help="Model B plays the raw policy (no lookahead).")
+    parser.add_argument("--value-weight", type=float, default=1.0,
+                        help="Weight on net-derived quiescence values in the "
+                             "search score (0 ablates the learned evaluation; "
+                             "terminal ground truth keeps full weight).")
     args = parser.parse_args()
 
     device = (
@@ -66,6 +91,9 @@ def main():
                 lookahead_k=args.lookahead_k,
                 lookahead_alpha=args.lookahead_alpha,
                 temperature=args.temperature,
+                raw_a=args.raw_a,
+                raw_b=args.raw_b,
+                value_weight=args.value_weight,
             )
             if result == "1-0":
                 if a_is_white:
@@ -94,8 +122,10 @@ def main():
             )
     print()
     print("\n--- Model vs Model ---")
-    print(f"A = {args.model_a}")
-    print(f"B = {args.model_b}")
+    mode_a = "raw" if args.raw_a else f"search vw={args.value_weight}"
+    mode_b = "raw" if args.raw_b else f"search vw={args.value_weight}"
+    print(f"A = {args.model_a} [{mode_a}]")
+    print(f"B = {args.model_b} [{mode_b}]")
     print(f"A wins: {a_wins} (white {a_white_wins}, black {a_black_wins}) | "
           f"Draws: {draws} | B wins: {b_wins}")
     print("----------------------\n")

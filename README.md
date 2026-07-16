@@ -1,35 +1,19 @@
-# Chess Engine with A2C
+# Chess Engine with PPO and Lookahead Search
 
-This project implements a chess engine that learns to play chess through self-play using an Actor-Critic (A2C) reinforcement learning algorithm. The engine is built in Python and uses the `python-chess` library for board logic and `PyTorch` for the neural network.
+This project implements a chess engine trained with PPO, supervised PGN pretraining,
+checkpoint/engine opponents, and value-guided quiescence search. It uses
+`python-chess` for board logic and PyTorch for the policy/value network.
 
 ## Project Structure
 
-```
-/home/teunis/python/ChessEngine/
-├───.gitignore
-├───helper.py
-├───logger.py
-├───train.py
-├───Visualize.py
-├───test_helper.py
-├───requirements.txt
-├───__pycache__/
-├───.git/...
-├───conv_white_capture/
-├───decent_models/
-├───eval_logs/...
-├───runs/...
-└───venv/
-```
-
-- **`train.py`**: The main script for training the chess agent. It contains the A2C training loop, the model definition, and the self-play logic.
+- **`train.py`**: PPO training, rollout generation, and diagnostics.
+- **`models.py`**: Policy/value network definitions and checkpoint-compatible loading.
+- **`lookahead.py`**: Widened policy-candidate lookahead and quiescence search.
 - **`helper.py`**: Contains helper functions for converting the chess board to a tensor, encoding and decoding moves, and creating a legal moves mask.
 - **`test_helper.py`**: Unit tests for the functions in `helper.py` to ensure the board representation and move encoding/decoding are correct.
-- **`Visualize.py`**: A utility for visualizing games in the console.
 - **`requirements.txt`**: A list of the Python packages required to run the project.
-- **`runs/`**: The directory where TensorBoard logs are stored.
-- **`eval_logs/`**: The directory where evaluation logs are stored.
-- **`decent_models/`**: A directory to store trained model checkpoints.
+- **`logs/`**: Evaluation, console, and H2H logs.
+- **`models/`**: Supervised seeds and PPO checkpoints.
 
 ## Installation
 
@@ -53,15 +37,33 @@ This project implements a chess engine that learns to play chess through self-pl
     pip install -r requirements.txt
     ```
 
-## Training the Agent
+## Training
 
-To start the training process, run the `train.py` script:
+On the Radeon 8060S, use the isolated `venv-rocm` environment. The entry point
+selects MIOpen `FAST` fallback and keeps AMP off because FP16 gradients are not
+finite on the current gfx1151 stack. Specify the initializer and run identity
+explicitly:
 
 ```bash
-python3 train.py
+MIOPEN_FIND_MODE=FAST venv-rocm/bin/python train.py \
+    --init-from models/ppo_search_v13_ppo_control_seed1301_checkpoint_99.pt \
+    --model-name ppo_search_v14 \
+    --num-batches 400 \
+    --eval-interval 50 \
+    --seed 1401
 ```
 
-This will initialize a new model (or load a pre-trained one if a checkpoint is found) and begin the self-play training loop. Training progress, including losses, rewards, and evaluation metrics, will be logged to the `runs/` directory.
+This loads model weights but starts a fresh optimizer and 400-batch cosine
+scheduler. The normal entrypoint uses raw-policy PPO rollouts, no distillation,
+and FP32. Use a distinct model name for every phase.
+
+## Completed v13 Experiment
+
+The pure-PPO control beat v11@399 70W/29D/2L and beat the search-training arm
+82W/16D/3L. The search arm lost to v11@399 17W/45D/39L. Both sides used the
+same lookahead search during H2H evaluation; "pure PPO" refers only to rollout
+generation. See `logs/v13_matched_experiment_final_report_20260715.md` for the
+full analysis.
 
 ## Supervised Pretraining from PGNs
 
@@ -71,24 +73,20 @@ You can optionally warm-start the model on real games before reinforcement learn
 python pretrain_from_pgn.py --pgn /path/to/games.pgn --max-games 5000 --epochs 5 --output-model pretrained.pt
 ```
 
-The resulting checkpoint (`pretrained.pt` in the example) can be supplied to `train.py` by renaming it to the expected model file (e.g., `actor_critic_chess_resnet_v4.pt`) or by loading it manually in your workflow.
+Supply a resulting checkpoint to `train.py` with `--init-from` when starting a
+new run.
 
 ### Monitoring Training
 
-You can monitor the training progress in real-time using TensorBoard. To launch TensorBoard, run the following command in a separate terminal:
-
-```bash
-tensorboard --logdir=runs
-```
-
-This will start a web server where you can view various training metrics, such as the total loss, actor and critic losses, entropy, and evaluation results.
+Training prints rollout, PPO, and opponent outcome diagnostics to the console.
+Periodic evaluation summaries are written to CSV files under `logs/`.
 
 ## Testing
 
 To ensure the core components of the project are working correctly, you can run the unit tests for the helper functions:
 
 ```bash
-python3 -m unittest test_helper.py
+python -m unittest test_helper.py
 ```
 
-These tests verify the board-to-tensor conversion, move encoding/decoding, and legal moves mask generation.
+These tests verify board/move encoding and legal masks.

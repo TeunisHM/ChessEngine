@@ -1,3 +1,4 @@
+import argparse
 import csv
 import math
 import os
@@ -26,7 +27,6 @@ from models import ActorCriticResNet, load_actor_critic_state_dict, net_from_sta
 from evaluate_vs_random import evaluate_vs_random
 
 MODELS_DIR = "models"
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 PIECE_VALUES = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -121,7 +121,9 @@ def _load_random_opponent(device: str):
     """Pick a random checkpoint from MODELS_DIR and return it as an eval-mode net."""
     if not os.path.isdir(MODELS_DIR):
         return None, None
-    files = [f for f in os.listdir(MODELS_DIR) if f.endswith(".pt")]
+    files = [
+        filename for filename in os.listdir(MODELS_DIR) if filename.endswith(".pt")
+    ]
     if not files:
         return None, None
     random.shuffle(files)
@@ -470,7 +472,14 @@ def _cosine_lr_lambda(total_steps: int, min_ratio: float = 0.1):
     return lr_lambda
 
 
-def _eval_old_policy(actor_critic_net, states, masks, actions, mb_size, amp_enabled):
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _eval_old_policy(actor_critic_net, states, masks, actions, mb_size):
     """Snapshot old-policy log-probs and values in eval mode for PPO baseline."""
     was_training = actor_critic_net.training
     actor_critic_net.eval()
@@ -481,12 +490,11 @@ def _eval_old_policy(actor_critic_net, states, masks, actions, mb_size, amp_enab
             mb = max(1, min(int(mb_size), n))
             for start in range(0, n, mb):
                 end = min(start + mb, n)
-                with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    logits, values = actor_critic_net(states[start:end])
-                    masked = logits.masked_fill(~masks[start:end], -1e9)
-                    dist = torch.distributions.Categorical(logits=masked)
-                    old_lps.append(dist.log_prob(actions[start:end]).float())
-                    old_vs.append(values.view(-1).float())
+                logits, values = actor_critic_net(states[start:end])
+                masked = logits.masked_fill(~masks[start:end], -1e9)
+                dist = torch.distributions.Categorical(logits=masked)
+                old_lps.append(dist.log_prob(actions[start:end]).float())
+                old_vs.append(values.view(-1).float())
     finally:
         if was_training:
             actor_critic_net.train()
@@ -526,12 +534,13 @@ def train_actor_critic(actor_critic_net,
                        trainee_search: bool = False,
                        distill_weight: float = 0.0,
                        tablebase_path: Optional[str] = "syzygy",
-                       tablebase_terminate_prob: float = 1.0):
+                       tablebase_terminate_prob: float = 1.0,
+                       seed: Optional[int] = None):
     """PPO training loop with self-play, optional checkpoint and engine opponents."""
+    if seed is not None:
+        _seed_everything(seed)
     actor_critic_net.to(device)
     scheduler = LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(num_batches, 0.1))
-    amp_enabled = bool(device == "cuda" and torch.cuda.is_available())
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     mirror_perm = MIRROR_ACTION_PERM.to(device)
 
     engine_pool: Optional[EnginePool] = None
@@ -579,6 +588,7 @@ def train_actor_critic(actor_critic_net,
         "lookahead_k": lookahead_k, "lookahead_alpha": lookahead_alpha,
         "trainee_search": trainee_search, "distill_weight": distill_weight,
         "tablebase_path": tablebase_path, "tablebase_terminate_prob": tablebase_terminate_prob,
+        "seed": seed,
         "optimizer": type(optimizer).__name__,
         "lr": [g["lr"] for g in optimizer.param_groups],
     }
@@ -702,9 +712,9 @@ def train_actor_critic(actor_critic_net,
             # early-stop diagnostic so it always measures *policy drift*.
             pi_old_lp_t, old_v_t = _eval_old_policy(
                 actor_critic_net, states_t, masks_t, actions_t,
-                ppo_minibatch_size, amp_enabled,
+                ppo_minibatch_size,
             )
-            if trainee_search and old_lps:
+            if trainee_search_now and old_lps:
                 # IS ratio uses log b (the search behavior policy) as denominator,
                 # so the actor loss is π_new(a|s) / b(a|s) — correct under search
                 # rollouts. Mirror states inherit b by symmetry of the search.
@@ -740,54 +750,46 @@ def train_actor_critic(actor_critic_net,
                     mb_adv = advantages[mb]
                     mb_ret = returns_t[mb]
 
-                    with torch.amp.autocast("cuda", enabled=amp_enabled):
-                        logits, values = actor_critic_net(mb_states)
-                        masked = logits.masked_fill(~mb_masks, -1e9)
-                        dist = torch.distributions.Categorical(logits=masked)
-                        new_lp = dist.log_prob(mb_actions)
-                        entropies = dist.entropy()
-                        ratios = torch.exp(new_lp - mb_old_lp)
-                        clipped = torch.clamp(ratios, 1.0 - ppo_clip_ratio, 1.0 + ppo_clip_ratio)
-                        actor_loss = -torch.min(ratios * mb_adv, clipped * mb_adv).mean()
-                        critic_loss = F.mse_loss(values.view(-1), mb_ret)
-                        entropy_loss = -entropies.mean()
-                        if distill_on:
-                            # Soft cross-entropy toward the search distribution b:
-                            #   per-state loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
-                            # Outcome-filtered: only states where the search-chosen action
-                            # had positive advantage contribute. This aligns the distill
-                            # gradient with the PPO actor signal (also advantage-weighted)
-                            # — search picks that the rollout vindicated reinforce π;
-                            # search picks that lost don't get copied. Without this filter,
-                            # the asymmetric clip protects the actor but distill flows
-                            # unrestricted, dragging π toward b's biased choices.
-                            new_log_pi = F.log_softmax(masked, dim=1)
-                            new_log_pi_topk = new_log_pi.gather(1, topk_idx_t[mb])
-                            mb_b_topk = log_b_topk_t[mb].exp()
-                            distill_per_state = -(mb_b_topk * new_log_pi_topk).sum(dim=1)
-                            pos_mask = (mb_adv > 0).float()
-                            n_pos = pos_mask.sum().clamp(min=1.0)
-                            distill_loss = (distill_per_state * pos_mask).sum() / n_pos
-                        else:
-                            distill_loss = torch.zeros((), device=device)
-                        total_loss = (
-                            actor_loss
-                            + critic_loss_weight * critic_loss
-                            + entropy_weight * entropy_loss
-                            + distill_weight * distill_loss
-                        )
+                    logits, values = actor_critic_net(mb_states)
+                    masked = logits.masked_fill(~mb_masks, -1e9)
+                    dist = torch.distributions.Categorical(logits=masked)
+                    new_lp = dist.log_prob(mb_actions)
+                    entropies = dist.entropy()
+                    ratios = torch.exp(new_lp - mb_old_lp)
+                    clipped = torch.clamp(ratios, 1.0 - ppo_clip_ratio, 1.0 + ppo_clip_ratio)
+                    actor_loss = -torch.min(ratios * mb_adv, clipped * mb_adv).mean()
+                    critic_loss = F.mse_loss(values.view(-1), mb_ret)
+                    entropy_loss = -entropies.mean()
+                    if distill_on:
+                        # Soft cross-entropy toward the search distribution b:
+                        #   per-state loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
+                        # Outcome-filtered: only states where the search-chosen action
+                        # had positive advantage contribute. This aligns the distill
+                        # gradient with the PPO actor signal (also advantage-weighted)
+                        # — search picks that the rollout vindicated reinforce π;
+                        # search picks that lost don't get copied. Without this filter,
+                        # the asymmetric clip protects the actor but distill flows
+                        # unrestricted, dragging π toward b's biased choices.
+                        new_log_pi = F.log_softmax(masked, dim=1)
+                        new_log_pi_topk = new_log_pi.gather(1, topk_idx_t[mb])
+                        mb_b_topk = log_b_topk_t[mb].exp()
+                        distill_per_state = -(mb_b_topk * new_log_pi_topk).sum(dim=1)
+                        pos_mask = (mb_adv > 0).float()
+                        n_pos = pos_mask.sum().clamp(min=1.0)
+                        distill_loss = (distill_per_state * pos_mask).sum() / n_pos
+                    else:
+                        distill_loss = torch.zeros((), device=device)
+                    total_loss = (
+                        actor_loss
+                        + critic_loss_weight * critic_loss
+                        + entropy_weight * entropy_loss
+                        + distill_weight * distill_loss
+                    )
 
                     optimizer.zero_grad()
-                    if amp_enabled:
-                        scaler.scale(total_loss).backward()
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
-                        optimizer.step()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
+                    optimizer.step()
 
                     with torch.no_grad():
                         # Trust-region check: drift of π_new from π_old, NOT from b.
@@ -879,24 +881,59 @@ def train_actor_critic(actor_critic_net,
             tablebase.close()
 
 
-if __name__ == "__main__":
-    # v12: SE blocks in the residual tower on top of v11's conv policy head.
-    # Same pipeline as v11: fresh PGN-pretrained seed, one 400-batch run,
-    # H2H vs v11@399. One variable (SE), one bar to clear.
-    actor_critic_net = ActorCriticResNet(use_se=True).to(device)
-    model_name = "ppo_search_v12"
-    init_from = "pretrained_conv_se.pt"
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the chess actor-critic model.")
+    parser.add_argument(
+        "--init-from", required=True,
+        help="Model checkpoint used as the warm-start weights.",
+    )
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--num-batches", type=int, default=400)
+    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=1401)
+    parser.add_argument("--device", default=None)
+    return parser.parse_args()
 
-    if os.path.exists(init_from):
-        print(f"Loading initial weights from: {init_from}")
-        try:
-            load_actor_critic_state_dict(
-                actor_critic_net, torch.load(init_from, map_location=device)
-            )
-        except Exception as e:
-            print(f"[WARN] Init checkpoint incompatible ({e}); initializing fresh weights.")
-    else:
-        print(f"[WARN] {init_from} not found; initializing fresh weights.")
+
+def main() -> None:
+    args = _parse_args()
+    run_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.version.hip is not None:
+        os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
+    run_config = {
+        "model_name": args.model_name,
+        "init_from": args.init_from,
+        "num_batches": args.num_batches,
+        "eval_interval": args.eval_interval,
+        "eval_games": args.eval_games,
+        "seed": args.seed,
+        "device": run_device,
+        "torch": torch.__version__,
+        "hip": torch.version.hip,
+        "precision": "fp32",
+        "miopen_find_mode": os.environ.get("MIOPEN_FIND_MODE"),
+        "trainee_search": False,
+        "distill_weight": 0.0,
+    }
+    print("[INFO] training configuration")
+    for key, value in run_config.items():
+        print(f"  {key}={value}")
+
+    if not os.path.exists(args.init_from):
+        raise SystemExit(f"Initial checkpoint not found: {args.init_from}")
+
+    actor_critic_net = ActorCriticResNet(use_se=False).to(run_device)
+    print(f"Loading initial weights from: {args.init_from}")
+    incompatible = load_actor_critic_state_dict(
+        actor_critic_net, torch.load(args.init_from, map_location=run_device)
+    )
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Initial checkpoint did not load at full fidelity: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
 
     optimizer = torch.optim.AdamW(
         actor_critic_net.parameters(), lr=5e-5, betas=(0.9, 0.999), weight_decay=0.0
@@ -904,12 +941,12 @@ if __name__ == "__main__":
 
     train_actor_critic(
         actor_critic_net=actor_critic_net,
-        model_name=model_name,
+        model_name=args.model_name,
         optimizer=optimizer,
-        device=device,
-        num_batches=400,
-        eval_interval=50,
-        eval_games=100,
+        device=run_device,
+        num_batches=args.num_batches,
+        eval_interval=args.eval_interval,
+        eval_games=args.eval_games,
         gamma=0.98,
         gae_lamb=0.95,
         critic_loss_weight=0.5,
@@ -930,10 +967,15 @@ if __name__ == "__main__":
         engine_skill_level=0,
         step_penalty=0.001,
         draw_penalty=0.1,
-        material_shaping_per_pawn=0.025,  
+        material_shaping_per_pawn=0.025,
         lookahead_k=4,
         lookahead_alpha=0.3,
-        trainee_search=True,  # only fires in checkpoint-opponent batches; pure π elsewhere.
-        distill_weight=0.025,
+        trainee_search=False,
+        distill_weight=0.0,
         tablebase_terminate_prob=0.25,
+        seed=args.seed,
     )
+
+
+if __name__ == "__main__":
+    main()

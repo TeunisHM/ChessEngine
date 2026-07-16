@@ -6,7 +6,7 @@ import chess
 import chess.engine
 import torch
 
-from helper import index_to_move
+from helper import board_to_tensor, index_to_move, legal_moves_mask
 from lookahead import select_moves_with_lookahead
 from models import ActorCriticResNet, net_from_state_dict
 
@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         default=0.33,
         help="Weight on log pi(a) in the lookahead score: -V(child) + alpha*log pi.",
     )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Play the raw policy (no lookahead search).",
+    )
     return parser.parse_args()
 
 def _create_engine(path: str, skill: Optional[int]) -> chess.engine.SimpleEngine:
@@ -90,6 +95,7 @@ def _play_game(
     engine_move_time: float,
     lookahead_k: int = 8,
     lookahead_alpha: float = 0.33,
+    raw: bool = False,
 ) -> Dict[str, int]:
     board = chess.Board()
     is_policy_white = (game_index % 2 == 0)
@@ -101,12 +107,25 @@ def _play_game(
         )
 
         if policy_turn:
-            idxs, *_ = select_moves_with_lookahead(
-                net, [board], device,
-                top_k=lookahead_k, alpha=lookahead_alpha,
-                temperature=temperature,
-            )
-            move = index_to_move(int(idxs[0].item()), board)
+            if raw:
+                state = board_to_tensor(board).unsqueeze(0).to(device)
+                logits, _ = net(state)
+                masked = logits[0].masked_fill(
+                    ~legal_moves_mask(board).to(device), -1e9
+                )
+                if temperature > 0:
+                    dist = torch.distributions.Categorical(logits=masked / temperature)
+                    idx = int(dist.sample().item())
+                else:
+                    idx = int(masked.argmax().item())
+            else:
+                idxs, *_ = select_moves_with_lookahead(
+                    net, [board], device,
+                    top_k=lookahead_k, alpha=lookahead_alpha,
+                    temperature=temperature,
+                )
+                idx = int(idxs[0].item())
+            move = index_to_move(idx, board)
             if move is None or move not in board.legal_moves:
                 move = next(iter(board.legal_moves))
         else:
@@ -168,6 +187,7 @@ def main() -> None:
                 engine_move_time=args.engine_move_time,
                 lookahead_k=args.lookahead_k,
                 lookahead_alpha=args.lookahead_alpha,
+                raw=args.raw,
             )
             game_lengths.append(stats["plies"])
             result = stats["result"]
@@ -194,6 +214,8 @@ def main() -> None:
         engine.quit()
 
     print("\n--- Evaluation vs Engine ---")
+    print(f"Model: {args.model} [{'raw' if args.raw else 'search'}] | "
+          f"skill={args.engine_skill_level} move_time={args.engine_move_time}")
     print(f"Wins: {wins} | Draws: {draws} | Losses: {losses}")
     print(f"Policy as White Wins: {policy_white_wins} | Policy as Black Wins: {policy_black_wins}")
     print(f"Avg plies per game: {sum(game_lengths) / max(1, len(game_lengths)):.1f}")

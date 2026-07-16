@@ -196,6 +196,7 @@ def select_moves_with_lookahead(
     alpha: float = 0.33,
     temperature: float = 0.0,
     max_qdepth: int = 2,
+    value_weight: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pick a move per board via *widened* candidate set + value quiescence.
@@ -292,7 +293,10 @@ def select_moves_with_lookahead(
         child_values = quiesce_batched(net, child_boards, device, max_qdepth=max_qdepth)
         rows_t = torch.tensor(child_rows, device=device, dtype=torch.long)
         cols_t = torch.tensor(child_cols, device=device, dtype=torch.long)
-        neg_v.index_put_((rows_t, cols_t), -child_values.to(neg_v.dtype))
+        # value_weight scales only net-derived quiescence values; ground-truth
+        # terminal entries (checkmate/stalemate children) keep full weight, so
+        # value_weight=0 ablates the learned evaluation but not mate detection.
+        neg_v.index_put_((rows_t, cols_t), -child_values.to(neg_v.dtype) * value_weight)
 
     score = neg_v + alpha * topk_logp
     score = score.masked_fill(is_invalid, -1e9)

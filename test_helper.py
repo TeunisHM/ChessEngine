@@ -2,7 +2,13 @@
 import unittest
 import chess
 import torch
-from helper import board_to_tensor, move_to_index, index_to_move, legal_moves_mask
+from helper import (
+    BOARD_TENSOR_PLANES,
+    board_to_tensor,
+    index_to_move,
+    legal_moves_mask,
+    move_to_index,
+)
 
 class TestHelperFunctions(unittest.TestCase):
 
@@ -12,7 +18,7 @@ class TestHelperFunctions(unittest.TestCase):
         tensor = board_to_tensor(board)
 
         # --- Shape and Type ---
-        self.assertEqual(tensor.shape, (18, 8, 8))
+        self.assertEqual(tensor.shape, (BOARD_TENSOR_PLANES, 8, 8))
         self.assertEqual(tensor.dtype, torch.float32)
 
         # --- Player's Turn (White) ---
