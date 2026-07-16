@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Play the raw policy (no lookahead search).",
     )
+    parser.add_argument(
+        "--value-weight",
+        type=float,
+        default=1.0,
+        help="Weight on net-derived quiescence values in the search score.",
+    )
     return parser.parse_args()
 
 def _create_engine(path: str, skill: Optional[int]) -> chess.engine.SimpleEngine:
@@ -96,6 +102,7 @@ def _play_game(
     lookahead_k: int = 8,
     lookahead_alpha: float = 0.33,
     raw: bool = False,
+    value_weight: float = 1.0,
 ) -> Dict[str, int]:
     board = chess.Board()
     is_policy_white = (game_index % 2 == 0)
@@ -122,7 +129,7 @@ def _play_game(
                 idxs, *_ = select_moves_with_lookahead(
                     net, [board], device,
                     top_k=lookahead_k, alpha=lookahead_alpha,
-                    temperature=temperature,
+                    temperature=temperature, value_weight=value_weight,
                 )
                 idx = int(idxs[0].item())
             move = index_to_move(idx, board)
@@ -188,6 +195,7 @@ def main() -> None:
                 lookahead_k=args.lookahead_k,
                 lookahead_alpha=args.lookahead_alpha,
                 raw=args.raw,
+                value_weight=args.value_weight,
             )
             game_lengths.append(stats["plies"])
             result = stats["result"]
@@ -214,7 +222,10 @@ def main() -> None:
         engine.quit()
 
     print("\n--- Evaluation vs Engine ---")
-    print(f"Model: {args.model} [{'raw' if args.raw else 'search'}] | "
+    mode = "raw" if args.raw else (
+        f"search k={args.lookahead_k} a={args.lookahead_alpha} vw={args.value_weight}"
+    )
+    print(f"Model: {args.model} [{mode}] | "
           f"skill={args.engine_skill_level} move_time={args.engine_move_time}")
     print(f"Wins: {wins} | Draws: {draws} | Losses: {losses}")
     print(f"Policy as White Wins: {policy_white_wins} | Policy as Black Wins: {policy_black_wins}")
