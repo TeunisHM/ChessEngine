@@ -58,11 +58,24 @@ priority order:
    rollout states only (NOT an isolated fine-tune — that regressed, see
    `project_tb_pretrain_regresses`). Build a TB-won conversion testsuite as
    the metric first.
-3. **v15 generational run**: whatever recipe change, fresh comparison against
-   control@99-raw with raw-vs-raw H2H as the bar. If the policy-scale search
-   confirms positive, consider it for checkpoint-batch rollouts too (but the
-   v13 search arm's off-policy PPO failure still applies — eval-time use only
-   unless the IS story is rethought).
+3. **Re-insert search in training (staged; user-endorsed 2026-07-17)**. The
+   v13 arm failed because old-formula b was near-uniform (72–75% of ratios
+   outside clip); new-formula b ∝ π·e^(−βV) keeps ratios ~e^(±β·ΔV), so the
+   pathology should shrink an order of magnitude. Stages, each gated:
+   (a) **Freebie first**: v14's checkpoint *opponents* still used the broken
+   α=0.3 formula (`_checkpoint_opponent_fn` inherits run lookahead args) —
+   fixing opponent search to α=1/β=2 is zero-PPO-risk and hardens the
+   curriculum; legitimate standalone v15 variable.
+   (b) Plumb `value_weight` + trainee/opponent search flags through train.py
+   CLI (v14 CLI hardcodes trainee_search=False).
+   (c) Diagnostics-only: 5–10 batches, trainee search-behavior at β=1, read
+   `kl_b_pi` + initial clip fraction. Gate: <~30% outside clip (v13 arm was
+   72–75%), else lower β.
+   (d) Matched pair from same init (v13 design): search-behavior arm vs
+   pure-PPO control, 100 batches, H2H both raw-vs-raw and new-search-wrapped.
+   Distillation stays off throughout (v5/v7/v8 unchanged).
+4. **v15 generational run**: whatever recipe change wins above, fresh
+   comparison against control@99-raw with raw-vs-raw H2H as the bar.
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
