@@ -4,7 +4,44 @@ Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
-Nothing is running. v14 (300-batch warm-start from v13 control@99) completed
+**v15 matched-pair search-in-training test SUCCEEDED — biggest single-run gain
+to date.** Two 150-batch arms from the same init (v14@299, seed 1401):
+`ppo_search_v15_search` (`--trainee-search --lookahead-alpha 1.0
+--value-weight 1.0`, trainee samples from policy-scale search in checkpoint
+AND engine batches, pure π in self-play) vs `ppo_search_v15_control`
+(identical, no trainee search). Both arms' checkpoint opponents used the
+fixed formula (α=1, β=1) so the single manipulated variable was trainee
+search-behavior. Gate held: search-batch clip fraction ~0.39–0.48 but
+`π↔search KL` only 0.024–0.040 nats (disagree ~20–25%) — a mild perturbation
+of π, nothing like v13's near-uniform behavior policy (72–75% outside clip
+from a *saturated* distribution, not just a narrow band). H2H results
+(101 games, temp 1.0, raw-vs-raw unless noted):
+
+- **v15-search-raw vs v15-control-raw: 67W/24D/10L → +222 Elo, CI [+140,+304]**
+- **v15-search-raw vs v14-raw: 56W/21D/24L → +114 Elo, CI [+43,+185] — real
+  generational gain, on par with v11's historic +114**
+- v15-control-raw vs v14-raw: 29W/25D/47L → **−63 Elo, CI [−131,+6]** (z=−1.82,
+  leans real but not 95%-significant) — plain PPO continuation likely
+  *regressed* against the harder shared curriculum (both arms' opponents got
+  stronger from the formula fix; the search arm's own moves coped, the
+  pure-π control arm apparently didn't)
+- search-raw vs search-search(β=2) on the v15-search checkpoint: wrapper wins
+  46/21/34, +41 Elo, CI [−27,+110] — same inconclusive-but-positive pattern
+  as the v14 self-match; still unresolved without paired openings
+
+**v15-search@149 is the new strongest known model.** Files:
+`models/ppo_search_v15_search_checkpoint_149.pt` (promote as next baseline),
+`models/ppo_search_v15_control_checkpoint_149.pt` (kept for the record, not
+a baseline candidate). Full match log: `logs/v15_h2h_suite_20260717.log`;
+training logs `logs/v15_search_run.log` / `logs/v15_control_run.log`.
+
+**Infra fix along the way**: `evaluate_vs_model.py` / `evaluate_vs_engine.py`
+never set `MIOPEN_FIND_MODE=FAST` (only `train.py` did), so on gfx1151
+(unreadable packaged FindDb) raw-policy forward passes hard-failed with
+`miopenStatusUnknownError`. Both scripts now set it via
+`os.environ.setdefault` at import time, mirroring train.py.
+
+v14 (300-batch warm-start from v13 control@99) completed
 2026-07-16 and **gained nothing: v14@299-raw vs control@99-raw is a statistical
 tie** (36W/32D/33L). But the post-mortem produced the day's real findings:
 
@@ -26,10 +63,10 @@ tie** (36W/32D/33L). But the post-mortem produced the day's real findings:
    raw 11W/6D/84L = 13.9% — externally validates the in-training vs-SF
    counter (~14%); old-formula search collapses it to 4.5%.
 
-**Strongest known agents: v13-control@99-raw ≈ v14@299-raw (tied).** All
-evaluation should default to raw-vs-raw (or the policy-scale search once
-confirmed); `evaluate_vs_model.py` has `--raw-a/--raw-b/--value-weight`,
-`evaluate_vs_engine.py` has `--raw`.
+**Strongest known model: v15-search@149-raw (+114 Elo over v14@299-raw,
+2026-07-17 — see Current state).** All evaluation should default to
+raw-vs-raw (or the policy-scale search once confirmed); `evaluate_vs_model.py`
+has `--raw-a/--raw-b/--value-weight`, `evaluate_vs_engine.py` has `--raw`.
 
 - **v11** = two changes over v10: (1) **conv policy head** (`ConvPolicyHead` in `models.py`: 3×3 conv → GN → ReLU → 1×1 conv to 73 planes, square-major reshape; 157k params vs the legacy dense head's 603k), and (2) **fresh lineage** — seeded from `pretrained_conv.pt` (two 3-epoch PGN passes over the lichess elite files; 42.2% top-1 move accuracy vs 37.5% for the dense head on the identical recipe), *not* warm-started from v10. Trained 2026-07-12/13, 400 batches of the v10 recipe, clean exit.
 - **H2H run 2026-07-13** (`logs/h2h_v11-399_vs_v10-399_*.log`), 101 games, temp=1.0, k=4, α=0.3:
@@ -44,38 +81,36 @@ confirmed); `evaluate_vs_model.py` has `--raw-a/--raw-b/--value-weight`,
 
 ## Next steps
 
-v14 ran (300 batches, seed 1401) and was flat — plain warm-start continuation
-is confirmed dead as a gain source (v4/v10 pattern). Candidates, in rough
-priority order:
+v15 search-in-training test succeeded (+114 Elo over v14, +222 over the
+matched pure-PPO control — see Current state). Candidates, in rough priority
+order:
 
-1. **Eval hygiene before any close call**: seed + paired opening suite + PGN
-   output in `evaluate_vs_model.py`, then a confirmation match of the
-   policy-scale search (`--lookahead-alpha 1.0 --value-weight 2.0`) vs raw —
-   +45 Elo on 101 games needs pairing to resolve.
-2. **Conversion/endgame fix** (draws-with-winning-material gap): DTZ-aware
+1. **Promote v15-search@149 to baseline** for all future comparisons and as
+   the next `--init-from`. Update any scripts/docs still pointing at v14.
+2. **v16 generational run from v15-search@149**: same recipe
+   (`--trainee-search --lookahead-alpha 1.0 --value-weight 1.0`) continued
+   for another 150-300 batches, since this is now a validated gain source
+   rather than a dead continuation pattern. H2H raw-vs-raw vs v15-search@149
+   as the bar. Watch whether the gain compounds or is a one-time unlock (the
+   v4/v10 "continuations are flat" pattern applied to *pure-PPO* continuation
+   — untested whether search-behavior continuation behaves differently).
+3. **Investigate the control-arm regression** (−63 Elo vs v14, CI [−131,+6]):
+   plain PPO continuation against the harder shared curriculum (opponents now
+   fixed-formula, stronger) may have actively hurt rather than merely
+   plateaued. Not blocking — the search arm is what we're keeping — but worth
+   understanding before assuming future pure-PPO continuations are simply
+   "flat."
+4. **Conversion/endgame fix** (draws-with-winning-material gap): DTZ-aware
    potential shaping inside the ≤5-man domain (`probe_dtz`; dense progress
    signal that WDL lacks), or joint TB-supervised auxiliary loss on TB-domain
    rollout states only (NOT an isolated fine-tune — that regressed, see
    `project_tb_pretrain_regresses`). Build a TB-won conversion testsuite as
-   the metric first.
-3. **Re-insert search in training (staged; user-endorsed 2026-07-17)**. The
-   v13 arm failed because old-formula b was near-uniform (72–75% of ratios
-   outside clip); new-formula b ∝ π·e^(−βV) keeps ratios ~e^(±β·ΔV), so the
-   pathology should shrink an order of magnitude. Stages, each gated:
-   (a) **Freebie first**: v14's checkpoint *opponents* still used the broken
-   α=0.3 formula (`_checkpoint_opponent_fn` inherits run lookahead args) —
-   fixing opponent search to α=1/β=2 is zero-PPO-risk and hardens the
-   curriculum; legitimate standalone v15 variable.
-   (b) Plumb `value_weight` + trainee/opponent search flags through train.py
-   CLI (v14 CLI hardcodes trainee_search=False).
-   (c) Diagnostics-only: 5–10 batches, trainee search-behavior at β=1, read
-   `kl_b_pi` + initial clip fraction. Gate: <~30% outside clip (v13 arm was
-   72–75%), else lower β.
-   (d) Matched pair from same init (v13 design): search-behavior arm vs
-   pure-PPO control, 100 batches, H2H both raw-vs-raw and new-search-wrapped.
-   Distillation stays off throughout (v5/v7/v8 unchanged).
-4. **v15 generational run**: whatever recipe change wins above, fresh
-   comparison against control@99-raw with raw-vs-raw H2H as the bar.
+   the metric first. User: "later we can implement DTZ."
+5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
+   paired opening suite + PGN output in `evaluate_vs_model.py`. Still the
+   right tool for the still-unresolved β=2-wrapper-vs-raw question (+41 Elo,
+   CI [−27,+110] on the new model, same inconclusive pattern as v14), but not
+   blocking anything now.
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
@@ -87,6 +122,8 @@ finite.
 
 | Run | Init | Recipe change | Result |
 |---|---|---|---|
+| **v15-search (succeeded, +114 Elo, new baseline)** | v14@299 | Fixed-formula search (α=1, β=1): checkpoint opponents in both arms use it; search arm also samples trainee behavior from it in checkpoint+engine batches (self-play stays pure π); 150 batches, seed 1401 | H2H **56W/21D/24L vs v14-raw** (+114, CI [+43,+185]); **67W/24D/10L vs matched control-raw** (+222, CI [+140,+304]) |
+| v15-control (regressed?, −63 Elo) | v14@299 | Same run, no trainee search (pure-π continuation against the same harder curriculum) | H2H **29W/25D/47L vs v14-raw** (−63, CI [−131,+6], z=−1.82 — leans real, not 95%-significant); decisively behind v15-search |
 | v14 (flat) | v13 control@99 | Pure warm-start continuation, 300 batches, seed 1401, dynamic curriculum incl. v13/v14 checkpoints | **Raw-vs-raw tie with init** (36W/32D/33L); within-run proxies healthy but no gain — continuations don't stack |
 | **v13 PPO control (succeeded, +284 Elo search-wrapped / +232 raw)** | v11@399 | Raw-policy trainee rollouts; no distillation; 100-batch matched diagnostic | H2H **70W/29D/2L vs v11@399** (search-wrapped); **65W/30D/6L raw-vs-raw**; **strongest baseline** |
 | v13 search arm (failed, -77 Elo) | v11@399 | Search behavior on checkpoint batches; `b_search` PPO denominator; positive-advantage distillation 0.025 | H2H **17W/45D/39L vs v11@399**; initial search-batch clip fraction 72-75%; do not continue |
@@ -108,10 +145,12 @@ finite.
 - Quiescence has in-check evasion handling (stand-pat skipped in check; recursion floor at depth ≤ 0).
 
 ### `train.py`
-- The normal entrypoint is pure PPO: raw-policy trainee actions,
-  `trainee_search=False`, and `distill_weight=0.0`.
-- The generic search/distillation implementation remains available to callers,
-  but it is not exposed as part of the v14 CLI.
+- Default entrypoint is pure PPO (`trainee_search=False`, `distill_weight=0.0`).
+  As of 2026-07-17 the CLI exposes `--trainee-search`, `--lookahead-alpha`
+  (default 1.0) and `--value-weight` (default 1.0): the policy-scale search
+  formula, shared by checkpoint opponents and (when enabled) the trainee
+  behavior policy. Trainee search applies in checkpoint AND engine batches,
+  never self-play. Distillation is not CLI-exposed.
 - **Per-batch PPO denominator gate**: recorded search behavior probabilities
   are used only when `trainee_search_now=True`; pure-PPO batches use `pi_old`.
 - **Outcome-filtered distillation** remains dormant with weight 0.
@@ -129,8 +168,9 @@ finite.
 - `temperature=1.0`, `ppo_clip_ratio=0.2`, `target_kl=0.015`, `ppo_minibatch_size=256`
 - `opponent_ratio=0.45`, `engine_ratio=0.1`, `engine_skill_level=0`, `engine_move_time=0.01`
 - `step_penalty=0.001`, `draw_penalty=0.1`, `material_shaping_per_pawn=0.025`
-- `lookahead_k=4`, `lookahead_alpha=0.3`; `trainee_search=False`,
-  `distill_weight=0.0`.
+- `lookahead_k=4`; `lookahead_alpha`/`value_weight` now CLI (default 1.0/1.0 —
+  the policy-scale formula; v14 itself ran the old α=0.3);
+  `trainee_search` CLI flag (default off), `distill_weight=0.0`.
 - `tablebase_terminate_prob=0.25`
 - Optimizer: AdamW, lr=5e-5, cosine schedule to 10%
 
@@ -162,15 +202,8 @@ protocol. Mixed head architectures load through `net_from_state_dict`.
 
 ## Files modified in working tree (uncommitted)
 
-- `train.py`: simplified warm-start CLI, deterministic seed, pure-PPO v14
-  entrypoint, and the P1 behavior-denominator correction.
-- `evaluate_vs_model.py`: `--raw-a`/`--raw-b` (raw-policy sides) and
-  `--value-weight` (scales net-derived quiescence values; 0 ablates learned
-  eval, terminal ground truth keeps full weight); mode + vw printed in footer.
-- `evaluate_vs_engine.py`: `--raw` flag, mode/skill/move-time printed in footer.
-- `lookahead.py`: `value_weight` param in `select_moves_with_lookahead`
-  (default 1.0 — training callers unchanged).
-- All 2026-07-16/17 match logs in `logs/h2h_*_2026071{6,7}*.log` and
-  `logs/engine_*_20260716.log`.
-- `test_helper.py`: current 20-plane shape contract.
-- `README.md` and this handover: v14 command and completed v13 results.
+- `train.py`: v15 CLI plumbing — `--trainee-search`, `--lookahead-alpha`,
+  `--value-weight`; `value_weight` threaded to `_checkpoint_opponent_fn` and
+  the trainee's `select_moves_with_lookahead`; trainee search now also active
+  in engine batches.
+- This handover: v15 matched-pair test documented, eval hygiene deprioritized.

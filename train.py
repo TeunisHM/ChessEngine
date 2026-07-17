@@ -95,7 +95,8 @@ OpponentMoveFn = Callable[[List[chess.Board]], List[Optional[chess.Move]]]
 
 
 def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
-                            top_k: int, alpha: float) -> OpponentMoveFn:
+                            top_k: int, alpha: float,
+                            value_weight: float = 1.0) -> OpponentMoveFn:
     """Vectorized opponent that picks moves with a frozen ActorCriticResNet using
     the same top-k value lookahead as the policy player."""
 
@@ -103,6 +104,7 @@ def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
         idxs, *_ = select_moves_with_lookahead(
             opponent_net, boards, device,
             top_k=top_k, alpha=alpha, temperature=temperature,
+            value_weight=value_weight,
         )
         idxs_cpu = idxs.cpu().tolist()
         out: List[Optional[chess.Move]] = []
@@ -209,6 +211,7 @@ def generate_batch(actor_critic_net,
                    trainee_search: bool = False,
                    trainee_top_k: int = 6,
                    trainee_alpha: float = 0.33,
+                   trainee_value_weight: float = 1.0,
                    progress_label: str = ""):
     """Lockstep batch of games. One forward pass per ply across all live games.
 
@@ -299,6 +302,7 @@ def generate_batch(actor_critic_net,
                  topk_idx_step, log_b_topk_step) = select_moves_with_lookahead(
                     actor_critic_net, pol_boards, device,
                     top_k=trainee_top_k, alpha=trainee_alpha, temperature=temperature,
+                    value_weight=trainee_value_weight,
                 )
                 # Diagnostics: how much does search disagree with raw π?
                 search_kl_sum += float(kl_b_pi_step.sum().item())
@@ -531,6 +535,7 @@ def train_actor_critic(actor_critic_net,
                        material_shaping_per_pawn: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
+                       lookahead_value_weight: float = 1.0,
                        trainee_search: bool = False,
                        distill_weight: float = 0.0,
                        tablebase_path: Optional[str] = "syzygy",
@@ -586,6 +591,7 @@ def train_actor_critic(actor_critic_net,
         "step_penalty": step_penalty, "draw_penalty": draw_penalty,
         "material_shaping_per_pawn": material_shaping_per_pawn,
         "lookahead_k": lookahead_k, "lookahead_alpha": lookahead_alpha,
+        "lookahead_value_weight": lookahead_value_weight,
         "trainee_search": trainee_search, "distill_weight": distill_weight,
         "tablebase_path": tablebase_path, "tablebase_terminate_prob": tablebase_terminate_prob,
         "seed": seed,
@@ -617,6 +623,7 @@ def train_actor_critic(actor_critic_net,
             if engine_pool is not None and r < engine_ratio:
                 opponent_fn = _engine_opponent_fn(engine_pool, engine_move_time)
                 source = "engine"
+                trainee_search_now = trainee_search
             elif r < engine_ratio + opponent_ratio:
                 opp_net, opp_path = _load_random_opponent(device)
                 if opp_net is None:
@@ -626,10 +633,11 @@ def train_actor_critic(actor_critic_net,
                     opponent_fn = _checkpoint_opponent_fn(
                         opp_net, device, opponent_temperature,
                         top_k=lookahead_k, alpha=lookahead_alpha,
+                        value_weight=lookahead_value_weight,
                     )
                     source = f"checkpoint ({os.path.basename(opp_path)})"
-                    # Trainee uses widened search only against past checkpoints;
-                    # pure π in self-play and against the engine.
+                    # Trainee search applies in opponent batches (checkpoint and
+                    # engine); pure π in self-play.
                     trainee_search_now = trainee_search
             else:
                 opponent_fn = None
@@ -648,6 +656,7 @@ def train_actor_critic(actor_critic_net,
                 trainee_search=trainee_search_now,
                 trainee_top_k=lookahead_k,
                 trainee_alpha=lookahead_alpha,
+                trainee_value_weight=lookahead_value_weight,
                 progress_label=f"[Batch {batch+1}/{num_batches}] {source}",
             )
             t1 = perf_counter()
@@ -893,6 +902,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1401)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--trainee-search", action="store_true",
+        help="Trainee samples from the lookahead search (policy-scale formula) "
+             "in checkpoint and engine batches; pure pi in self-play.",
+    )
+    parser.add_argument(
+        "--lookahead-alpha", type=float, default=1.0,
+        help="Weight on log pi in the search score (1.0 = policy-scale formula).",
+    )
+    parser.add_argument(
+        "--value-weight", type=float, default=1.0,
+        help="Weight beta on net-derived quiescence values in the search score.",
+    )
     return parser.parse_args()
 
 
@@ -914,7 +936,9 @@ def main() -> None:
         "hip": torch.version.hip,
         "precision": "fp32",
         "miopen_find_mode": os.environ.get("MIOPEN_FIND_MODE"),
-        "trainee_search": False,
+        "trainee_search": args.trainee_search,
+        "lookahead_alpha": args.lookahead_alpha,
+        "value_weight": args.value_weight,
         "distill_weight": 0.0,
     }
     print("[INFO] training configuration")
@@ -969,8 +993,9 @@ def main() -> None:
         draw_penalty=0.1,
         material_shaping_per_pawn=0.025,
         lookahead_k=4,
-        lookahead_alpha=0.3,
-        trainee_search=False,
+        lookahead_alpha=args.lookahead_alpha,
+        lookahead_value_weight=args.value_weight,
+        trainee_search=args.trainee_search,
         distill_weight=0.0,
         tablebase_terminate_prob=0.25,
         seed=args.seed,
