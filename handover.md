@@ -4,6 +4,15 @@ Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
+**Running (launched 2026-07-17): v16, 450 batches from v15-search@149, eval
+every 150.** Same recipe as v15-search (`--trainee-search --lookahead-alpha
+1.0 --value-weight 1.0`) plus the new `--dtz-shaping-weight 0.15`: dense
+reward inside confirmed <=5-man tablebase wins for shrinking DTZ (distance to
+the forced zeroing move), aimed at the draws-with-winning-material conversion
+gap. See "DTZ conversion shaping" below for the mechanism. Log:
+`logs/v16_run.log`; checkpoints at `models/ppo_search_v16_checkpoint_{149,299,449}.pt`.
+Verdict on completion: raw-vs-raw H2H vs v15-search@149.
+
 **v15 matched-pair search-in-training test SUCCEEDED — biggest single-run gain
 to date.** Two 150-batch arms from the same init (v14@299, seed 1401):
 `ppo_search_v15_search` (`--trainee-search --lookahead-alpha 1.0
@@ -82,35 +91,31 @@ has `--raw-a/--raw-b/--value-weight`, `evaluate_vs_engine.py` has `--raw`.
 ## Next steps
 
 v15 search-in-training test succeeded (+114 Elo over v14, +222 over the
-matched pure-PPO control — see Current state). Candidates, in rough priority
-order:
+matched pure-PPO control — see Current state). v15-search@149 is the new
+baseline; v16 (running) bundles the generational continuation with DTZ
+conversion shaping in one run, rather than testing them separately, per
+user's call. Candidates, in rough priority order:
 
-1. **Promote v15-search@149 to baseline** for all future comparisons and as
-   the next `--init-from`. Update any scripts/docs still pointing at v14.
-2. **v16 generational run from v15-search@149**: same recipe
-   (`--trainee-search --lookahead-alpha 1.0 --value-weight 1.0`) continued
-   for another 150-300 batches, since this is now a validated gain source
-   rather than a dead continuation pattern. H2H raw-vs-raw vs v15-search@149
-   as the bar. Watch whether the gain compounds or is a one-time unlock (the
-   v4/v10 "continuations are flat" pattern applied to *pure-PPO* continuation
-   — untested whether search-behavior continuation behaves differently).
-3. **Investigate the control-arm regression** (−63 Elo vs v14, CI [−131,+6]):
-   plain PPO continuation against the harder shared curriculum (opponents now
-   fixed-formula, stronger) may have actively hurt rather than merely
-   plateaued. Not blocking — the search arm is what we're keeping — but worth
-   understanding before assuming future pure-PPO continuations are simply
-   "flat."
-4. **Conversion/endgame fix** (draws-with-winning-material gap): DTZ-aware
-   potential shaping inside the ≤5-man domain (`probe_dtz`; dense progress
-   signal that WDL lacks), or joint TB-supervised auxiliary loss on TB-domain
-   rollout states only (NOT an isolated fine-tune — that regressed, see
-   `project_tb_pretrain_regresses`). Build a TB-won conversion testsuite as
-   the metric first. User: "later we can implement DTZ."
-5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
+1. **v16 verdict — pending**. H2H raw-vs-raw vs v15-search@149 once it
+   finishes. Note this is *not* a clean 1-variable test (continuation +
+   DTZ shaping together), so a gain doesn't isolate which part helped; if
+   it's a clear win that's fine (we get a better model), but don't credit
+   DTZ specifically without a follow-up ablation (rerun without
+   `--dtz-shaping-weight` if the credit assignment ever matters).
+2. **Conversion testsuite** (still not built): a set of TB-won positions
+   with known DTZ, scored by how often/fast the model actually converts —
+   needed to directly confirm DTZ shaping fixed the draws-with-winning-
+   material gap, independent of aggregate Elo.
+3. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
+   [−131,+6]): plain PPO continuation against the harder shared curriculum
+   (opponents now fixed-formula, stronger) may have actively hurt rather than
+   merely plateaued. Not blocking, but worth understanding before assuming
+   future pure-PPO continuations are simply "flat."
+4. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
    paired opening suite + PGN output in `evaluate_vs_model.py`. Still the
-   right tool for the still-unresolved β=2-wrapper-vs-raw question (+41 Elo,
-   CI [−27,+110] on the new model, same inconclusive pattern as v14), but not
-   blocking anything now.
+   right tool for the still-unresolved β=2-wrapper-vs-raw question (wrapper
+   showed no benefit on v15-search: self-match +41 Elo CI [−27,+110]; engine
+   16.8% raw vs 13.4% wrapped — both ties, but current lean is deploy raw).
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
@@ -158,6 +163,22 @@ finite.
 - **Padding** of variable-length `topk_idx` / `log_b_topk` to rollout-global max before stacking — prevents crash when `distill_weight > 0`.
 - **CSV log hparam header**: first line of `logs/{model}_*.csv` is `# k1=v1 k2=v2 ...` of all hparams (parsers should skip lines starting with `#`).
 - **Per-batch trainee outcomes**: `generate_batch` returns `stats["trainee_outcomes"] = {"W":, "D":, "L":, "T":}` for non-self-play batches. Printed inline; engine batches get cumulative running totals.
+- **DTZ conversion shaping** (`--dtz-shaping-weight`, default 0.0, off): dense
+  potential-based reward inside a *confirmed unconditional* ≤5-man tablebase
+  win for the mover (`_dtz_progress_potential` in `train.py`), rewarding
+  moves that shrink `probe_dtz`'s distance to the forced zeroing move. Bounded
+  in [−1, 0] (dtz magnitude / 100), `None` (no shaping) outside the tablebase
+  domain, on a draw/loss, or on a cursed win (dtz magnitude > 100 — a
+  50-move-rule edge case). Same cycle-based Φ(s) pattern as the existing
+  material shaping; a cycle only contributes when *both* endpoints are
+  defined, so entering/leaving the domain is silent rather than injecting a
+  spurious jump — this means a blunder that throws away a TB win is NOT
+  penalized by this term specifically (relies on the existing terminal/WDL
+  reward for that). Sign convention verified against a real KQvK tablebase
+  position before the v16 launch (`phi(white)` rose monotonically −0.13 → 0
+  as White played optimally toward mate; `phi(black)` was `None` throughout,
+  correctly gated since Black wasn't winning). v16 uses weight 0.15, a first
+  guess not yet tuned — no conversion testsuite exists yet to calibrate it.
 
 ### Prepared v14 configuration
 - Required `--init-from` and `--model-name`; defaults are 400 batches, eval
@@ -202,8 +223,8 @@ protocol. Mixed head architectures load through `net_from_state_dict`.
 
 ## Files modified in working tree (uncommitted)
 
-- `train.py`: v15 CLI plumbing — `--trainee-search`, `--lookahead-alpha`,
-  `--value-weight`; `value_weight` threaded to `_checkpoint_opponent_fn` and
-  the trainee's `select_moves_with_lookahead`; trainee search now also active
-  in engine batches.
-- This handover: v15 matched-pair test documented, eval hygiene deprioritized.
+- `train.py`: `--dtz-shaping-weight` CLI flag and `_dtz_progress_potential`
+  helper; DTZ shaping cycle plumbed through `generate_batch` alongside the
+  existing material shaping (per-move + end-of-batch closing).
+- This handover: v16 (search continuation + DTZ shaping) documented as
+  running; next steps reordered around its verdict.

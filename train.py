@@ -46,6 +46,37 @@ def _material_balance(board: chess.Board, color: chess.Color) -> float:
     return float(own - opp)
 
 
+def _dtz_progress_potential(
+    tablebase: Optional[chess.syzygy.Tablebase], board: chess.Board, color: chess.Color
+) -> Optional[float]:
+    """Bounded progress potential inside a clean <=5-man tablebase win for `color`.
+
+    None outside the tablebase domain, on a draw/loss, or on a cursed win (DTZ
+    magnitude > 100, a 50-move-rule edge case) — shaping only applies while
+    color has an unconditional, table-confirmed win. WDL/DTZ are reported from
+    the mover's perspective, so both are negated when color is not to move.
+    Returns -|dtz|/100 in [-1, 0], rising toward 0 as the forced conversion
+    (zeroing move) gets closer.
+    """
+    if tablebase is None or chess.popcount(board.occupied) > 5:
+        return None
+    try:
+        wdl = tablebase.probe_wdl(board)
+    except (chess.syzygy.MissingTableError, KeyError):
+        return None
+    wdl_color = wdl if board.turn == color else -wdl
+    if wdl_color != 2:
+        return None
+    try:
+        dtz = tablebase.probe_dtz(board)
+    except (chess.syzygy.MissingTableError, KeyError):
+        return None
+    dtz_color = dtz if board.turn == color else -dtz
+    if abs(dtz_color) > 100:
+        return None
+    return -abs(dtz_color) / 100.0
+
+
 def _start_position(opening_prob: float) -> chess.Board:
     """Return a fresh board, optionally seeded with a random opening line."""
     board = chess.Board()
@@ -206,6 +237,7 @@ def generate_batch(actor_critic_net,
                    step_penalty: float = 0.0,
                    draw_penalty: float = 0.1,
                    material_shaping_per_pawn: float = 0.0,
+                   dtz_shaping_weight: float = 0.0,
                    tablebase: Optional[chess.syzygy.Tablebase] = None,
                    tablebase_terminate_prob: float = 1.0,
                    trainee_search: bool = False,
@@ -237,9 +269,12 @@ def generate_batch(actor_critic_net,
     black_rewards = [[] for _ in range(batch_size)]
     last_phi_white: List[Optional[float]] = [None] * batch_size
     last_phi_black: List[Optional[float]] = [None] * batch_size
+    last_dtz_phi_white: List[Optional[float]] = [None] * batch_size
+    last_dtz_phi_black: List[Optional[float]] = [None] * batch_size
     done = [False] * batch_size
     tb_terminate = [random.random() < tablebase_terminate_prob for _ in range(batch_size)]
     shape_on = material_shaping_per_pawn > 0.0
+    dtz_shape_on = dtz_shaping_weight > 0.0 and tablebase is not None
 
     # π-vs-search rollout diagnostics (only meaningful when trainee_search).
     search_kl_sum = 0.0
@@ -348,6 +383,23 @@ def generate_batch(actor_critic_net,
                             black_rewards[gid][-1] += material_shaping_per_pawn * (gamma * phi_now - last)
                         last_phi_black[gid] = phi_now
 
+                # Same cycle pattern, but Φ is only defined inside a clean TB
+                # win (see _dtz_progress_potential); undefined on either side
+                # of a cycle means skip (don't shape entering/leaving the
+                # tablebase domain, only progress *within* it).
+                if dtz_shape_on:
+                    dtz_phi_now = _dtz_progress_potential(tablebase, board, current_player)
+                    if current_player == chess.WHITE:
+                        dtz_last = last_dtz_phi_white[gid]
+                        if dtz_phi_now is not None and dtz_last is not None and white_rewards[gid]:
+                            white_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_now - dtz_last)
+                        last_dtz_phi_white[gid] = dtz_phi_now
+                    else:
+                        dtz_last = last_dtz_phi_black[gid]
+                        if dtz_phi_now is not None and dtz_last is not None and black_rewards[gid]:
+                            black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_now - dtz_last)
+                        last_dtz_phi_black[gid] = dtz_phi_now
+
                 step = (
                     states[k].detach(),
                     masks[k].detach(),
@@ -403,6 +455,16 @@ def generate_batch(actor_critic_net,
             if last_phi_black[gid] is not None and black_rewards[gid]:
                 phi_b = _material_balance(board, chess.BLACK)
                 black_rewards[gid][-1] += material_shaping_per_pawn * (gamma * phi_b - last_phi_black[gid])
+
+        if dtz_shape_on:
+            if last_dtz_phi_white[gid] is not None and white_rewards[gid]:
+                dtz_phi_w = _dtz_progress_potential(tablebase, board, chess.WHITE)
+                if dtz_phi_w is not None:
+                    white_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_w - last_dtz_phi_white[gid])
+            if last_dtz_phi_black[gid] is not None and black_rewards[gid]:
+                dtz_phi_b = _dtz_progress_potential(tablebase, board, chess.BLACK)
+                if dtz_phi_b is not None:
+                    black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_b - last_dtz_phi_black[gid])
 
         if board.is_game_over():
             final_w, final_b = _terminal_rewards(board, draw_penalty=draw_penalty)
@@ -533,6 +595,7 @@ def train_actor_critic(actor_critic_net,
                        step_penalty: float = 0.001,
                        draw_penalty: float = 0.1,
                        material_shaping_per_pawn: float = 0.0,
+                       dtz_shaping_weight: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
                        lookahead_value_weight: float = 1.0,
@@ -590,6 +653,7 @@ def train_actor_critic(actor_critic_net,
         "engine_skill_level": engine_skill_level,
         "step_penalty": step_penalty, "draw_penalty": draw_penalty,
         "material_shaping_per_pawn": material_shaping_per_pawn,
+        "dtz_shaping_weight": dtz_shaping_weight,
         "lookahead_k": lookahead_k, "lookahead_alpha": lookahead_alpha,
         "lookahead_value_weight": lookahead_value_weight,
         "trainee_search": trainee_search, "distill_weight": distill_weight,
@@ -651,6 +715,7 @@ def train_actor_critic(actor_critic_net,
                 opponent_move_fn=opponent_fn,
                 step_penalty=step_penalty, draw_penalty=draw_penalty,
                 material_shaping_per_pawn=material_shaping_per_pawn,
+                dtz_shaping_weight=dtz_shaping_weight,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
                 trainee_search=trainee_search_now,
@@ -915,6 +980,12 @@ def _parse_args() -> argparse.Namespace:
         "--value-weight", type=float, default=1.0,
         help="Weight beta on net-derived quiescence values in the search score.",
     )
+    parser.add_argument(
+        "--dtz-shaping-weight", type=float, default=0.0,
+        help="Weight on the DTZ conversion-progress potential inside <=5-man "
+             "tablebase wins (0 = off). Dense reward for shrinking distance "
+             "to the forced zeroing move; silent outside a confirmed win.",
+    )
     return parser.parse_args()
 
 
@@ -939,6 +1010,7 @@ def main() -> None:
         "trainee_search": args.trainee_search,
         "lookahead_alpha": args.lookahead_alpha,
         "value_weight": args.value_weight,
+        "dtz_shaping_weight": args.dtz_shaping_weight,
         "distill_weight": 0.0,
     }
     print("[INFO] training configuration")
@@ -992,6 +1064,7 @@ def main() -> None:
         step_penalty=0.001,
         draw_penalty=0.1,
         material_shaping_per_pawn=0.025,
+        dtz_shaping_weight=args.dtz_shaping_weight,
         lookahead_k=4,
         lookahead_alpha=args.lookahead_alpha,
         lookahead_value_weight=args.value_weight,
