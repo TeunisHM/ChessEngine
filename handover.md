@@ -4,36 +4,53 @@ Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
-**Running (launched 2026-07-18): v17, 300 batches from v16@449, eval every
-100.** Same recipe as v16 (`--trainee-search --lookahead-alpha 1.0
---value-weight 1.0 --dtz-shaping-weight 0.15`), straight continuation —
-train-to-ceiling strategy (keep going from the winner until a generation
-shows no gain). Log: `logs/v17_run.log`; checkpoints at
-`models/ppo_search_v17_checkpoint_{99,199,299}.pt`. Verdict on completion:
-same four-match suite as v16 (raw H2H, search-wrapped H2H, both vs engine)
-against v16@449.
+**Running (launched 2026-07-18): v18, 300 batches from v16@449, eval every
+100.** First real use of the tablebase value-head auxiliary loss:
+`--trainee-search --lookahead-alpha 1.0 --value-weight 1.0
+--dtz-shaping-weight 0.15 --tb-value-aux-weight 0.5
+--tablebase-terminate-prob 0.0` (see "Tablebase value-head auxiliary loss"
+below for the mechanism). Init is v16@449, not v17@299 — v17 (see below)
+didn't outperform v16, so v16 keeps the baton. Log: `logs/v18_run.log`;
+checkpoints at `models/ppo_search_v18_checkpoint_{99,199,299}.pt`. Verdict on
+completion: same four-match suite as v16/v17 (raw H2H, search-wrapped H2H,
+both vs engine) against v16@449. Per user: "if it gets worse we'll revert the
+most recent changes" — if v18 loses this suite, drop back to v16@449 as
+baseline and don't pursue the aux loss further without the conversion
+testsuite to diagnose why.
 
-**New mechanism added mid-run (not yet used in a training run): tablebase
-value-head auxiliary loss.** User's insight: a non-yet-converged policy's own
-rollout returns only teach the critic what it *currently* achieves in an
-endgame, not what's *achievable* — so the critic's baseline can silently sink
-to match repeated failed conversions, shrinking exactly the advantage signal
-that should be punishing them. Fix: `_tb_value_target` (train.py) supervises
-the value head directly toward `probe_wdl` ground truth (+1/0/−1, cursed
-outcomes collapsed to 0) at every visited ≤5-man position, via a loss term
-completely separate from the reward/return stream — the actor never sees an
-injected reward, only a better-calibrated critic baseline, so a failed
-conversion now produces a correctly large negative advantage through the
-ordinary PPO mechanism rather than a hand-fed penalty. CLI:
-`--tb-value-aux-weight` (default 0, off). Pairs with
-`--tablebase-terminate-prob 0` (also newly exposed via CLI, was hardcoded
-0.25) so the actor's reward stream carries zero artificial TB-injected
-signal — the terminate-prob mechanism and this auxiliary loss are meant to be
-used as a pair, not simultaneously with the old terminate-prob>0 shortcut.
-Smoke-tested (2 batches, `tb_value_aux_weight=0.1`, `tablebase_terminate_prob=0`):
-ran clean, `TBaux: 0.2940` appeared in the log line as expected, no crashes.
-**Not yet used in a real run** — candidate for v18, once v17 finishes and its
-ceiling verdict is in.
+**v17 (2026-07-18, 300 batches from v16@449, plain continuation, no new
+mechanism) did NOT improve on v16 — first "no gain" signal on this recipe.**
+H2H suite (101 games each, temp 1.0):
+- v17-raw vs v16-raw: 39W/15D/47L → −28 Elo, CI [−96,+40]
+- v17-search(β=2) vs v16-search(β=2): 34W/27D/40L → −21 Elo, CI [−88,+47]
+- v17-raw vs engine: 8W/13D/80L → 14.4% (v16-raw was 12.4%, a wash)
+- v17-search(β=2) vs engine: 7W/10D/84L → **11.9%, down from v16's 19.8%**
+
+Three of four measurements lean negative (none individually significant),
+despite v17's in-training cumulative vs-SF counter looking *better* than
+v16's (28.6% vs 21.3%) — another data point that the counter doesn't
+reliably track raw strength. Per the train-to-ceiling strategy, this is the
+signal to try a new mechanism rather than another plain continuation — v18
+(above) is that attempt. **v16@449 remains the strongest known checkpoint.**
+
+**Tablebase value-head auxiliary loss** (`--tb-value-aux-weight`, implemented
+2026-07-18, first real run is v18 above): user's insight was that a
+not-yet-converged policy's own rollout returns only teach the critic what it
+*currently* achieves in an endgame, not what's *achievable* — so the critic's
+baseline can silently sink to match repeated failed conversions, shrinking
+exactly the advantage signal that should be punishing them. Fix:
+`_tb_value_target` (train.py) supervises the value head directly toward
+`probe_wdl` ground truth (+1/0/−1, cursed outcomes collapsed to 0) at every
+visited ≤5-man position, via a loss term completely separate from the
+reward/return stream — the actor never sees an injected reward, only a
+better-calibrated critic baseline, so a failed conversion now produces a
+correctly large negative advantage through the ordinary PPO mechanism rather
+than a hand-fed penalty. Pairs with `--tablebase-terminate-prob 0` (also
+newly exposed via CLI, was hardcoded 0.25) so the actor's reward stream
+carries zero artificial TB-injected signal. Smoke-tested clean before v18
+(2 batches, weight=0.1, terminate-prob=0: `TBaux: 0.2940` appeared in the log
+line as expected, no crashes). v18 uses weight 0.5 (roughly critic-loss-weight
+scale, a first guess — no tuning done).
 
 **v16 (2026-07-17/18) is the current strongest / promoted baseline** —
 450 batches from v15-search@149 (same search-in-training recipe) plus the
@@ -137,25 +154,28 @@ sensible since v16 was itself trained with search. `evaluate_vs_model.py` has
 
 Train-to-ceiling strategy (user, 2026-07-18): keep launching continuations
 from the winning checkpoint until a generation's H2H shows no gain, to find
-this architecture/recipe's limit. v17 (running) is the next data point.
-Candidates, in rough priority order:
+this architecture/recipe's limit. v17 hit that signal (see Current state);
+v18 (running) is the first attempt at a new mechanism rather than another
+plain continuation. Candidates, in rough priority order:
 
-1. **v17 verdict — pending**. Same four-match suite as v16 (raw H2H,
-   search-wrapped H2H, both vs engine) against v16@449. If v17 also ties,
-   that's two flat/marginal generations in a row on this recipe — a real
-   ceiling signal per the strategy above.
-2. **v18 candidate: tablebase value-head auxiliary loss** (new, see Current
-   state / code-state — `--tb-value-aux-weight` + `--tablebase-terminate-prob 0`).
-   Targets conversion more directly than DTZ shaping alone: corrects the
-   critic's baseline with ground truth so a failed conversion produces a
-   properly large negative advantage, without hand-feeding the actor a
-   reward. Good candidate for exactly when v17 signals a ceiling — a
-   genuinely new mechanism rather than another plain continuation.
+1. **v18 verdict — pending**. Same four-match suite vs v16@449. Per user: if
+   it's worse, revert to v16@449 as baseline and don't pursue the aux loss
+   further without the conversion testsuite (item 3) to diagnose why — don't
+   just retune the weight blind.
+2. **If v18 also fails to beat v16**: this recipe (search-in-training +
+   fixed-formula opponents, this network architecture) has plausibly hit its
+   ceiling per the train-to-ceiling strategy. Time to consider a structural
+   change instead of another loss-function tweak: bigger/different network
+   capacity, deeper search (real multi-ply, not 1-ply value lookahead), or
+   revisiting distillation (dormant since v5/v7/v8 failures, but under a
+   fixed-formula behavior policy the original failure mode — near-uniform b
+   — no longer applies, unlike when it was last tried).
 3. **Conversion testsuite** (still not built): a set of TB-won positions
    with known DTZ, scored by how often/fast the model actually converts —
-   needed to directly confirm DTZ shaping (and the new aux loss) are doing
-   something, independent of aggregate Elo (which has been flat/marginal
-   across both v16 and — likely — v17).
+   needed to directly confirm DTZ shaping and the TB aux loss are doing
+   something, independent of aggregate Elo (which has been flat/marginal to
+   negative across v16/v17, so aggregate Elo alone is a weak instrument for
+   judging these two mechanisms specifically).
 4. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
    [−131,+6]): plain PPO continuation against the harder shared curriculum
    (opponents now fixed-formula, stronger) may have actively hurt rather than
@@ -163,9 +183,9 @@ Candidates, in rough priority order:
    future pure-PPO continuations are simply "flat."
 5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
    paired opening suite + PGN output in `evaluate_vs_model.py`. Increasingly
-   relevant — every v16 measurement landed inside its own CI, and the same
-   is likely for v17; paired openings would shrink variance enough to
-   actually resolve these close calls instead of accumulating more ties.
+   relevant — v16 and v17's H2H/engine measurements have all landed inside
+   their own CIs; paired openings would shrink variance enough to actually
+   resolve these close calls instead of accumulating more ties.
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
@@ -177,7 +197,8 @@ finite.
 
 | Run | Init | Recipe change | Result |
 |---|---|---|---|
-| v17 (running) | v16@449 | Straight continuation, same recipe (search-in-training + DTZ shaping 0.15), 300 batches, eval every 100 | pending |
+| v18 (running) | v16@449 | Same recipe + tablebase value-head auxiliary loss (`tb_value_aux_weight=0.5`) and `tablebase_terminate_prob=0` (always play out endgames); 300 batches, eval every 100 | pending |
+| v17 (no gain, first ceiling signal) | v16@449 | Straight continuation, same recipe (search-in-training + DTZ shaping 0.15), 300 batches, eval every 100 | H2H **39W/15D/47L vs v16-raw** (−28 Elo, CI[−96,+40]); search(β=2) **34W/27D/40L** (−21 Elo, CI[−88,+47]); engine raw 14.4% (wash); engine search(β=2) **11.9%, down from v16's 19.8%** — 3/4 measurements negative despite a better in-training vs-SF counter (28.6% vs 21.3%) |
 | **v16 (promoted, marginal/directional +14 to +38 Elo)** | v15-search@149 | Same search recipe + `--dtz-shaping-weight 0.15` (new: DTZ conversion progress shaping); 450 batches, eval every 150 | H2H vs v15-search: raw +14 Elo CI[−54,+82]; search(β=2) +38 Elo CI[−30,+106] — neither significant alone, all measurements agree in direction; **engine (β=2) 19.8%, best to date**; continuation+DTZ bundled, not isolated |
 | **v15-search (succeeded, +114 Elo, new baseline)** | v14@299 | Fixed-formula search (α=1, β=1): checkpoint opponents in both arms use it; search arm also samples trainee behavior from it in checkpoint+engine batches (self-play stays pure π); 150 batches, seed 1401 | H2H **56W/21D/24L vs v14-raw** (+114, CI [+43,+185]); **67W/24D/10L vs matched control-raw** (+222, CI [+140,+304]) |
 | v15-control (regressed?, −63 Elo) | v14@299 | Same run, no trainee search (pure-π continuation against the same harder curriculum) | H2H **29W/25D/47L vs v14-raw** (−63, CI [−131,+6], z=−1.82 — leans real, not 95%-significant); decisively behind v15-search |
