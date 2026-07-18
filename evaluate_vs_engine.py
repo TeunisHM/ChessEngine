@@ -12,7 +12,6 @@ if torch.version.hip is not None:
 from helper import board_to_tensor, index_to_move, legal_moves_mask
 from lookahead import select_moves_with_lookahead
 from models import ActorCriticResNet, net_from_state_dict
-from train import _start_position
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,7 +117,11 @@ def _play_game(
     value_weight: float = 1.0,
     opening_prob: float = 0.0,
 ) -> Dict[str, int]:
-    board = _start_position(opening_prob)
+    if opening_prob > 0.0:
+        from train import _start_position  # lazy: avoid train.py's heavier deps by default
+        board = _start_position(opening_prob)
+    else:
+        board = chess.Board()
     is_policy_white = (game_index % 2 == 0)
     move_count = 0
 
