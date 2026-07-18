@@ -4,14 +4,34 @@ Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
-**Running (launched 2026-07-17): v16, 450 batches from v15-search@149, eval
-every 150.** Same recipe as v15-search (`--trainee-search --lookahead-alpha
-1.0 --value-weight 1.0`) plus the new `--dtz-shaping-weight 0.15`: dense
-reward inside confirmed <=5-man tablebase wins for shrinking DTZ (distance to
-the forced zeroing move), aimed at the draws-with-winning-material conversion
-gap. See "DTZ conversion shaping" below for the mechanism. Log:
-`logs/v16_run.log`; checkpoints at `models/ppo_search_v16_checkpoint_{149,299,449}.pt`.
-Verdict on completion: raw-vs-raw H2H vs v15-search@149.
+**Running (launched 2026-07-18): v17, 300 batches from v16@449, eval every
+100.** Same recipe as v16 (`--trainee-search --lookahead-alpha 1.0
+--value-weight 1.0 --dtz-shaping-weight 0.15`), straight continuation —
+train-to-ceiling strategy (keep going from the winner until a generation
+shows no gain). Log: `logs/v17_run.log`; checkpoints at
+`models/ppo_search_v17_checkpoint_{99,199,299}.pt`. Verdict on completion:
+same four-match suite as v16 (raw H2H, search-wrapped H2H, both vs engine)
+against v16@449.
+
+**v16 (2026-07-17/18) is the current strongest / promoted baseline** —
+450 batches from v15-search@149 (same search-in-training recipe) plus the
+new `--dtz-shaping-weight 0.15` (dense reward inside confirmed <=5-man
+tablebase wins for shrinking DTZ; see "DTZ conversion shaping" below).
+Verdict was directionally positive but not individually significant on any
+one measurement — promoted anyway because every measurement pointed the
+same way:
+- v16-raw vs v15-search-raw: 40W/25D/36L, +14 Elo, CI [−54,+82]
+- v16-search(β=2) vs v15-search-search(β=2): 40W/32D/29L, +38 Elo, CI [−30,+106]
+- v16-raw vs engine: 12.4% (8W/9D/84L)
+- **v16-search(β=2) vs engine: 19.8% (12W/16D/73L) — best engine score to
+  date**, and the first wrapper result with a balanced color split (6W/6L),
+  unlike earlier wrapper runs' white-heavy skew. Since v16 was trained *with*
+  search (unlike v15-search's raw-trained policy being evaluated with an
+  unfamiliar wrapper), the wrapper being additive again here tracks: training
+  and evaluation conditions now match.
+- Caveat unresolved: v16 bundled continuation + DTZ shaping in one run, so a
+  gain doesn't isolate DTZ's contribution; no conversion-specific testsuite
+  exists yet to check directly. Still on the to-do list (see Next steps).
 
 **v15 matched-pair search-in-training test SUCCEEDED — biggest single-run gain
 to date.** Two 150-batch arms from the same init (v14@299, seed 1401):
@@ -72,10 +92,13 @@ tie** (36W/32D/33L). But the post-mortem produced the day's real findings:
    raw 11W/6D/84L = 13.9% — externally validates the in-training vs-SF
    counter (~14%); old-formula search collapses it to 4.5%.
 
-**Strongest known model: v15-search@149-raw (+114 Elo over v14@299-raw,
-2026-07-17 — see Current state).** All evaluation should default to
-raw-vs-raw (or the policy-scale search once confirmed); `evaluate_vs_model.py`
-has `--raw-a/--raw-b/--value-weight`, `evaluate_vs_engine.py` has `--raw`.
+**Strongest known model: v16@449, played with the search wrapper (α=1,
+β=2) — best engine score to date (19.8%), directionally ahead of v15-search
+on both raw and wrapped H2H (neither individually significant). See Current
+state.** Unlike v15-search, the wrapper helps v16 rather than being a wash —
+sensible since v16 was itself trained with search. `evaluate_vs_model.py` has
+`--raw-a/--raw-b/--value-weight`, `evaluate_vs_engine.py` has
+`--value-weight`/`--lookahead-alpha` (default now the policy-scale formula).
 
 - **v11** = two changes over v10: (1) **conv policy head** (`ConvPolicyHead` in `models.py`: 3×3 conv → GN → ReLU → 1×1 conv to 73 planes, square-major reshape; 157k params vs the legacy dense head's 603k), and (2) **fresh lineage** — seeded from `pretrained_conv.pt` (two 3-epoch PGN passes over the lichess elite files; 42.2% top-1 move accuracy vs 37.5% for the dense head on the identical recipe), *not* warm-started from v10. Trained 2026-07-12/13, 400 batches of the v10 recipe, clean exit.
 - **H2H run 2026-07-13** (`logs/h2h_v11-399_vs_v10-399_*.log`), 101 games, temp=1.0, k=4, α=0.3:
@@ -90,32 +113,32 @@ has `--raw-a/--raw-b/--value-weight`, `evaluate_vs_engine.py` has `--raw`.
 
 ## Next steps
 
-v15 search-in-training test succeeded (+114 Elo over v14, +222 over the
-matched pure-PPO control — see Current state). v15-search@149 is the new
-baseline; v16 (running) bundles the generational continuation with DTZ
-conversion shaping in one run, rather than testing them separately, per
-user's call. Candidates, in rough priority order:
+Train-to-ceiling strategy (user, 2026-07-18): keep launching continuations
+from the winning checkpoint until a generation's H2H shows no gain, to find
+this architecture/recipe's limit. v17 (running) is the next data point.
+Candidates, in rough priority order:
 
-1. **v16 verdict — pending**. H2H raw-vs-raw vs v15-search@149 once it
-   finishes. Note this is *not* a clean 1-variable test (continuation +
-   DTZ shaping together), so a gain doesn't isolate which part helped; if
-   it's a clear win that's fine (we get a better model), but don't credit
-   DTZ specifically without a follow-up ablation (rerun without
-   `--dtz-shaping-weight` if the credit assignment ever matters).
+1. **v17 verdict — pending**. Same four-match suite as v16 (raw H2H,
+   search-wrapped H2H, both vs engine) against v16@449. If v17 also ties,
+   that's two flat/marginal generations in a row on this recipe — a real
+   ceiling signal per the strategy above, worth pausing generational runs
+   for the items below rather than launching v18 on the same recipe
+   unchanged.
 2. **Conversion testsuite** (still not built): a set of TB-won positions
    with known DTZ, scored by how often/fast the model actually converts —
-   needed to directly confirm DTZ shaping fixed the draws-with-winning-
-   material gap, independent of aggregate Elo.
+   needed to directly confirm DTZ shaping is doing anything, independent of
+   aggregate Elo (which has been flat/marginal across both v16 and — likely
+   — v17).
 3. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
    [−131,+6]): plain PPO continuation against the harder shared curriculum
    (opponents now fixed-formula, stronger) may have actively hurt rather than
    merely plateaued. Not blocking, but worth understanding before assuming
    future pure-PPO continuations are simply "flat."
 4. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
-   paired opening suite + PGN output in `evaluate_vs_model.py`. Still the
-   right tool for the still-unresolved β=2-wrapper-vs-raw question (wrapper
-   showed no benefit on v15-search: self-match +41 Elo CI [−27,+110]; engine
-   16.8% raw vs 13.4% wrapped — both ties, but current lean is deploy raw).
+   paired opening suite + PGN output in `evaluate_vs_model.py`. Increasingly
+   relevant — every v16 measurement landed inside its own CI, and the same
+   is likely for v17; paired openings would shrink variance enough to
+   actually resolve these close calls instead of accumulating more ties.
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
@@ -127,6 +150,8 @@ finite.
 
 | Run | Init | Recipe change | Result |
 |---|---|---|---|
+| v17 (running) | v16@449 | Straight continuation, same recipe (search-in-training + DTZ shaping 0.15), 300 batches, eval every 100 | pending |
+| **v16 (promoted, marginal/directional +14 to +38 Elo)** | v15-search@149 | Same search recipe + `--dtz-shaping-weight 0.15` (new: DTZ conversion progress shaping); 450 batches, eval every 150 | H2H vs v15-search: raw +14 Elo CI[−54,+82]; search(β=2) +38 Elo CI[−30,+106] — neither significant alone, all measurements agree in direction; **engine (β=2) 19.8%, best to date**; continuation+DTZ bundled, not isolated |
 | **v15-search (succeeded, +114 Elo, new baseline)** | v14@299 | Fixed-formula search (α=1, β=1): checkpoint opponents in both arms use it; search arm also samples trainee behavior from it in checkpoint+engine batches (self-play stays pure π); 150 batches, seed 1401 | H2H **56W/21D/24L vs v14-raw** (+114, CI [+43,+185]); **67W/24D/10L vs matched control-raw** (+222, CI [+140,+304]) |
 | v15-control (regressed?, −63 Elo) | v14@299 | Same run, no trainee search (pure-π continuation against the same harder curriculum) | H2H **29W/25D/47L vs v14-raw** (−63, CI [−131,+6], z=−1.82 — leans real, not 95%-significant); decisively behind v15-search |
 | v14 (flat) | v13 control@99 | Pure warm-start continuation, 300 batches, seed 1401, dynamic curriculum incl. v13/v14 checkpoints | **Raw-vs-raw tie with init** (36W/32D/33L); within-run proxies healthy but no gain — continuations don't stack |
