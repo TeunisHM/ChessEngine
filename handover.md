@@ -13,6 +13,28 @@ shows no gain). Log: `logs/v17_run.log`; checkpoints at
 same four-match suite as v16 (raw H2H, search-wrapped H2H, both vs engine)
 against v16@449.
 
+**New mechanism added mid-run (not yet used in a training run): tablebase
+value-head auxiliary loss.** User's insight: a non-yet-converged policy's own
+rollout returns only teach the critic what it *currently* achieves in an
+endgame, not what's *achievable* — so the critic's baseline can silently sink
+to match repeated failed conversions, shrinking exactly the advantage signal
+that should be punishing them. Fix: `_tb_value_target` (train.py) supervises
+the value head directly toward `probe_wdl` ground truth (+1/0/−1, cursed
+outcomes collapsed to 0) at every visited ≤5-man position, via a loss term
+completely separate from the reward/return stream — the actor never sees an
+injected reward, only a better-calibrated critic baseline, so a failed
+conversion now produces a correctly large negative advantage through the
+ordinary PPO mechanism rather than a hand-fed penalty. CLI:
+`--tb-value-aux-weight` (default 0, off). Pairs with
+`--tablebase-terminate-prob 0` (also newly exposed via CLI, was hardcoded
+0.25) so the actor's reward stream carries zero artificial TB-injected
+signal — the terminate-prob mechanism and this auxiliary loss are meant to be
+used as a pair, not simultaneously with the old terminate-prob>0 shortcut.
+Smoke-tested (2 batches, `tb_value_aux_weight=0.1`, `tablebase_terminate_prob=0`):
+ran clean, `TBaux: 0.2940` appeared in the log line as expected, no crashes.
+**Not yet used in a real run** — candidate for v18, once v17 finishes and its
+ceiling verdict is in.
+
 **v16 (2026-07-17/18) is the current strongest / promoted baseline** —
 450 batches from v15-search@149 (same search-in-training recipe) plus the
 new `--dtz-shaping-weight 0.15` (dense reward inside confirmed <=5-man
@@ -121,20 +143,25 @@ Candidates, in rough priority order:
 1. **v17 verdict — pending**. Same four-match suite as v16 (raw H2H,
    search-wrapped H2H, both vs engine) against v16@449. If v17 also ties,
    that's two flat/marginal generations in a row on this recipe — a real
-   ceiling signal per the strategy above, worth pausing generational runs
-   for the items below rather than launching v18 on the same recipe
-   unchanged.
-2. **Conversion testsuite** (still not built): a set of TB-won positions
+   ceiling signal per the strategy above.
+2. **v18 candidate: tablebase value-head auxiliary loss** (new, see Current
+   state / code-state — `--tb-value-aux-weight` + `--tablebase-terminate-prob 0`).
+   Targets conversion more directly than DTZ shaping alone: corrects the
+   critic's baseline with ground truth so a failed conversion produces a
+   properly large negative advantage, without hand-feeding the actor a
+   reward. Good candidate for exactly when v17 signals a ceiling — a
+   genuinely new mechanism rather than another plain continuation.
+3. **Conversion testsuite** (still not built): a set of TB-won positions
    with known DTZ, scored by how often/fast the model actually converts —
-   needed to directly confirm DTZ shaping is doing anything, independent of
-   aggregate Elo (which has been flat/marginal across both v16 and — likely
-   — v17).
-3. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
+   needed to directly confirm DTZ shaping (and the new aux loss) are doing
+   something, independent of aggregate Elo (which has been flat/marginal
+   across both v16 and — likely — v17).
+4. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
    [−131,+6]): plain PPO continuation against the harder shared curriculum
    (opponents now fixed-formula, stronger) may have actively hurt rather than
    merely plateaued. Not blocking, but worth understanding before assuming
    future pure-PPO continuations are simply "flat."
-4. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
+5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
    paired opening suite + PGN output in `evaluate_vs_model.py`. Increasingly
    relevant — every v16 measurement landed inside its own CI, and the same
    is likely for v17; paired openings would shrink variance enough to
@@ -204,6 +231,23 @@ finite.
   as White played optimally toward mate; `phi(black)` was `None` throughout,
   correctly gated since Black wasn't winning). v16 uses weight 0.15, a first
   guess not yet tuned — no conversion testsuite exists yet to calibrate it.
+- **Tablebase value-head auxiliary loss** (`--tb-value-aux-weight`, default
+  0.0, off): `_tb_value_target` returns ground-truth +1/0/−1 (cursed
+  outcomes collapsed to 0) for *every* visited ≤5-man position, not just
+  clean wins — unlike the DTZ potential, this is defined on draws and losses
+  too. Recorded per trajectory step alongside the existing search/distill
+  fields (trajectory tuples now 8 elements; `generate_batch` returns a 10-tuple
+  including `all_tb_targets`), duplicated for the mirror augmentation (the
+  target is file-flip invariant). Applied as `F.mse_loss` against the
+  network's own value-head output, masked to only the entries with a real
+  (non-NaN) target, added to `total_loss` with its own weight — entirely
+  separate from `critic_loss` (which still targets GAE returns) and from the
+  reward stream (no term here ever touches `white_rewards`/`black_rewards`).
+  Meant to pair with `--tablebase-terminate-prob 0` (now CLI-exposed, was
+  hardcoded 0.25): with terminate-prob at 0, the actor's reward stream
+  carries zero artificial TB signal, and this loss is the sole channel
+  correcting the critic. Logged as `TBaux:` in the per-batch print line.
+  Smoke-tested only (2 batches) — not yet used in a real training run.
 
 ### Prepared v14 configuration
 - Required `--init-from` and `--model-name`; defaults are 400 batches, eval

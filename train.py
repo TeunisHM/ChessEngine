@@ -77,6 +77,33 @@ def _dtz_progress_potential(
     return -abs(dtz_color) / 100.0
 
 
+def _tb_value_target(
+    tablebase: Optional[chess.syzygy.Tablebase], board: chess.Board, color: chess.Color
+) -> Optional[float]:
+    """Ground-truth value target for `color` from the <=5-man tablebase, or
+    None outside its domain / on a probe miss.
+
+    Unlike _dtz_progress_potential this is defined on every in-domain
+    position (win, draw, or loss), for use as a value-head-only auxiliary
+    supervision target — kept out of the reward stream so it corrects the
+    critic's baseline without directly rewarding the actor. Cursed win /
+    blessed loss (50-move-rule edge cases) collapse to 0, same conservative
+    mapping as the WDL bootstrap termination.
+    """
+    if tablebase is None or chess.popcount(board.occupied) > 5:
+        return None
+    try:
+        wdl = tablebase.probe_wdl(board)
+    except (chess.syzygy.MissingTableError, KeyError):
+        return None
+    wdl_color = wdl if board.turn == color else -wdl
+    if wdl_color >= 2:
+        return 1.0
+    if wdl_color <= -2:
+        return -1.0
+    return 0.0
+
+
 def _start_position(opening_prob: float) -> chess.Board:
     """Return a fresh board, optionally seeded with a random opening line."""
     board = chess.Board()
@@ -238,6 +265,7 @@ def generate_batch(actor_critic_net,
                    draw_penalty: float = 0.1,
                    material_shaping_per_pawn: float = 0.0,
                    dtz_shaping_weight: float = 0.0,
+                   tb_value_aux_weight: float = 0.0,
                    tablebase: Optional[chess.syzygy.Tablebase] = None,
                    tablebase_terminate_prob: float = 1.0,
                    trainee_search: bool = False,
@@ -275,6 +303,7 @@ def generate_batch(actor_critic_net,
     tb_terminate = [random.random() < tablebase_terminate_prob for _ in range(batch_size)]
     shape_on = material_shaping_per_pawn > 0.0
     dtz_shape_on = dtz_shaping_weight > 0.0 and tablebase is not None
+    tb_aux_on = tb_value_aux_weight > 0.0 and tablebase is not None
 
     # π-vs-search rollout diagnostics (only meaningful when trainee_search).
     search_kl_sum = 0.0
@@ -400,6 +429,8 @@ def generate_batch(actor_critic_net,
                             black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_now - dtz_last)
                         last_dtz_phi_black[gid] = dtz_phi_now
 
+                tb_target = _tb_value_target(tablebase, board, current_player) if tb_aux_on else None
+
                 step = (
                     states[k].detach(),
                     masks[k].detach(),
@@ -408,6 +439,7 @@ def generate_batch(actor_critic_net,
                     values[k].detach().view(-1),
                     topk_idx_step[k].detach() if trainee_search else None,
                     log_b_topk_step[k].detach() if trainee_search else None,
+                    tb_target,
                 )
                 if current_player == chess.WHITE:
                     white_traj[gid].append(step)
@@ -442,6 +474,7 @@ def generate_batch(actor_critic_net,
     all_states, all_masks, all_actions = [], [], []
     all_old_log_probs, all_old_values, all_returns = [], [], []
     all_topk_idx, all_log_b_topk = [], []
+    all_tb_targets = []
 
     for gid in range(batch_size):
         board = boards[gid]
@@ -479,10 +512,10 @@ def generate_batch(actor_critic_net,
                               (black_traj[gid], black_rewards[gid])):
             if not traj:
                 continue
-            vals = [float(v.item()) for (_, _, _, _, v, _, _) in traj]
+            vals = [float(v.item()) for (_, _, _, _, v, _, _, _) in traj]
             returns = calculate_gae_returns(rewards, vals, gamma=gamma, lam=gae_lamb)
             for (state_tensor, mask, action_idx, old_lp, old_v,
-                 topk_idx, log_b_topk), ret in zip(traj, returns):
+                 topk_idx, log_b_topk, tb_target), ret in zip(traj, returns):
                 all_states.append(state_tensor)
                 all_masks.append(mask)
                 all_actions.append(action_idx)
@@ -491,6 +524,7 @@ def generate_batch(actor_critic_net,
                 all_returns.append(ret)
                 all_topk_idx.append(topk_idx)
                 all_log_b_topk.append(log_b_topk)
+                all_tb_targets.append(tb_target)
 
     stats: dict = {}
     if trainee_search and search_states_n > 0:
@@ -523,7 +557,8 @@ def generate_batch(actor_critic_net,
         stats["trainee_outcomes"] = outcomes
 
     return (all_states, all_masks, all_actions, all_old_log_probs,
-            all_old_values, all_returns, all_topk_idx, all_log_b_topk, stats)
+            all_old_values, all_returns, all_topk_idx, all_log_b_topk,
+            all_tb_targets, stats)
 
 
 # ---- Training loop ------------------------------------------------------
@@ -596,6 +631,7 @@ def train_actor_critic(actor_critic_net,
                        draw_penalty: float = 0.1,
                        material_shaping_per_pawn: float = 0.0,
                        dtz_shaping_weight: float = 0.0,
+                       tb_value_aux_weight: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
                        lookahead_value_weight: float = 1.0,
@@ -654,6 +690,7 @@ def train_actor_critic(actor_critic_net,
         "step_penalty": step_penalty, "draw_penalty": draw_penalty,
         "material_shaping_per_pawn": material_shaping_per_pawn,
         "dtz_shaping_weight": dtz_shaping_weight,
+        "tb_value_aux_weight": tb_value_aux_weight,
         "lookahead_k": lookahead_k, "lookahead_alpha": lookahead_alpha,
         "lookahead_value_weight": lookahead_value_weight,
         "trainee_search": trainee_search, "distill_weight": distill_weight,
@@ -709,13 +746,14 @@ def train_actor_critic(actor_critic_net,
 
             actor_critic_net.eval()
             (states, masks, actions, old_lps, old_vs, returns,
-             topk_idxs, log_b_topks, rollout_stats) = generate_batch(
+             topk_idxs, log_b_topks, tb_targets, rollout_stats) = generate_batch(
                 actor_critic_net, batch_size=batch_size, gamma=gamma, gae_lamb=gae_lamb,
                 device=device, temperature=temperature, opening_prob=opening_prob,
                 opponent_move_fn=opponent_fn,
                 step_penalty=step_penalty, draw_penalty=draw_penalty,
                 material_shaping_per_pawn=material_shaping_per_pawn,
                 dtz_shaping_weight=dtz_shaping_weight,
+                tb_value_aux_weight=tb_value_aux_weight,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
                 trainee_search=trainee_search_now,
@@ -735,6 +773,14 @@ def train_actor_critic(actor_critic_net,
             masks_t = torch.stack(masks).to(device)
             actions_t = torch.tensor(actions, dtype=torch.long, device=device)
             returns_t = torch.stack(returns).view(-1).to(device)
+            tb_aux_on = tb_value_aux_weight > 0.0 and any(t is not None for t in tb_targets)
+            if tb_aux_on:
+                # NaN marks "no tablebase target" (outside the domain); masked
+                # out of the auxiliary loss, never treated as a real value.
+                tb_target_t = torch.tensor(
+                    [float("nan") if t is None else t for t in tb_targets],
+                    dtype=torch.float32, device=device,
+                )
             distill_on = (
                 distill_weight > 0.0 and trainee_search
                 and topk_idxs and topk_idxs[0] is not None
@@ -780,6 +826,9 @@ def train_actor_critic(actor_critic_net,
                 m_topk_idx = mirror_perm[topk_idx_t]
                 topk_idx_t = torch.cat([topk_idx_t, m_topk_idx], 0)
                 log_b_topk_t = torch.cat([log_b_topk_t, log_b_topk_t], 0)
+            if tb_aux_on:
+                # Tablebase value target is invariant to the file-flip mirror.
+                tb_target_t = torch.cat([tb_target_t, tb_target_t], 0)
 
             # pi_old_lp_t: log π at rollout time (== current weights, since no PPO
             # update has happened yet this batch). Used for the approx_kl /
@@ -804,6 +853,7 @@ def train_actor_critic(actor_critic_net,
 
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
             distill_loss_sum = 0.0
+            tb_aux_loss_sum = 0.0
             approx_kl_sum = clip_frac_sum = 0.0
             update_count = 0
             early_stopped_at: Optional[int] = None
@@ -853,11 +903,27 @@ def train_actor_critic(actor_critic_net,
                         distill_loss = (distill_per_state * pos_mask).sum() / n_pos
                     else:
                         distill_loss = torch.zeros((), device=device)
+                    if tb_aux_on:
+                        # Value-head-only supervision toward tablebase ground
+                        # truth — kept off the reward stream so it corrects the
+                        # critic's baseline without directly rewarding the actor;
+                        # a better-calibrated baseline still sharpens the actor's
+                        # advantage (and thus its training signal) for failed
+                        # conversions, but only via the normal PPO mechanism.
+                        mb_tb_target = tb_target_t[mb]
+                        tb_valid = ~torch.isnan(mb_tb_target)
+                        if tb_valid.any():
+                            tb_aux_loss = F.mse_loss(values.view(-1)[tb_valid], mb_tb_target[tb_valid])
+                        else:
+                            tb_aux_loss = torch.zeros((), device=device)
+                    else:
+                        tb_aux_loss = torch.zeros((), device=device)
                     total_loss = (
                         actor_loss
                         + critic_loss_weight * critic_loss
                         + entropy_weight * entropy_loss
                         + distill_weight * distill_loss
+                        + tb_value_aux_weight * tb_aux_loss
                     )
 
                     optimizer.zero_grad()
@@ -876,6 +942,7 @@ def train_actor_critic(actor_critic_net,
                     critic_loss_sum += critic_loss.item()
                     entropy_loss_sum += entropy_loss.item()
                     distill_loss_sum += distill_loss.item()
+                    tb_aux_loss_sum += tb_aux_loss.item()
                     approx_kl_sum += approx_kl
                     clip_frac_sum += clip_frac
                     update_count += 1
@@ -892,6 +959,7 @@ def train_actor_critic(actor_critic_net,
             avg_critic = critic_loss_sum / denom
             avg_entropy = entropy_loss_sum / denom
             avg_distill = distill_loss_sum / denom
+            avg_tb_aux = tb_aux_loss_sum / denom
             avg_kl = approx_kl_sum / denom
             avg_clip = clip_frac_sum / denom
             t2 = perf_counter()
@@ -907,6 +975,7 @@ def train_actor_critic(actor_critic_net,
                     f"Δlogp@a: {s['mean_delta_logp_at_chosen']:+.3f}"
                 )
             distill_info = f" Distill: {avg_distill:.4f}" if distill_weight > 0 else ""
+            tb_aux_info = f" TBaux: {avg_tb_aux:.4f}" if tb_value_aux_weight > 0 else ""
             outcome_info = ""
             outcomes = rollout_stats.get("trainee_outcomes")
             if outcomes is not None:
@@ -927,7 +996,7 @@ def train_actor_critic(actor_critic_net,
                 f"[Batch {batch+1}] {source} | DataGen: {t1 - t0:.2f}s "
                 f"Train: {t2 - t1:.2f}s{suffix} | "
                 f"Actor: {avg_actor:.4f} Critic: {avg_critic:.4f} "
-                f"Entropy: {avg_entropy:.4f}{distill_info} "
+                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info} "
                 f"KL: {avg_kl:.4f} Clip: {avg_clip:.3f}"
                 f"{search_info}"
                 f"{outcome_info}"
@@ -986,6 +1055,21 @@ def _parse_args() -> argparse.Namespace:
              "tablebase wins (0 = off). Dense reward for shrinking distance "
              "to the forced zeroing move; silent outside a confirmed win.",
     )
+    parser.add_argument(
+        "--tb-value-aux-weight", type=float, default=0.0,
+        help="Weight on a value-head-only auxiliary loss toward tablebase "
+             "ground truth (0 = off). Kept out of the reward stream so it "
+             "corrects the critic's baseline without directly rewarding the "
+             "actor for reaching a won position.",
+    )
+    parser.add_argument(
+        "--tablebase-terminate-prob", type=float, default=0.25,
+        help="Per-game probability of auto-terminating with the WDL result "
+             "the instant a <=5-man tablebase position is reached. Set to 0 "
+             "to always play out endgames (e.g. when using "
+             "--tb-value-aux-weight, so the actor never gets an injected "
+             "terminal reward for merely reaching a won position).",
+    )
     return parser.parse_args()
 
 
@@ -1011,6 +1095,8 @@ def main() -> None:
         "lookahead_alpha": args.lookahead_alpha,
         "value_weight": args.value_weight,
         "dtz_shaping_weight": args.dtz_shaping_weight,
+        "tb_value_aux_weight": args.tb_value_aux_weight,
+        "tablebase_terminate_prob": args.tablebase_terminate_prob,
         "distill_weight": 0.0,
     }
     print("[INFO] training configuration")
@@ -1065,12 +1151,13 @@ def main() -> None:
         draw_penalty=0.1,
         material_shaping_per_pawn=0.025,
         dtz_shaping_weight=args.dtz_shaping_weight,
+        tb_value_aux_weight=args.tb_value_aux_weight,
         lookahead_k=4,
         lookahead_alpha=args.lookahead_alpha,
         lookahead_value_weight=args.value_weight,
         trainee_search=args.trainee_search,
         distill_weight=0.0,
-        tablebase_terminate_prob=0.25,
+        tablebase_terminate_prob=args.tablebase_terminate_prob,
         seed=args.seed,
     )
 
