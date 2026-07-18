@@ -12,6 +12,7 @@ if torch.version.hip is not None:
 from helper import board_to_tensor, index_to_move, legal_moves_mask
 from lookahead import select_moves_with_lookahead
 from models import ActorCriticResNet, net_from_state_dict
+from train import _start_position
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +84,15 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Weight on net-derived quiescence values in the search score.",
     )
+    parser.add_argument(
+        "--opening-prob",
+        type=float,
+        default=0.0,
+        help="Probability of starting from a random named opening line "
+             "(same book as train.py) instead of the standard position. "
+             "Match training's opening_prob to test whether the in-training "
+             "vs-engine counter differs due to starting-position mix.",
+    )
     return parser.parse_args()
 
 def _create_engine(path: str, skill: Optional[int]) -> chess.engine.SimpleEngine:
@@ -106,8 +116,9 @@ def _play_game(
     lookahead_alpha: float = 0.33,
     raw: bool = False,
     value_weight: float = 1.0,
+    opening_prob: float = 0.0,
 ) -> Dict[str, int]:
-    board = chess.Board()
+    board = _start_position(opening_prob)
     is_policy_white = (game_index % 2 == 0)
     move_count = 0
 
@@ -199,6 +210,7 @@ def main() -> None:
                 lookahead_alpha=args.lookahead_alpha,
                 raw=args.raw,
                 value_weight=args.value_weight,
+                opening_prob=args.opening_prob,
             )
             game_lengths.append(stats["plies"])
             result = stats["result"]

@@ -186,6 +186,58 @@ plain continuation. Candidates, in rough priority order:
    relevant — v16 and v17's H2H/engine measurements have all landed inside
    their own CIs; paired openings would shrink variance enough to actually
    resolve these close calls instead of accumulating more ties.
+6. **(LOW PRIORITY, not yet built) Diagnose the training-vs-standalone
+   engine-score gap directly**, per user 2026-07-19: call `generate_batch`
+   with a real checkpoint + engine opponent, batch_size=32, several batches
+   — training's actual code path (4-process `EnginePool` under
+   `ThreadPoolExecutor`, no PPO update) — and compare its outcome rate to a
+   standalone `evaluate_vs_engine.py` match. If it reproduces something near
+   the in-training cumulative counter, that confirms the engine-pool's
+   concurrency/contention (not GPU/CPU sharing with the main training
+   process, which was tested and ruled out — see the gap-tracking note
+   below) as the driver. Keep tracking the gap in the meantime (see below);
+   only build this if the gap becomes something we need to act on (e.g. to
+   decide whether the in-training counter can ever be trusted as a ranking
+   signal).
+
+**Standing watch: training-time vs-engine counter is running well ahead of
+standalone `evaluate_vs_engine.py` scores, gap only partially explained
+(2026-07-19 investigation)**. v16: training counter 21.3% vs standalone best
+19.8% (β=2) — close, within noise. **v17: training counter 28.6% vs
+standalone best only 14.4%** — a large, mostly unexplained gap. Tested and
+ruled out / only-partial:
+- Value-weight mismatch (training used β=1, my initial "best" standalone
+  tests used β=2): re-tested v16/v17 at the exact trained β=1 — v16 got
+  17.3% (between raw 12.4% and β=2's 19.8%, doesn't close the gap for v16
+  either); **v17 got 9.9%, actually the lowest score yet** — ruled out as
+  the driver.
+- Opening-book randomization (training's `generate_batch` starts 60% of
+  games from one of 66 named theory lines via `opening_prob=0.6`;
+  `evaluate_vs_engine.py` always started from the standard position only) —
+  now fixed via `--opening-prob` (imports `_start_position` from `train.py`).
+  Re-tested v17 at β=1 + `--opening-prob 0.6`: **14.4%, up from 9.9%** — a
+  real +4.5pp contribution, but far short of closing a ~14pp gap.
+- Truncated-game silent exclusion (`max_plies=600` games neither win/loss/
+  draw get dropped from the reported %, only `T` internally) — checked
+  actual log ply counts for engine batches: max seen was 430, well under the
+  cap. Ruled out, not happening.
+- Shared CPU/GPU power budget (Ryzen AI Max APU) throttling Stockfish during
+  training — the re-test above happened *while v18 was training* (same
+  GPU-contention condition), and still didn't reproduce anything close to
+  28.6%, which argues against this being the dominant mechanism (though
+  doesn't fully rule it out as a smaller contributor).
+- **Leading remaining hypothesis (untested, item 6 above)**: training's
+  engine opponent runs through a 4-process `EnginePool` handling up to 32
+  concurrent board requests per ply via `ThreadPoolExecutor` — a much
+  heavier contention pattern (4 Stockfish processes competing with each
+  other) than `evaluate_vs_engine.py`'s single serial engine playing one
+  game at a time. Untested pending the diagnostic script above.
+- **Practical implication for now**: don't trust the in-training vs-SF
+  counter as a ranking signal on its own (already flagged elsewhere, e.g.
+  v17's counter read *better* than v16's while H2H said v17 was worse) —
+  always confirm with a standalone match. Keep watching whether the gap
+  widens/narrows across future runs; if it stays large and this becomes
+  decision-relevant, build the item-6 diagnostic.
 
 AMD runtime note: the host is a Radeon 8060S (`gfx1151`). `venv-rocm` contains
 PyTorch 2.11.0 + ROCm 7.13. The packaged MIOpen wheel has no readable gfx1151
@@ -221,6 +273,13 @@ finite.
 - `select_moves_with_lookahead`: **widened candidate set** = top-k(π) ∪ legal captures ∪ legal non-capture checks. Returns 10-tuple including `log_b_chosen`, `log_b_topk` for IS / distill.
 - `select_moves_from_policy`: stores `log_pi` under the **actual sampling temperature** (`log_softmax(masked/T)`), so PPO old_log_prob matches the sampling distribution. T=1.0 in current config so this is mathematically neutral, but the fix matters if T≠1 is reintroduced.
 - Quiescence has in-check evasion handling (stand-pat skipped in check; recursion floor at depth ≤ 0).
+
+### `evaluate_vs_engine.py`
+- `--opening-prob` (2026-07-19): imports `_start_position` from `train.py` so
+  standalone matches can replicate training's 60%-book-opening mix instead
+  of always starting from the standard position. Added specifically to
+  investigate the training-vs-standalone engine-score gap (see Next steps);
+  default 0.0 preserves old behavior.
 
 ### `train.py`
 - Default entrypoint is pure PPO (`trainee_search=False`, `distill_weight=0.0`).
