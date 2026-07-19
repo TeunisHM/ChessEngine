@@ -6,6 +6,9 @@ from time import perf_counter
 import chess
 import torch
 
+if torch.version.hip is not None:
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 from helper import index_to_move
 from lookahead import select_moves_with_lookahead
 from models import net_from_state_dict

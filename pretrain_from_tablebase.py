@@ -10,6 +10,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+if torch.version.hip is not None:
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 from helper import (
     board_to_tensor,
     mirror_action_index,

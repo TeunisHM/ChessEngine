@@ -21,6 +21,9 @@ import chess
 import torch
 from torch.utils.data import Dataset
 
+if torch.version.hip is not None:
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 from helper import board_to_tensor, move_to_index
 from models import ActorCriticResNet, load_actor_critic_state_dict
 from pretrain_from_pgn import PGNSupervisedDataset, supervised_pretrain
