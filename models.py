@@ -199,14 +199,30 @@ def infer_use_se(state_dict) -> bool:
     return any(".se." in key for key in state_dict)
 
 
+def infer_num_filters(state_dict) -> int:
+    return state_dict["stem.0.weight"].shape[0]
+
+
+def infer_num_residual_blocks(state_dict) -> int:
+    prefix = "residual_tower."
+    indices = set()
+    for key in state_dict:
+        if key.startswith(prefix) and key.endswith(".conv1.weight"):
+            indices.add(int(key[len(prefix):].split(".")[0]))
+    return max(indices) + 1 if indices else DEFAULT_NUM_RESIDUAL_BLOCKS
+
+
 def net_from_state_dict(state_dict, device="cpu") -> ActorCriticResNet:
-    """Build a net whose architecture matches the checkpoint (policy-head style
-    and SE blocks auto-detected), so checkpoints from every generation load at
-    full fidelity.
+    """Build a net whose architecture matches the checkpoint (policy-head style,
+    SE blocks, filter width, and residual depth all auto-detected), so
+    checkpoints from every generation and every model size load at full
+    fidelity and can safely mix in the same opponent pool.
     """
     net = ActorCriticResNet(
         policy_head_style=infer_policy_head_style(state_dict),
         use_se=infer_use_se(state_dict),
+        num_filters=infer_num_filters(state_dict),
+        num_residual_blocks=infer_num_residual_blocks(state_dict),
     ).to(device)
     load_actor_critic_state_dict(net, state_dict)
     return net

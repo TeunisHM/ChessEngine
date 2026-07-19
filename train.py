@@ -23,7 +23,13 @@ from helper import (
     mirror_board_tensor_batch,
 )
 from lookahead import select_moves_from_policy, select_moves_with_lookahead
-from models import ActorCriticResNet, load_actor_critic_state_dict, net_from_state_dict
+from models import (
+    ActorCriticResNet,
+    DEFAULT_NUM_FILTERS,
+    DEFAULT_NUM_RESIDUAL_BLOCKS,
+    load_actor_critic_state_dict,
+    net_from_state_dict,
+)
 from evaluate_vs_random import evaluate_vs_random
 
 MODELS_DIR = "models"
@@ -1063,6 +1069,14 @@ def _parse_args() -> argparse.Namespace:
              "actor for reaching a won position.",
     )
     parser.add_argument(
+        "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
+        help="Residual tower channel width. Must match --init-from's architecture.",
+    )
+    parser.add_argument(
+        "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
+        help="Number of residual blocks. Must match --init-from's architecture.",
+    )
+    parser.add_argument(
         "--tablebase-terminate-prob", type=float, default=0.25,
         help="Per-game probability of auto-terminating with the WDL result "
              "the instant a <=5-man tablebase position is reached. Set to 0 "
@@ -1097,6 +1111,8 @@ def main() -> None:
         "dtz_shaping_weight": args.dtz_shaping_weight,
         "tb_value_aux_weight": args.tb_value_aux_weight,
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
+        "num_filters": args.num_filters,
+        "num_residual_blocks": args.num_residual_blocks,
         "distill_weight": 0.0,
     }
     print("[INFO] training configuration")
@@ -1106,7 +1122,11 @@ def main() -> None:
     if not os.path.exists(args.init_from):
         raise SystemExit(f"Initial checkpoint not found: {args.init_from}")
 
-    actor_critic_net = ActorCriticResNet(use_se=False).to(run_device)
+    actor_critic_net = ActorCriticResNet(
+        use_se=False,
+        num_filters=args.num_filters,
+        num_residual_blocks=args.num_residual_blocks,
+    ).to(run_device)
     print(f"Loading initial weights from: {args.init_from}")
     incompatible = load_actor_critic_state_dict(
         actor_critic_net, torch.load(args.init_from, map_location=run_device)

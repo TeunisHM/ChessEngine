@@ -9,8 +9,16 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+if torch.version.hip is not None:
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 from helper import board_to_tensor, move_to_index
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import (
+    ActorCriticResNet,
+    DEFAULT_NUM_FILTERS,
+    DEFAULT_NUM_RESIDUAL_BLOCKS,
+    load_actor_critic_state_dict,
+)
 
 
 def _result_to_value(result: str) -> Optional[float]:
@@ -320,6 +328,14 @@ def parse_args() -> argparse.Namespace:
         help="Build the net with squeeze-excitation blocks in the residual tower.",
     )
     parser.add_argument(
+        "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
+        help="Residual tower channel width.",
+    )
+    parser.add_argument(
+        "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
+        help="Number of residual blocks in the tower.",
+    )
+    parser.add_argument(
         "--init-model",
         type=str,
         default=None,
@@ -353,7 +369,11 @@ def main() -> None:
         print("[ERROR] No training samples were loaded from the PGNs.")
         return
 
-    model = ActorCriticResNet(use_se=args.se)
+    model = ActorCriticResNet(
+        use_se=args.se,
+        num_filters=args.num_filters,
+        num_residual_blocks=args.num_residual_blocks,
+    )
     if args.init_model:
         if os.path.exists(args.init_model):
             print(f"[INFO] Loading initial weights from {args.init_model}")
