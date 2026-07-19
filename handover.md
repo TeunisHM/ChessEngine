@@ -4,8 +4,48 @@ Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEn
 
 ## Current state
 
-**Nothing running. v18 FAILED CLEARLY — reverted to v16@449 as baseline
-(2026-07-19).** v18 (300 batches from v16@449, `--tb-value-aux-weight 0.5
+**Running (launched 2026-07-19): fresh pretrain on a scaled-up architecture
+— v19 lineage.** User's call: try a bigger network from scratch (fresh PGN
+pretrain, like v11's lineage restart) rather than more loss-function tweaks
+on the 2.77M-param network. Chose the "aggressive" size option: **16
+residual blocks, 192 filters, 1 transformer layer — 11.5M params (4.1x
+current)**. Compute time, not memory, is the binding constraint (125GB
+unified RAM, 103GB free; bottleneck is the search wrapper's many forward
+passes per move during RL training, which scale with model size).
+
+Enabled by two prerequisite code changes (both committed):
+1. **`net_from_state_dict` now infers filter width and residual depth from
+   the checkpoint's own weight shapes** (previously only policy-head style
+   and SE blocks were auto-detected, size was assumed default 128/8). Without
+   this, loading an 11.5M-param checkpoint through the opponent pool
+   (`_load_random_opponent`) would silently drop every shape-mismatched conv
+   key and hand back a near-random-init net — a serious latent bug now that
+   two model sizes coexist in `models/`. Verified: existing checkpoints still
+   infer 128/8 correctly; a smoke-built 192/16 net round-trips through
+   `net_from_state_dict` correctly.
+2. **`--num-filters`/`--num-residual-blocks` CLI flags** added to both
+   `pretrain_from_pgn.py` and `train.py`, so both pipeline stages can target
+   the same custom size.
+3. **Found and fixed the same MIOpen gap** (missing `MIOPEN_FIND_MODE=FAST`)
+   in `pretrain_from_pgn.py`, `pretrain_from_puzzles.py`,
+   `pretrain_from_tablebase.py`, and `evaluate_vs_random.py` — same class of
+   bug as the earlier fix to the two `evaluate_vs_*` scripts; every one of
+   these five scripts had hard-failed with `miopenStatusUnknownError` before
+   being caught.
+
+**Pipeline** (mirrors v11's fresh-seed recipe): pass 1 — 3 epochs on
+`lichess_elite_2025-07.pgn` → `models_big/pretrained_big_pass1.pt` (running
+now, `logs/pretrain_big_pass1.log`, ~13 it/s, ~4.3 min/epoch). Pass 2 — 3
+epochs on `lichess_elite_2025-08.pgn`, init from pass 1 →
+`models_big/pretrained_big.pt`. Then the validated recipe (`--trainee-search
+--lookahead-alpha 1.0 --value-weight 1.0 --dtz-shaping-weight 0.15`, matching
+v16/v17/v18) launches from that fresh seed with `--num-filters 192
+--num-residual-blocks 16`, as the first generation of the new lineage.
+**v16@449 (2.77M params) remains the fallback baseline** if the bigger
+architecture underperforms once trained.
+
+**v18 FAILED CLEARLY (2026-07-19, historical, superseded by the above as the
+active work).** v18 (300 batches from v16@449, `--tb-value-aux-weight 0.5
 --tablebase-terminate-prob 0.0` on top of v16's recipe) was the first real
 use of the tablebase value-head auxiliary loss (see mechanism below). Result,
 unlike v16/v17's close calls, is a clear and statistically significant
