@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ChessEngine GUI</title>
+<link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 20px auto; }
+  #layout { display: flex; gap: 24px; }
+  #board { width: 480px; }
+  #controls { flex: 1; min-width: 320px; }
+  fieldset { margin-bottom: 12px; }
+  label { display: block; margin-top: 6px; }
+  select, input[type=number] { width: 100%; box-sizing: border-box; }
+  #status { font-weight: bold; margin: 10px 0; }
+  #history { height: 160px; overflow-y: auto; border: 1px solid #ccc; padding: 6px; font-family: monospace; font-size: 13px; }
+  .mode-panel { display: none; }
+  .mode-panel.active { display: block; }
+  button { margin-right: 8px; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h2>ChessEngine GUI</h2>
+
+<div id="layout">
+  <div id="board"></div>
+
+  <div id="controls">
+    <label>Mode
+      <select id="mode">
+        <option value="human_vs_model">Human vs Model</option>
+        <option value="model_vs_model">Model vs Model</option>
+        <option value="model_vs_engine">Model vs Engine</option>
+      </select>
+    </label>
+
+    <div id="panel-human_vs_model" class="mode-panel">
+      <fieldset>
+        <legend>Model</legend>
+        <label>Checkpoint <select class="model-select" id="hm-model"></select></label>
+        <label><input type="checkbox" id="hm-raw" checked> Raw policy (uncheck for search wrapper)</label>
+        <div class="search-cfg" id="hm-search-cfg" style="display:none">
+          <label>top-k <input type="number" id="hm-k" value="4"></label>
+          <label>alpha <input type="number" id="hm-alpha" value="1.0" step="0.1"></label>
+          <label>value-weight <input type="number" id="hm-vw" value="2.0" step="0.1"></label>
+        </div>
+        <label>Temperature <input type="number" id="hm-temp" value="0.0" step="0.1"></label>
+        <label>Play as
+          <select id="hm-color"><option value="white">White</option><option value="black">Black</option></select>
+        </label>
+      </fieldset>
+    </div>
+
+    <div id="panel-model_vs_model" class="mode-panel">
+      <fieldset>
+        <legend>White</legend>
+        <label>Checkpoint <select class="model-select" id="mm-a-model"></select></label>
+        <label><input type="checkbox" id="mm-a-raw" checked> Raw policy</label>
+        <div class="search-cfg" id="mm-a-search-cfg" style="display:none">
+          <label>top-k <input type="number" id="mm-a-k" value="4"></label>
+          <label>alpha <input type="number" id="mm-a-alpha" value="1.0" step="0.1"></label>
+          <label>value-weight <input type="number" id="mm-a-vw" value="2.0" step="0.1"></label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Black</legend>
+        <label>Checkpoint <select class="model-select" id="mm-b-model"></select></label>
+        <label><input type="checkbox" id="mm-b-raw" checked> Raw policy</label>
+        <div class="search-cfg" id="mm-b-search-cfg" style="display:none">
+          <label>top-k <input type="number" id="mm-b-k" value="4"></label>
+          <label>alpha <input type="number" id="mm-b-alpha" value="1.0" step="0.1"></label>
+          <label>value-weight <input type="number" id="mm-b-vw" value="2.0" step="0.1"></label>
+        </div>
+      </fieldset>
+      <label>Temperature (both) <input type="number" id="mm-temp" value="1.0" step="0.1"></label>
+    </div>
+
+    <div id="panel-model_vs_engine" class="mode-panel">
+      <fieldset>
+        <legend>Model</legend>
+        <label>Checkpoint <select class="model-select" id="me-model"></select></label>
+        <label><input type="checkbox" id="me-raw" checked> Raw policy</label>
+        <div class="search-cfg" id="me-search-cfg" style="display:none">
+          <label>top-k <input type="number" id="me-k" value="4"></label>
+          <label>alpha <input type="number" id="me-alpha" value="1.0" step="0.1"></label>
+          <label>value-weight <input type="number" id="me-vw" value="2.0" step="0.1"></label>
+        </div>
+        <label>Temperature <input type="number" id="me-temp" value="0.0" step="0.1"></label>
+        <label>Model plays
+          <select id="me-color"><option value="white">White</option><option value="black">Black</option></select>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Engine (Stockfish)</legend>
+        <label>Skill level (0-20) <input type="number" id="me-skill" value="0"></label>
+        <label>Move time (s) <input type="number" id="me-movetime" value="0.1" step="0.01"></label>
+      </fieldset>
+    </div>
+
+    <button id="start-btn">Start Game</button>
+    <button id="step-btn" disabled>Step</button>
+    <button id="auto-btn" disabled>Auto-play</button>
+
+    <div id="status">No game running.</div>
+    <div id="history"></div>
+  </div>
+</div>
+
+<script>
+let board = null;
+let gameId = null;
+let autoTimer = null;
+let humanColor = null;
+let currentMode = null;
+
+function modelOption(path) {
+  return $('<option>').val(path).text(path);
+}
+
+function loadModels() {
+  $.getJSON('/api/models', function(data) {
+    $('.model-select').empty();
+    data.models.forEach(function(path) {
+      $('.model-select').append(modelOption(path));
+    });
+  });
+}
+
+function showModePanel() {
+  const mode = $('#mode').val();
+  currentMode = mode;
+  $('.mode-panel').removeClass('active');
+  $('#panel-' + mode).addClass('active');
+}
+
+['hm', 'mm-a', 'mm-b', 'me'].forEach(function(prefix) {
+  $('#' + prefix + '-raw').change(function() {
+    $('#' + prefix + '-search-cfg').toggle(!this.checked);
+  });
+});
+
+$('#mode').change(showModePanel);
+
+function modelConfig(prefix, tempId) {
+  return {
+    path: $('#' + prefix + '-model').val(),
+    raw: $('#' + prefix + '-raw').is(':checked'),
+    temperature: tempId ? parseFloat($('#' + tempId).val()) : 1.0,
+    k: parseInt($('#' + prefix + '-k').val()),
+    alpha: parseFloat($('#' + prefix + '-alpha').val()),
+    value_weight: parseFloat($('#' + prefix + '-vw').val()),
+  };
+}
+
+function renderState(state) {
+  board.position(state.fen);
+  $('#status').text(
+    (state.white_label || '?') + ' (White) vs ' + (state.black_label || '?') + ' (Black) — ' +
+    (state.game_over ? 'Game over: ' + state.result : 'Turn: ' + state.turn)
+  );
+  $('#history').text(state.san_history.map((san, i) =>
+    (i % 2 === 0 ? (i/2 + 1) + '. ' : '') + san + ' '
+  ).join(''));
+  $('#history').scrollTop($('#history')[0].scrollHeight);
+  if (state.game_over) {
+    stopAuto();
+    $('#step-btn, #auto-btn').prop('disabled', true);
+  }
+}
+
+function startGame() {
+  const mode = $('#mode').val();
+  let payload = { mode: mode };
+
+  if (mode === 'human_vs_model') {
+    payload.model = modelConfig('hm', 'hm-temp');
+    payload.human_color = $('#hm-color').val();
+    humanColor = payload.human_color;
+  } else if (mode === 'model_vs_model') {
+    payload.model_a = modelConfig('mm-a', 'mm-temp');
+    payload.model_b = modelConfig('mm-b', 'mm-temp');
+    humanColor = null;
+  } else if (mode === 'model_vs_engine') {
+    payload.model = modelConfig('me', 'me-temp');
+    payload.model_color = $('#me-color').val();
+    payload.engine = { skill: parseInt($('#me-skill').val()), move_time: parseFloat($('#me-movetime').val()) };
+    humanColor = null;
+  }
+
+  $.ajax({
+    url: '/api/new_game', method: 'POST', contentType: 'application/json',
+    data: JSON.stringify(payload),
+    success: function(state) {
+      gameId = state.game_id;
+      renderState(state);
+      const humanDriven = mode === 'human_vs_model';
+      $('#step-btn, #auto-btn').prop('disabled', humanDriven);
+      board.draggable = true;
+    },
+    error: function(xhr) { alert('Failed to start game: ' + xhr.responseText); }
+  });
+}
+
+function onDragStart(source, piece) {
+  if (!gameId || currentMode !== 'human_vs_model') return false;
+  const pieceColor = piece[0] === 'w' ? 'white' : 'black';
+  if (pieceColor !== humanColor) return false;
+}
+
+function onDrop(source, target) {
+  if (!gameId) return 'snapback';
+  $.ajax({
+    url: '/api/human_move', method: 'POST', contentType: 'application/json',
+    data: JSON.stringify({ game_id: gameId, uci: source + target }),
+    success: renderState,
+    error: function() { board.position(board.fen()); }
+  });
+}
+
+function doStep() {
+  if (!gameId) return;
+  $.post({
+    url: '/api/step', contentType: 'application/json',
+    data: JSON.stringify({ game_id: gameId }),
+  }).done(renderState);
+}
+
+function stopAuto() {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  $('#auto-btn').text('Auto-play');
+}
+
+function toggleAuto() {
+  if (autoTimer) {
+    stopAuto();
+  } else {
+    autoTimer = setInterval(doStep, 600);
+    $('#auto-btn').text('Stop');
+  }
+}
+
+$(document).ready(function() {
+  board = Chessboard('board', {
+    draggable: true,
+    position: 'start',
+    pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png',
+    onDragStart: onDragStart,
+    onDrop: onDrop,
+  });
+  loadModels();
+  showModePanel();
+  $('#start-btn').click(function() { stopAuto(); startGame(); });
+  $('#step-btn').click(doStep);
+  $('#auto-btn').click(toggleAuto);
+});
+</script>
+
+</body>
+</html>
