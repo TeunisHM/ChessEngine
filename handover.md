@@ -1,20 +1,42 @@
 # Handover — ChessEngine PPO training
 
-Last updated: 2026-07-17. See `~/.claude/projects/-var-home-eunis-Python-ChessEngine/memory/` for the auto-loaded memory index (`MEMORY.md`) and per-topic files.
+Last updated: 2026-07-20. See `~/.claude/projects/-var-home-eunis-Python-ChessEngine/memory/` for the auto-loaded memory index (`MEMORY.md`) and per-topic files.
 
 ## Current state
 
-**Running (launched 2026-07-19): v19, 450 batches, eval every 150 — first
-generation of the scaled-up architecture lineage.** User's call: after v17
-(marginal loss) and v18 (clear −110 to −154 Elo regression) both failed to
-improve on the 2.77M-param network, try a bigger one from scratch instead of
-another loss-function tweak — fresh PGN pretrain, like v11's lineage
-restart. Chose the "aggressive" size option: **16 residual blocks, 192
-filters, 1 transformer layer — 11.5M params (4.1x current)**. Compute time,
-not memory, is the binding constraint (125GB unified RAM, 103GB free;
-bottleneck is the search wrapper's many forward passes per move during RL
-training, which scale with model size) — already visible: batch-0 eval games
-run ~15-19s each vs ~1-2s for the small model.
+**v19 SUCCEEDED DECISIVELY — biggest, cleanest win since v13-control, new
+strongest model by a wide margin (2026-07-20).** First generation of the
+scaled-up architecture lineage: **16 residual blocks, 192 filters, 1
+transformer layer — 11.5M params (4.1x the 2.77M-param network)**, fresh
+PGN pretrain (like v11's lineage restart), then 450 batches of the validated
+search-in-training recipe. User's call after v17 (marginal loss) and v18
+(clear −110 to −154 Elo regression) both failed to improve on the small
+network — try a bigger one from scratch instead of another loss-function
+tweak. Full verdict suite vs v16@449 (101 games each, temp 1.0):
+
+- **v19-raw vs v16-raw: 56W/19D/26L → +106 Elo, CI [+35,+177]**
+- **v19-search(β=2) vs v16-search(β=2): 67W/25D/9L → +227 Elo, CI [+144,+310]**
+- v19-raw vs engine: 10W/14D/77L → 16.8% (v16-raw was 12.4%)
+- **v19-search(β=2) vs engine: 22W/11D/68L → 27.2%, best engine score by a
+  wide margin (previous best 19.8%)**
+
+All four measurements decisively positive, both H2H matches massively
+significant — nothing has cleared this bar since v13-control's original
++232/+284 Elo jump. "Bigger is better" is validated for this domain/recipe,
+at least at this size step. **v19@449
+(`models/ppo_search_v19_checkpoint_449.pt`) is the new baseline for
+everything going forward** (v16@449 kept only for historical reference).
+
+Compute time, not memory, was the binding constraint during training (125GB
+unified RAM, 103GB free; the search wrapper's many forward passes per move
+scale with model size) — self-play batches ran ~15-20s, checkpoint/engine
+batches 4-7 min (comparable to the small model, since search cost already
+dominated), and the PPO update step itself went from ~1.5-3s to ~15-19s
+(~8x, tracking the ~4.1x parameter increase plus overhead). Full run took
+about 16 hours. Cumulative in-training vs-Stockfish counter was 39.8%, by
+far the highest seen — encouraging, though per the standing gap
+investigation this counter runs ahead of standalone matches, so the 27.2%
+standalone figure is the trustworthy number.
 
 Enabled by three prerequisite code changes (all committed):
 1. **`net_from_state_dict` now infers filter width and residual depth from
@@ -54,10 +76,6 @@ the RL checkpoints land in the same shared pool as every small-model
 checkpoint. This is exactly the scenario the `net_from_state_dict` fix
 (above) exists for — v19's checkpoints will genuinely get sampled as
 opponents alongside v10-v18, and must load at correct size.
-
-**v16@449 (2.77M params) remains the fallback baseline** if the bigger
-architecture doesn't outperform once trained through the full pipeline —
-this is a real experiment, not a guaranteed win.
 
 **Process note**: launching the pass2→train chain, an earlier `pkill`
 cleanup command's regex accidentally also killed the *new* chained job
@@ -238,40 +256,35 @@ sensible since v16 was itself trained with search. `evaluate_vs_model.py` has
 
 ## Next steps
 
-Train-to-ceiling strategy (user, 2026-07-18): keep launching continuations
-from the winning checkpoint until a generation's H2H shows no gain, to find
-this architecture/recipe's limit. v17 hit that signal, and v18's attempt at
-a new mechanism failed clearly (see Current state) — **v16@449 is the
-working baseline again**. Candidates, in rough priority order:
+Train-to-ceiling strategy (user, 2026-07-18) validated by v19's result: the
+architecture itself was the actual ceiling on the small network, not the
+recipe — scaling up (16 blocks/192 filters) unlocked a bigger jump than any
+loss-function tweak had. **v19@449 is the new baseline.** Candidates, in
+rough priority order:
 
-1. **Conversion testsuite** (still not built, now higher priority): a set of
-   TB-won positions with known DTZ, scored by how often/fast the model
-   actually converts. Needed before retrying the TB value-aux loss at a
-   lower weight — v18 failed clearly enough that blind retuning isn't
-   advisable; diagnose first.
-2. **If revisiting the TB aux loss**: try a much lower weight (0.05–0.1, not
-   0.5) and change only *one* variable at a time — either the aux loss or
-   `tablebase_terminate_prob=0`, not both together. v18 bundled both, so we
-   don't know which one (or the combination) caused the regression.
-3. **Structural change instead of another loss-function tweak**: this
-   recipe (search-in-training + fixed-formula opponents, current network
-   architecture) has now failed to improve twice in a row (v17 plain
-   continuation, v18 new loss term) — bigger/different network capacity,
-   deeper search (real multi-ply, not 1-ply value lookahead), or revisiting
-   distillation (dormant since v5/v7/v8 failures, but under a fixed-formula
-   behavior policy the original failure mode — near-uniform b — no longer
-   applies, unlike when it was last tried) are the remaining candidates if
-   item 1/2 doesn't pan out.
+1. **v20: continue the v19 lineage.** Same recipe, warm-start from
+   v19@449, matching the "keep training until no improvement" strategy —
+   now on the architecture that's actually shown headroom. Watch whether
+   this continuation compounds (like v15-search→v16 did, marginally) or
+   plateaus immediately (like v16→v17 did) — first continuation on the new
+   architecture is unprecedented data either way.
+2. **Conversion testsuite** (still not built): now more useful than ever —
+   a bigger model may have genuinely better endgame technique, or may not;
+   worth checking directly rather than only inferring from aggregate Elo.
+   Also needed before ever retrying the TB value-aux loss (v18 failed
+   clearly at weight=0.5 on the small network — untested on this one).
+3. **Consider going even bigger**, now that the "aggressive" step paid off
+   clearly rather than marginally — the compute-time tradeoff may be worth
+   paying again if v20/continued lineage plateaus. Not urgent; see how far
+   this size goes first.
 4. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
    [−131,+6]): plain PPO continuation against the harder shared curriculum
    (opponents now fixed-formula, stronger) may have actively hurt rather than
-   merely plateaued. Not blocking, but worth understanding before assuming
-   future pure-PPO continuations are simply "flat."
+   merely plateaued. Not blocking, low priority.
 5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
-   paired opening suite + PGN output in `evaluate_vs_model.py`. v16/v17's
-   close calls would benefit from paired openings; v18's regression was
-   large enough not to need it, but future close calls will.
-   resolve these close calls instead of accumulating more ties.
+   paired opening suite + PGN output in `evaluate_vs_model.py`. Less urgent
+   now — v19's result was large enough not to need it, but future close
+   calls (e.g. a v20 continuation) will.
 6. **(LOW PRIORITY, not yet built) Diagnose the training-vs-standalone
    engine-score gap directly**, per user 2026-07-19: call `generate_batch`
    with a real checkpoint + engine opponent, batch_size=32, several batches
@@ -335,6 +348,7 @@ finite.
 
 | Run | Init | Recipe change | Result |
 |---|---|---|---|
+| **v19 (SUCCEEDED DECISIVELY, +106 to +227 Elo, new baseline)** | fresh PGN pretrain (44.39% acc) | **Scaled architecture: 16 residual blocks, 192 filters (11.5M params, 4.1x)**, same recipe as v16-v18 (search-in-training + DTZ shaping); 450 batches, eval every 150 | H2H **56W/19D/26L vs v16-raw** (+106 Elo, CI[+35,+177]); search(β=2) **67W/25D/9L** (+227 Elo, CI[+144,+310]); engine raw 16.8% (up from 12.4%), engine search(β=2) **27.2%, best to date by far** (up from 19.8%) — all four measurements decisively positive, both H2H significant; biggest clean win since v13-control |
 | v18 (FAILED, clear regression) | v16@449 | Same recipe + tablebase value-head auxiliary loss (`tb_value_aux_weight=0.5`) and `tablebase_terminate_prob=0` (always play out endgames); 300 batches, eval every 100 | H2H **12W/46D/43L vs v16-raw** (−110 Elo, CI[−181,−39]); search(β=2) **15W/29D/57L** (−154 Elo, CI[−228,−79]); engine raw 8.9% (down from 12.4%), engine search(β=2) 7.9% (down from 19.8%) — all four measurements clearly negative, vs-random declined monotonically all run (98→96→92→86); reverted to v16@449 as baseline |
 | v17 (no gain, first ceiling signal) | v16@449 | Straight continuation, same recipe (search-in-training + DTZ shaping 0.15), 300 batches, eval every 100 | H2H **39W/15D/47L vs v16-raw** (−28 Elo, CI[−96,+40]); search(β=2) **34W/27D/40L** (−21 Elo, CI[−88,+47]); engine raw 14.4% (wash); engine search(β=2) **11.9%, down from v16's 19.8%** — 3/4 measurements negative despite a better in-training vs-SF counter (28.6% vs 21.3%) |
 | **v16 (promoted, marginal/directional +14 to +38 Elo)** | v15-search@149 | Same search recipe + `--dtz-shaping-weight 0.15` (new: DTZ conversion progress shaping); 450 batches, eval every 150 | H2H vs v15-search: raw +14 Elo CI[−54,+82]; search(β=2) +38 Elo CI[−30,+106] — neither significant alone, all measurements agree in direction; **engine (β=2) 19.8%, best to date**; continuation+DTZ bundled, not isolated |
