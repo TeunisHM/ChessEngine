@@ -59,12 +59,7 @@ Enabled by three prerequisite code changes (all committed):
 
 **Pretraining complete** (mirrored v11's two-pass recipe): pass 1 (3 epochs,
 `lichess_elite_2025-07.pgn`) finished at **37.55% accuracy**; pass 2 (3
-epochs, `lichess_elite_2025-08.pgn`, init from pass 1) finished at **44.39%
-accuracy** — a real but modest +2.2pp edge over v11's historical 42.2% on
-the small network, despite 4.1x the parameters (worth remembering: top-1
-move-matching accuracy against human games has an inherent ceiling well
-below 100%, so this metric alone may understate the bigger model's actual
-representational improvement). `models_big/pretrained_big.pt` is the seed.
+epochs, `lichess_elite_2025-08.pgn`, init from pass 1) 
 RL training launched immediately after with the validated recipe
 (`--trainee-search --lookahead-alpha 1.0 --value-weight 1.0
 --dtz-shaping-weight 0.15`), correctly defaulting `tb_value_aux_weight=0.0`
@@ -97,30 +92,17 @@ regression on every measurement (101 games each, temp 1.0):
 - v18-search(β=2) vs engine: 5W/6D/90L → 7.9% (v16-search was 19.8%, the
   best-to-date figure it was supposed to build on)
 
-Warning signs were visible *during* training and should have been weighted
-more: vs-random declined monotonically all run (98→96→92→86), unlike v16
-(floor 95) or v17 (flat 97) — the lowest and only strictly-declining pattern
+Warning signs were visible *during* training: vs-random declined monotonically all run (98→96→92→86),
+unlike v16 (floor 95) or v17 (flat 97) — the lowest and only strictly-declining pattern
 seen across any run so far. Draw counts in the H2H (46/101, 29/101) are also
 far above the typical 15–30 range, consistent with the model becoming
 generally more passive, not just better at conversion.
-
-**Working diagnosis (unconfirmed — would need the conversion testsuite to
-verify properly)**: `tb_value_aux_weight=0.5` is co-equal in magnitude with
-`critic_loss_weight=0.5`, so the auxiliary loss may have fought the ordinary
-GAE-based critic loss hard enough to destabilize the shared trunk generally
-(not just improve endgame values) — compounded by simultaneously setting
-`tablebase_terminate_prob=0`, so far more long, hard-to-resolve endgames fed
-into that unstable signal. Two aggressive changes landing on the value head
-at once, with no isolation between them.
 
 **Resolution**: per user's stated fallback ("if it gets worse we'll revert
 the most recent changes"), v16@449 is the working baseline again. The
 TB-aux-loss code stays in the repo (dormant, `--tb-value-aux-weight` defaults
 to 0) rather than being deleted — it may be worth retrying at a much lower
-weight (e.g. 0.05–0.1) with `tablebase_terminate_prob` left nonzero, but not
-without the conversion testsuite to actually diagnose what went wrong first.
-Do not reuse `--tb-value-aux-weight 0.5` / `--tablebase-terminate-prob 0.0`
-as configured in v18.
+weight (e.g. 0.05–0.1) with `tablebase_terminate_prob` left nonzero
 
 **v17 (2026-07-18, 300 batches from v16@449, plain continuation, no new
 mechanism) did NOT improve on v16 — first "no gain" signal on this recipe.**
@@ -268,37 +250,11 @@ rough priority order:
    this continuation compounds (like v15-search→v16 did, marginally) or
    plateaus immediately (like v16→v17 did) — first continuation on the new
    architecture is unprecedented data either way.
-2. **Conversion testsuite** (still not built): now more useful than ever —
-   a bigger model may have genuinely better endgame technique, or may not;
-   worth checking directly rather than only inferring from aggregate Elo.
-   Also needed before ever retrying the TB value-aux loss (v18 failed
-   clearly at weight=0.5 on the small network — untested on this one).
-3. **Consider going even bigger**, now that the "aggressive" step paid off
+2. **Consider going even bigger**, now that the "aggressive" step paid off
    clearly rather than marginally — the compute-time tradeoff may be worth
    paying again if v20/continued lineage plateaus. Not urgent; see how far
    this size goes first.
-4. **Investigate the v15-control-arm regression** (−63 Elo vs v14, CI
-   [−131,+6]): plain PPO continuation against the harder shared curriculum
-   (opponents now fixed-formula, stronger) may have actively hurt rather than
-   merely plateaued. Not blocking, low priority.
-5. **Eval hygiene (LOW PRIORITY — user deprioritized 2026-07-17)**: seed +
-   paired opening suite + PGN output in `evaluate_vs_model.py`. Less urgent
-   now — v19's result was large enough not to need it, but future close
-   calls (e.g. a v20 continuation) will.
-6. **(LOW PRIORITY, not yet built) Diagnose the training-vs-standalone
-   engine-score gap directly**, per user 2026-07-19: call `generate_batch`
-   with a real checkpoint + engine opponent, batch_size=32, several batches
-   — training's actual code path (4-process `EnginePool` under
-   `ThreadPoolExecutor`, no PPO update) — and compare its outcome rate to a
-   standalone `evaluate_vs_engine.py` match. If it reproduces something near
-   the in-training cumulative counter, that confirms the engine-pool's
-   concurrency/contention (not GPU/CPU sharing with the main training
-   process, which was tested and ruled out — see the gap-tracking note
-   below) as the driver. Keep tracking the gap in the meantime (see below);
-   only build this if the gap becomes something we need to act on (e.g. to
-   decide whether the in-training counter can ever be trusted as a ranking
-   signal).
-
+   
 **Standing watch: training-time vs-engine counter is running well ahead of
 standalone `evaluate_vs_engine.py` scores, gap only partially explained
 (2026-07-19 investigation)**. v16: training counter 21.3% vs standalone best
