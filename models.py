@@ -162,12 +162,37 @@ class ActorCriticResNet(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, x):
+        # Separate WDL evaluator head with its own conv adapter. Trained on
+        # objective game outcome (win/draw/loss) with the shared trunk DETACHED,
+        # so it gives search a calibrated zero-sum evaluator without dragging the
+        # policy — unlike supervising the shared value scalar, which backprops
+        # into the trunk and destabilises PPO.
+        self.wdl_head = nn.Sequential(
+            nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1),
+            _norm2d(num_filters),
+            nn.ReLU(),
+            nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1),
+            _norm2d(num_filters),
+            nn.ReLU(),
+            nn.Conv2d(num_filters, 1, kernel_size=1),
+            _norm2d(1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(1 * 8 * 8, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3),          # logits: [win, draw, loss], mover POV
+        )
+
+    def forward(self, x, with_wdl=False, wdl_detach=True):
         out = self.stem(x)
         out = self.residual_tower(out)
         out = self.transformer(out)
         policy_logits = self.policy_head(out)
         state_value = self.value_head(out)
+        if with_wdl:
+            # Detach by default: WDL loss must not update the shared trunk/policy.
+            feat = out.detach() if wdl_detach else out
+            return policy_logits, state_value, self.wdl_head(feat)
         return policy_logits, state_value
 
 def load_actor_critic_state_dict(model, state_dict):

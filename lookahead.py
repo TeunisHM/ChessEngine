@@ -24,6 +24,18 @@ from helper import board_to_tensor, index_to_move, legal_moves_mask, move_to_ind
 MATE_SCORE = 1000.0
 
 
+def _leaf_value(net, board: chess.Board, device, use_wdl: bool) -> float:
+    """Side-to-move leaf evaluation in [-1,1]. use_wdl -> P(win)-P(loss) from the
+    separate WDL head (zero-sum, calibrated); else the scalar value head."""
+    state = board_to_tensor(board).unsqueeze(0).to(device)
+    if use_wdl:
+        _, _, wdl = net(state, with_wdl=True)
+        p = wdl.softmax(-1)
+        return float((p[0, 0] - p[0, 2]).item())
+    _, v = net(state)
+    return float(v.item())
+
+
 @torch.inference_mode()
 def select_moves_from_policy(
     net,
@@ -93,7 +105,7 @@ def _ordered_checks(board: chess.Board):
 @torch.inference_mode()
 def _quiesce_ab(net, board: chess.Board, device,
                 alpha: float, beta: float, depth: int,
-                check_budget: int = 1) -> float:
+                check_budget: int = 1, use_wdl: bool = False) -> float:
     """Negamax alpha-beta quiescence with stand-pat cutoff. Side-to-move value.
 
     Extends through captures at every depth; non-capturing checks are explored
@@ -114,9 +126,7 @@ def _quiesce_ab(net, board: chess.Board, device,
         # deep in a check sequence. V here is approximate (net learns mostly
         # quiet positions) but bounded — better than infinite recursion.
         if depth <= 0:
-            state = board_to_tensor(board).unsqueeze(0).to(device)
-            _, v = net(state)
-            return float(v.item())
+            return _leaf_value(net, board, device, use_wdl)
 
         # No stand-pat — side to move can't refuse the check. Search all legal
         # evasions: captures first (often refute the check best), then quiet.
@@ -126,16 +136,14 @@ def _quiesce_ab(net, board: chess.Board, device,
                 child = board.copy(stack=True)
                 child.push(move)
                 score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                                     depth - 1, check_budget)
+                                     depth - 1, check_budget, use_wdl)
                 if score >= beta:
                     return score
                 if score > alpha:
                     alpha = score
         return alpha
 
-    state = board_to_tensor(board).unsqueeze(0).to(device)
-    _, v = net(state)
-    stand_pat = float(v.item())
+    stand_pat = _leaf_value(net, board, device, use_wdl)
 
     # Stand-pat fail-high: side to move could just refuse to capture.
     if stand_pat >= beta:
@@ -149,7 +157,7 @@ def _quiesce_ab(net, board: chess.Board, device,
         child = board.copy(stack=True)
         child.push(move)
         score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                             depth - 1, check_budget)
+                             depth - 1, check_budget, use_wdl)
         if score >= beta:
             return score
         if score > alpha:
@@ -160,7 +168,7 @@ def _quiesce_ab(net, board: chess.Board, device,
             child = board.copy(stack=True)
             child.push(move)
             score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                                 depth - 1, check_budget - 1)
+                                 depth - 1, check_budget - 1, use_wdl)
             if score >= beta:
                 return score
             if score > alpha:
@@ -176,6 +184,7 @@ def quiesce_batched(
     device,
     max_qdepth: int = 2,
     check_budget: int = 1,
+    use_wdl: bool = False,
 ) -> torch.Tensor:
     """Per-board quiescence via alpha-beta DFS with stand-pat short-circuit and
     MVV-LVA capture ordering. Returns one value per input board (side-to-move).
@@ -185,7 +194,7 @@ def quiesce_batched(
     """
     if not boards:
         return torch.empty(0, device=device)
-    out = [_quiesce_ab(net, b, device, -1e9, 1e9, max_qdepth, check_budget)
+    out = [_quiesce_ab(net, b, device, -1e9, 1e9, max_qdepth, check_budget, use_wdl)
            for b in boards]
     return torch.tensor(out, device=device, dtype=torch.float32)
 
@@ -201,6 +210,7 @@ def select_moves_with_lookahead(
     temperature: float = 0.0,
     max_qdepth: int = 2,
     value_weight: float = 1.0,
+    use_wdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pick a move per board via *widened* candidate set + value quiescence.
@@ -294,7 +304,8 @@ def select_moves_with_lookahead(
                 child_cols.append(j)
 
     if child_boards:
-        child_values = quiesce_batched(net, child_boards, device, max_qdepth=max_qdepth)
+        child_values = quiesce_batched(net, child_boards, device, max_qdepth=max_qdepth,
+                                       use_wdl=use_wdl)
         rows_t = torch.tensor(child_rows, device=device, dtype=torch.long)
         cols_t = torch.tensor(child_cols, device=device, dtype=torch.long)
         # value_weight scales only net-derived quiescence values; ground-truth
