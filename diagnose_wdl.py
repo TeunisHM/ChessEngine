@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--seed", type=int, default=1401)
     ap.add_argument("--band", type=float, default=0.5,
                     help="dead-zone half-width for 3-class thresholding of the value scalar")
+    ap.add_argument("--head", choices=["value", "wdl"], default="value",
+                    help="value = scalar value head (thresholded); wdl = 3-logit WDL head (argmax)")
     ap.add_argument("--tablebase", default="syzygy")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
@@ -73,14 +75,25 @@ def main():
     tgt = torch.tensor(targets)
     with torch.inference_mode():
         states = torch.stack([board_to_tensor(b) for b in boards]).to(dev)
-        vals = []
+        vals, cls_list = [], []
         for i in range(0, len(states), 1024):
-            _, v = net(states[i:i + 1024])
-            vals.append(v.view(-1).cpu())
+            chunk = states[i:i + 1024]
+            if args.head == "wdl":
+                _, _, wdl = net(chunk, with_wdl=True)
+                p = wdl.softmax(-1)
+                vals.append((p[:, 0] - p[:, 2]).cpu())          # P(win) - P(loss)
+                # class from argmax: 0=win->+1, 1=draw->0, 2=loss->-1
+                cls_list.append((1 - wdl.argmax(-1)).cpu())
+            else:
+                _, v = net(chunk)
+                vals.append(v.view(-1).cpu())
         vals = torch.cat(vals)
 
     mae = (vals - tgt).abs().mean().item()
-    pred_cls = torch.tensor([_value_to_class(float(v), args.band) for v in vals])
+    if args.head == "wdl":
+        pred_cls = torch.cat(cls_list)
+    else:
+        pred_cls = torch.tensor([_value_to_class(float(v), args.band) for v in vals])
     true_cls = tgt.to(torch.long)
     acc = (pred_cls == true_cls).float().mean().item()
 

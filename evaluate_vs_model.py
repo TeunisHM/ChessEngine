@@ -27,8 +27,9 @@ def _raw_policy_index(net, board, device, temperature: float) -> int:
 def play_game(net_a, net_b, device, *, a_is_white: bool,
               lookahead_k: int, lookahead_alpha: float, temperature: float,
               raw_a: bool = False, raw_b: bool = False,
-              value_weight: float = 1.0, max_qdepth: int = 2):
-    board = chess.Board()
+              value_weight: float = 1.0, max_qdepth: int = 2, use_wdl: bool = False,
+              start_board: "chess.Board | None" = None):
+    board = chess.Board() if start_board is None else start_board.copy()
     while not board.is_game_over():
         a_turn = (board.turn == chess.WHITE) == a_is_white
         net = net_a if a_turn else net_b
@@ -39,7 +40,7 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
                 net, [board], device,
                 top_k=lookahead_k, alpha=lookahead_alpha,
                 temperature=temperature, value_weight=value_weight,
-                max_qdepth=max_qdepth,
+                max_qdepth=max_qdepth, use_wdl=use_wdl,
             )
             idx = int(idxs[0].item())
         move = index_to_move(idx, board)
@@ -70,6 +71,12 @@ def main():
                         help="Max forcing-move plies quiescence extends below "
                              "each candidate (default 2). Higher = deeper "
                              "tactical horizon along captures/checks.")
+    parser.add_argument("--use-wdl", action="store_true",
+                        help="Model A's search evaluates leaves with the separate "
+                             "WDL head (P(win)-P(loss)) instead of the value scalar.")
+    parser.add_argument("--paired-openings", action="store_true",
+                        help="Play every opening in the book twice with colors "
+                             "reversed (removes opening+color noise); ignores --games.")
     args = parser.parse_args()
 
     device = (
@@ -87,12 +94,28 @@ def main():
 
     net_a, net_b = nets[args.model_a], nets[args.model_b]
 
+    # Build the game plan: (a_is_white, start_board). Paired openings play each
+    # line twice with colors reversed, removing opening+color as noise sources.
+    plan = []
+    if args.paired_openings:
+        from helper import OPENINGS
+        for san_line in OPENINGS.values():
+            b = chess.Board()
+            try:
+                for san in san_line:
+                    b.push_san(san)
+            except Exception:
+                continue
+            plan.append((True, b)); plan.append((False, b))
+    else:
+        plan = [(i % 2 == 0, None) for i in range(args.games)]
+
     a_wins = b_wins = draws = 0
     a_white_wins = a_black_wins = 0
+    total = len(plan)
     start = perf_counter()
     with torch.inference_mode():
-        for i in range(args.games):
-            a_is_white = i % 2 == 0
+        for i, (a_is_white, start_board) in enumerate(plan):
             result = play_game(
                 net_a, net_b, str(device),
                 a_is_white=a_is_white,
@@ -103,6 +126,8 @@ def main():
                 raw_b=args.raw_b,
                 value_weight=args.value_weight,
                 max_qdepth=args.max_qdepth,
+                use_wdl=args.use_wdl,
+                start_board=start_board,
             )
             if result == "1-0":
                 if a_is_white:
@@ -120,12 +145,12 @@ def main():
             done = i + 1
             elapsed = perf_counter() - start
             rate = done / elapsed if elapsed > 0 else 0
-            eta = (args.games - done) / rate if rate > 0 else 0
+            eta = (total - done) / rate if rate > 0 else 0
             bar_len = 30
-            filled = int(done / args.games * bar_len)
+            filled = int(done / total * bar_len)
             bar = "=" * filled + "-" * (bar_len - filled)
             print(
-                f"\r[{bar}] {done}/{args.games} | A:{a_wins} D:{draws} B:{b_wins} | "
+                f"\r[{bar}] {done}/{total} | A:{a_wins} D:{draws} B:{b_wins} | "
                 f"{elapsed:5.1f}s | ETA {eta:5.1f}s",
                 end="", flush=True,
             )
