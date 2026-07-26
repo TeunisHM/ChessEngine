@@ -27,7 +27,6 @@ from models import (
     ActorCriticResNet,
     DEFAULT_NUM_FILTERS,
     DEFAULT_NUM_RESIDUAL_BLOCKS,
-    load_actor_critic_state_dict,
     net_from_state_dict,
 )
 from evaluate_vs_random import evaluate_vs_random
@@ -124,7 +123,7 @@ def _start_position(opening_prob: float) -> chess.Board:
     return board
 
 
-def _terminal_rewards(board: chess.Board, draw_penalty: float = 0.1):
+def _terminal_rewards(board: chess.Board, draw_penalty: float = 0.0):
     """Win/loss/draw signal from each color's perspective.
 
     Draw penalty makes draws strictly worse than ongoing-but-winnable play, so the
@@ -268,10 +267,11 @@ def generate_batch(actor_critic_net,
                    opponent_move_fn: Optional[OpponentMoveFn] = None,
                    max_plies: int = 600,
                    step_penalty: float = 0.0,
-                   draw_penalty: float = 0.1,
+                   draw_penalty: float = 0.0,
                    material_shaping_per_pawn: float = 0.0,
                    dtz_shaping_weight: float = 0.0,
                    tb_value_aux_weight: float = 0.0,
+                   clean_value_weight: float = 0.0,
                    tablebase: Optional[chess.syzygy.Tablebase] = None,
                    tablebase_terminate_prob: float = 1.0,
                    trainee_search: bool = False,
@@ -310,6 +310,9 @@ def generate_batch(actor_critic_net,
     shape_on = material_shaping_per_pawn > 0.0
     dtz_shape_on = dtz_shaping_weight > 0.0 and tablebase is not None
     tb_aux_on = tb_value_aux_weight > 0.0 and tablebase is not None
+    clean_value_on = clean_value_weight > 0.0
+    # The clean-value anchor uses the game outcome (computed in the gather loop),
+    # not a per-state Syzygy probe, so the rollout path is unchanged when it's on.
 
     # π-vs-search rollout diagnostics (only meaningful when trainee_search).
     search_kl_sum = 0.0
@@ -481,6 +484,7 @@ def generate_batch(actor_critic_net,
     all_old_log_probs, all_old_values, all_returns = [], [], []
     all_topk_idx, all_log_b_topk = [], []
     all_tb_targets = []
+    all_outcome_targets = []
 
     for gid in range(batch_size):
         board = boards[gid]
@@ -505,19 +509,28 @@ def generate_batch(actor_critic_net,
                 if dtz_phi_b is not None:
                     black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_b - last_dtz_phi_black[gid])
 
+        # Clean-value anchor: objective game outcome (mover POV) for every state,
+        # None on a max-plies timeout (unknown result -> masked from the anchor).
         if board.is_game_over():
             final_w, final_b = _terminal_rewards(board, draw_penalty=draw_penalty)
             if white_rewards[gid]:
                 white_rewards[gid][-1] += final_w
             if black_rewards[gid]:
                 black_rewards[gid][-1] += final_b
+            res = board.result()
+            white_outcome = 1.0 if res == "1-0" else (-1.0 if res == "0-1" else 0.0)
+        else:
+            white_outcome = None  # max-plies timeout: result unknown, mask it
         # else: max-plies timeout. Keep the per-ply step-penalty rewards and let
         # GAE bootstrap from 0 — discarding the trajectory wasted training data.
 
-        for traj, rewards in ((white_traj[gid], white_rewards[gid]),
-                              (black_traj[gid], black_rewards[gid])):
+        for is_white, (traj, rewards) in (
+                (True, (white_traj[gid], white_rewards[gid])),
+                (False, (black_traj[gid], black_rewards[gid]))):
             if not traj:
                 continue
+            mover_outcome = None if white_outcome is None else (
+                white_outcome if is_white else -white_outcome)
             vals = [float(v.item()) for (_, _, _, _, v, _, _, _) in traj]
             returns = calculate_gae_returns(rewards, vals, gamma=gamma, lam=gae_lamb)
             for (state_tensor, mask, action_idx, old_lp, old_v,
@@ -531,6 +544,10 @@ def generate_batch(actor_critic_net,
                 all_topk_idx.append(topk_idx)
                 all_log_b_topk.append(log_b_topk)
                 all_tb_targets.append(tb_target)
+                # Objective game outcome (mover POV), None on timeout -> masked.
+                # Game outcomes alone calibrate the value head well (pretrained_big
+                # reached ~90% endgame WDL from PGN results with no tablebase).
+                all_outcome_targets.append(mover_outcome)
 
     stats: dict = {}
     if trainee_search and search_states_n > 0:
@@ -564,7 +581,7 @@ def generate_batch(actor_critic_net,
 
     return (all_states, all_masks, all_actions, all_old_log_probs,
             all_old_values, all_returns, all_topk_idx, all_log_b_topk,
-            all_tb_targets, stats)
+            all_tb_targets, all_outcome_targets, stats)
 
 
 # ---- Training loop ------------------------------------------------------
@@ -634,10 +651,11 @@ def train_actor_critic(actor_critic_net,
                        engine_move_time: float = 0.05,
                        engine_skill_level: Optional[int] = None,
                        step_penalty: float = 0.001,
-                       draw_penalty: float = 0.1,
+                       draw_penalty: float = 0.0,
                        material_shaping_per_pawn: float = 0.0,
                        dtz_shaping_weight: float = 0.0,
                        tb_value_aux_weight: float = 0.0,
+                       clean_value_weight: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
                        lookahead_value_weight: float = 1.0,
@@ -645,7 +663,8 @@ def train_actor_critic(actor_critic_net,
                        distill_weight: float = 0.0,
                        tablebase_path: Optional[str] = "syzygy",
                        tablebase_terminate_prob: float = 1.0,
-                       seed: Optional[int] = None):
+                       seed: Optional[int] = None,
+                       run_config: Optional[dict] = None):
     """PPO training loop with self-play, optional checkpoint and engine opponents."""
     if seed is not None:
         _seed_everything(seed)
@@ -682,29 +701,11 @@ def train_actor_critic(actor_critic_net,
     )
     log_file = open(log_path, "w", newline="", buffering=1)
     log_writer = csv.writer(log_file)
-    _hparams = {
-        "num_batches": num_batches, "eval_interval": eval_interval, "eval_games": eval_games,
-        "gamma": gamma, "gae_lamb": gae_lamb,
-        "critic_loss_weight": critic_loss_weight, "entropy_weight": entropy_weight,
-        "batch_size": batch_size, "opening_prob": opening_prob, "temperature": temperature,
-        "ppo_clip_ratio": ppo_clip_ratio, "ppo_epochs": ppo_epochs,
-        "ppo_minibatch_size": ppo_minibatch_size, "target_kl": target_kl,
-        "opponent_ratio": opponent_ratio, "opponent_temperature": opponent_temperature,
-        "engine_ratio": engine_ratio, "engine_path": engine_path,
-        "engine_pool_size": engine_pool_size, "engine_move_time": engine_move_time,
-        "engine_skill_level": engine_skill_level,
-        "step_penalty": step_penalty, "draw_penalty": draw_penalty,
-        "material_shaping_per_pawn": material_shaping_per_pawn,
-        "dtz_shaping_weight": dtz_shaping_weight,
-        "tb_value_aux_weight": tb_value_aux_weight,
-        "lookahead_k": lookahead_k, "lookahead_alpha": lookahead_alpha,
-        "lookahead_value_weight": lookahead_value_weight,
-        "trainee_search": trainee_search, "distill_weight": distill_weight,
-        "tablebase_path": tablebase_path, "tablebase_terminate_prob": tablebase_terminate_prob,
-        "seed": seed,
-        "optimizer": type(optimizer).__name__,
-        "lr": [g["lr"] for g in optimizer.param_groups],
-    }
+    # Log the exact config dict passed by the caller (single source of truth),
+    # plus the resolved optimizer/lr the caller doesn't know about.
+    _hparams = dict(run_config or {})
+    _hparams["optimizer"] = type(optimizer).__name__
+    _hparams["lr"] = [g["lr"] for g in optimizer.param_groups]
     log_writer.writerow(["# " + " ".join(f"{k}={v}" for k, v in _hparams.items())])
     log_writer.writerow(["batch", "wins", "draws", "losses"])
     print(f"[INFO] eval log: {log_path}")
@@ -752,7 +753,7 @@ def train_actor_critic(actor_critic_net,
 
             actor_critic_net.eval()
             (states, masks, actions, old_lps, old_vs, returns,
-             topk_idxs, log_b_topks, tb_targets, rollout_stats) = generate_batch(
+             topk_idxs, log_b_topks, tb_targets, outcome_targets, rollout_stats) = generate_batch(
                 actor_critic_net, batch_size=batch_size, gamma=gamma, gae_lamb=gae_lamb,
                 device=device, temperature=temperature, opening_prob=opening_prob,
                 opponent_move_fn=opponent_fn,
@@ -760,6 +761,7 @@ def train_actor_critic(actor_critic_net,
                 material_shaping_per_pawn=material_shaping_per_pawn,
                 dtz_shaping_weight=dtz_shaping_weight,
                 tb_value_aux_weight=tb_value_aux_weight,
+                clean_value_weight=clean_value_weight,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
                 trainee_search=trainee_search_now,
@@ -785,6 +787,14 @@ def train_actor_critic(actor_critic_net,
                 # out of the auxiliary loss, never treated as a real value.
                 tb_target_t = torch.tensor(
                     [float("nan") if t is None else t for t in tb_targets],
+                    dtype=torch.float32, device=device,
+                )
+            clean_value_on = clean_value_weight > 0.0 and any(t is not None for t in outcome_targets)
+            if clean_value_on:
+                # Dense objective-outcome anchor (mover POV, Syzygy-exact in the
+                # endgame). NaN = timeout game with unknown result -> masked out.
+                outcome_target_t = torch.tensor(
+                    [float("nan") if t is None else t for t in outcome_targets],
                     dtype=torch.float32, device=device,
                 )
             distill_on = (
@@ -835,6 +845,9 @@ def train_actor_critic(actor_critic_net,
             if tb_aux_on:
                 # Tablebase value target is invariant to the file-flip mirror.
                 tb_target_t = torch.cat([tb_target_t, tb_target_t], 0)
+            if clean_value_on:
+                # Game outcome is invariant to the file-flip mirror.
+                outcome_target_t = torch.cat([outcome_target_t, outcome_target_t], 0)
 
             # pi_old_lp_t: log π at rollout time (== current weights, since no PPO
             # update has happened yet this batch). Used for the approx_kl /
@@ -860,6 +873,7 @@ def train_actor_critic(actor_critic_net,
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
             distill_loss_sum = 0.0
             tb_aux_loss_sum = 0.0
+            clean_value_loss_sum = 0.0
             approx_kl_sum = clip_frac_sum = 0.0
             update_count = 0
             early_stopped_at: Optional[int] = None
@@ -924,12 +938,26 @@ def train_actor_critic(actor_critic_net,
                             tb_aux_loss = torch.zeros((), device=device)
                     else:
                         tb_aux_loss = torch.zeros((), device=device)
+                    if clean_value_on:
+                        # Dense supervision of the value head toward objective
+                        # outcome — keeps it a calibrated evaluator so search stays
+                        # useful; separate from the GAE critic target and the
+                        # reward stream (never touches the actor directly).
+                        mb_ct = outcome_target_t[mb]
+                        ct_valid = ~torch.isnan(mb_ct)
+                        if ct_valid.any():
+                            clean_value_loss = F.mse_loss(values.view(-1)[ct_valid], mb_ct[ct_valid])
+                        else:
+                            clean_value_loss = torch.zeros((), device=device)
+                    else:
+                        clean_value_loss = torch.zeros((), device=device)
                     total_loss = (
                         actor_loss
                         + critic_loss_weight * critic_loss
                         + entropy_weight * entropy_loss
                         + distill_weight * distill_loss
                         + tb_value_aux_weight * tb_aux_loss
+                        + clean_value_weight * clean_value_loss
                     )
 
                     optimizer.zero_grad()
@@ -949,6 +977,7 @@ def train_actor_critic(actor_critic_net,
                     entropy_loss_sum += entropy_loss.item()
                     distill_loss_sum += distill_loss.item()
                     tb_aux_loss_sum += tb_aux_loss.item()
+                    clean_value_loss_sum += clean_value_loss.item()
                     approx_kl_sum += approx_kl
                     clip_frac_sum += clip_frac
                     update_count += 1
@@ -966,6 +995,7 @@ def train_actor_critic(actor_critic_net,
             avg_entropy = entropy_loss_sum / denom
             avg_distill = distill_loss_sum / denom
             avg_tb_aux = tb_aux_loss_sum / denom
+            avg_clean_value = clean_value_loss_sum / denom
             avg_kl = approx_kl_sum / denom
             avg_clip = clip_frac_sum / denom
             t2 = perf_counter()
@@ -982,6 +1012,7 @@ def train_actor_critic(actor_critic_net,
                 )
             distill_info = f" Distill: {avg_distill:.4f}" if distill_weight > 0 else ""
             tb_aux_info = f" TBaux: {avg_tb_aux:.4f}" if tb_value_aux_weight > 0 else ""
+            clean_value_info = f" CleanV: {avg_clean_value:.4f}" if clean_value_weight > 0 else ""
             outcome_info = ""
             outcomes = rollout_stats.get("trainee_outcomes")
             if outcomes is not None:
@@ -1002,7 +1033,7 @@ def train_actor_critic(actor_critic_net,
                 f"[Batch {batch+1}] {source} | DataGen: {t1 - t0:.2f}s "
                 f"Train: {t2 - t1:.2f}s{suffix} | "
                 f"Actor: {avg_actor:.4f} Critic: {avg_critic:.4f} "
-                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info} "
+                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info}{clean_value_info} "
                 f"KL: {avg_kl:.4f} Clip: {avg_clip:.3f}"
                 f"{search_info}"
                 f"{outcome_info}"
@@ -1033,12 +1064,14 @@ def train_actor_critic(actor_critic_net,
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the chess actor-critic model.")
     parser.add_argument(
-        "--init-from", required=True,
-        help="Model checkpoint used as the warm-start weights.",
+        "--init-from", default=None,
+        help="Checkpoint to warm-start from (architecture inferred from it). "
+             "Omit to cold-start from a fresh random net whose size is set by "
+             "--num-filters / --num-residual-blocks.",
     )
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--num-batches", type=int, default=400)
-    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1401)
     parser.add_argument("--device", default=None)
@@ -1069,12 +1102,21 @@ def _parse_args() -> argparse.Namespace:
              "actor for reaching a won position.",
     )
     parser.add_argument(
+        "--clean-value-weight", type=float, default=0.0,
+        help="Weight on a dense value-head-only anchor toward objective game "
+             "outcome (mover POV, Syzygy-exact in the endgame; 0 = off). Keeps "
+             "the value head a calibrated evaluator during RL so search stays "
+             "useful. Separate from the GAE critic target and the reward stream.",
+    )
+    parser.add_argument(
         "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
-        help="Residual tower channel width. Must match --init-from's architecture.",
+        help="Residual tower width for a cold start; ignored when --init-from "
+             "is given (architecture is inferred from the checkpoint).",
     )
     parser.add_argument(
         "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
-        help="Number of residual blocks. Must match --init-from's architecture.",
+        help="Residual block count for a cold start; ignored when --init-from "
+             "is given (architecture is inferred from the checkpoint).",
     )
     parser.add_argument(
         "--tablebase-terminate-prob", type=float, default=0.25,
@@ -1093,49 +1135,75 @@ def main() -> None:
     if torch.version.hip is not None:
         os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
-    run_config = {
+    if args.init_from is not None and not os.path.exists(args.init_from):
+        raise SystemExit(f"Initial checkpoint not found: {args.init_from}")
+
+    # Single source of truth for every training hyperparameter. Keys are exactly
+    # train_actor_critic's kwargs, so it is passed straight through (**config)
+    # and saved verbatim to the eval log — no second hand-maintained copy.
+    config = {
         "model_name": args.model_name,
-        "init_from": args.init_from,
+        "device": run_device,
         "num_batches": args.num_batches,
         "eval_interval": args.eval_interval,
         "eval_games": args.eval_games,
         "seed": args.seed,
-        "device": run_device,
-        "torch": torch.__version__,
-        "hip": torch.version.hip,
-        "precision": "fp32",
-        "miopen_find_mode": os.environ.get("MIOPEN_FIND_MODE"),
-        "trainee_search": args.trainee_search,
+        "gamma": 0.98,
+        "gae_lamb": 0.95,
+        "critic_loss_weight": 0.5,
+        "entropy_weight": 0.005,
+        "batch_size": 32,
+        "opening_prob": 0.6,
+        "temperature": 1.0,
+        "ppo_clip_ratio": 0.2,
+        "ppo_epochs": 4,
+        "ppo_minibatch_size": 256,
+        "target_kl": 0.015,
+        "opponent_ratio": 0.45,
+        "opponent_temperature": 1.0,
+        "engine_ratio": 0.1,
+        "engine_path": "./stockfish/stockfish",
+        "engine_pool_size": 4,
+        "engine_move_time": 0.01,
+        "engine_skill_level": 0,
+        "step_penalty": 0.001,
+        "draw_penalty": 0.0,
+        "material_shaping_per_pawn": 0.025,
+        "lookahead_k": 4,
         "lookahead_alpha": args.lookahead_alpha,
-        "value_weight": args.value_weight,
+        "lookahead_value_weight": args.value_weight,
+        "trainee_search": args.trainee_search,
+        "distill_weight": 0.0,
         "dtz_shaping_weight": args.dtz_shaping_weight,
         "tb_value_aux_weight": args.tb_value_aux_weight,
+        "clean_value_weight": args.clean_value_weight,
+        "tablebase_path": "syzygy",
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
-        "num_filters": args.num_filters,
-        "num_residual_blocks": args.num_residual_blocks,
-        "distill_weight": 0.0,
     }
+
     print("[INFO] training configuration")
-    for key, value in run_config.items():
+    print(f"  init_from={args.init_from}")
+    print(f"  torch={torch.__version__} hip={torch.version.hip} "
+          f"miopen_find_mode={os.environ.get('MIOPEN_FIND_MODE')}")
+    for key, value in config.items():
         print(f"  {key}={value}")
 
-    if not os.path.exists(args.init_from):
-        raise SystemExit(f"Initial checkpoint not found: {args.init_from}")
-
-    actor_critic_net = ActorCriticResNet(
-        use_se=False,
-        num_filters=args.num_filters,
-        num_residual_blocks=args.num_residual_blocks,
-    ).to(run_device)
-    print(f"Loading initial weights from: {args.init_from}")
-    incompatible = load_actor_critic_state_dict(
-        actor_critic_net, torch.load(args.init_from, map_location=run_device)
-    )
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise RuntimeError(
-            "Initial checkpoint did not load at full fidelity: "
-            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+    if args.init_from is not None:
+        # Architecture (filter width, residual depth, policy-head style, SE) is
+        # inferred from the checkpoint's own weight shapes, so the loaded net
+        # always matches --init-from — there is no way to mismatch it.
+        print(f"Loading initial weights from: {args.init_from}")
+        actor_critic_net = net_from_state_dict(
+            torch.load(args.init_from, map_location=run_device), run_device
         )
+    else:
+        print(f"Cold start: fresh net "
+              f"({args.num_filters} filters x {args.num_residual_blocks} blocks)")
+        actor_critic_net = ActorCriticResNet(
+            use_se=False,
+            num_filters=args.num_filters,
+            num_residual_blocks=args.num_residual_blocks,
+        ).to(run_device)
 
     optimizer = torch.optim.AdamW(
         actor_critic_net.parameters(), lr=5e-5, betas=(0.9, 0.999), weight_decay=0.0
@@ -1143,44 +1211,10 @@ def main() -> None:
 
     train_actor_critic(
         actor_critic_net=actor_critic_net,
-        model_name=args.model_name,
         optimizer=optimizer,
-        device=run_device,
-        num_batches=args.num_batches,
-        eval_interval=args.eval_interval,
-        eval_games=args.eval_games,
-        gamma=0.98,
-        gae_lamb=0.95,
-        critic_loss_weight=0.5,
-        entropy_weight=0.005,
-        batch_size=32,
-        opening_prob=0.6,
-        temperature=1.0,
-        ppo_clip_ratio=0.2,
-        ppo_epochs=4,
-        ppo_minibatch_size=256,
-        target_kl=0.015,
-        opponent_ratio=0.45,
-        opponent_temperature=1.0,
-        engine_ratio=0.1,
-        engine_path="./stockfish/stockfish",
-        engine_pool_size=4,
-        engine_move_time=0.01,
-        engine_skill_level=0,
-        step_penalty=0.001,
-        draw_penalty=0.1,
-        material_shaping_per_pawn=0.025,
-        dtz_shaping_weight=args.dtz_shaping_weight,
-        tb_value_aux_weight=args.tb_value_aux_weight,
-        lookahead_k=4,
-        lookahead_alpha=args.lookahead_alpha,
-        lookahead_value_weight=args.value_weight,
-        trainee_search=args.trainee_search,
-        distill_weight=0.0,
-        tablebase_terminate_prob=args.tablebase_terminate_prob,
-        seed=args.seed,
+        run_config=config,
+        **config,
     )
-
 
 if __name__ == "__main__":
     main()
