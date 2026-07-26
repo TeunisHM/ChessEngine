@@ -19,6 +19,10 @@ import torch.nn.functional as F
 
 from helper import board_to_tensor, index_to_move, legal_moves_mask, move_to_index
 
+# Proven-mate score: dominant and independent of value_weight, so a forced mate
+# always outranks any learned evaluation (fixes value_weight>1 rejecting mate).
+MATE_SCORE = 1000.0
+
 
 @torch.inference_mode()
 def select_moves_from_policy(
@@ -103,7 +107,7 @@ def _quiesce_ab(net, board: chess.Board, device,
     perpetual-check sequences can't run unbounded.
     """
     if board.is_game_over(claim_draw=False):
-        return -1.0 if board.is_checkmate() else 0.0
+        return -MATE_SCORE if board.is_checkmate() else 0.0
 
     if board.is_check():
         # Recursion floor: fall back to the net's evaluation if we're stuck
@@ -119,7 +123,7 @@ def _quiesce_ab(net, board: chess.Board, device,
         for move_set in (_ordered_captures(board),
                          (m for m in board.legal_moves if not board.is_capture(m))):
             for move in move_set:
-                child = board.copy(stack=False)
+                child = board.copy(stack=True)
                 child.push(move)
                 score = -_quiesce_ab(net, child, device, -beta, -alpha,
                                      depth - 1, check_budget)
@@ -142,7 +146,7 @@ def _quiesce_ab(net, board: chess.Board, device,
         return alpha
 
     for move in _ordered_captures(board):
-        child = board.copy(stack=False)
+        child = board.copy(stack=True)
         child.push(move)
         score = -_quiesce_ab(net, child, device, -beta, -alpha,
                              depth - 1, check_budget)
@@ -153,7 +157,7 @@ def _quiesce_ab(net, board: chess.Board, device,
 
     if check_budget > 0:
         for move in _ordered_checks(board):
-            child = board.copy(stack=False)
+            child = board.copy(stack=True)
             child.push(move)
             score = -_quiesce_ab(net, child, device, -beta, -alpha,
                                  depth - 1, check_budget - 1)
@@ -280,10 +284,10 @@ def select_moves_with_lookahead(
             if move is None or move not in board.legal_moves:
                 is_invalid[i, j] = True
                 continue
-            child = board.copy(stack=False)
+            child = board.copy(stack=True)
             child.push(move)
             if child.is_game_over(claim_draw=False):
-                neg_v[i, j] = 1.0 if child.is_checkmate() else 0.0
+                neg_v[i, j] = MATE_SCORE if child.is_checkmate() else 0.0
             else:
                 child_boards.append(child)
                 child_rows.append(i)
@@ -296,7 +300,11 @@ def select_moves_with_lookahead(
         # value_weight scales only net-derived quiescence values; ground-truth
         # terminal entries (checkmate/stalemate children) keep full weight, so
         # value_weight=0 ablates the learned evaluation but not mate detection.
-        neg_v.index_put_((rows_t, cols_t), -child_values.to(neg_v.dtype) * value_weight)
+        # Forced mates found in quiescence (|value| == MATE_SCORE) also bypass the
+        # scaling, so a proven mate stays dominant regardless of value_weight.
+        cv = -child_values.to(neg_v.dtype)
+        cv = torch.where(cv.abs() >= MATE_SCORE, cv, cv * value_weight)
+        neg_v.index_put_((rows_t, cols_t), cv)
 
     score = neg_v + alpha * topk_logp
     score = score.masked_fill(is_invalid, -1e9)
