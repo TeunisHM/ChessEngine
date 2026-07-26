@@ -27,7 +27,7 @@ def _raw_policy_index(net, board, device, temperature: float) -> int:
 def play_game(net_a, net_b, device, *, a_is_white: bool,
               lookahead_k: int, lookahead_alpha: float, temperature: float,
               raw_a: bool = False, raw_b: bool = False,
-              value_weight: float = 1.0):
+              value_weight: float = 1.0, max_qdepth: int = 2):
     board = chess.Board()
     while not board.is_game_over():
         a_turn = (board.turn == chess.WHITE) == a_is_white
@@ -39,6 +39,7 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
                 net, [board], device,
                 top_k=lookahead_k, alpha=lookahead_alpha,
                 temperature=temperature, value_weight=value_weight,
+                max_qdepth=max_qdepth,
             )
             idx = int(idxs[0].item())
         move = index_to_move(idx, board)
@@ -65,6 +66,10 @@ def main():
                         help="Weight on net-derived quiescence values in the "
                              "search score (0 ablates the learned evaluation; "
                              "terminal ground truth keeps full weight).")
+    parser.add_argument("--max-qdepth", type=int, default=2,
+                        help="Max forcing-move plies quiescence extends below "
+                             "each candidate (default 2). Higher = deeper "
+                             "tactical horizon along captures/checks.")
     args = parser.parse_args()
 
     device = (
@@ -97,6 +102,7 @@ def main():
                 raw_a=args.raw_a,
                 raw_b=args.raw_b,
                 value_weight=args.value_weight,
+                max_qdepth=args.max_qdepth,
             )
             if result == "1-0":
                 if a_is_white:
