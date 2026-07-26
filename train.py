@@ -271,7 +271,7 @@ def generate_batch(actor_critic_net,
                    material_shaping_per_pawn: float = 0.0,
                    dtz_shaping_weight: float = 0.0,
                    tb_value_aux_weight: float = 0.0,
-                   clean_value_weight: float = 0.0,
+                   wdl_weight: float = 0.0,
                    tablebase: Optional[chess.syzygy.Tablebase] = None,
                    tablebase_terminate_prob: float = 1.0,
                    trainee_search: bool = False,
@@ -307,12 +307,15 @@ def generate_batch(actor_critic_net,
     last_dtz_phi_black: List[Optional[float]] = [None] * batch_size
     done = [False] * batch_size
     tb_terminate = [random.random() < tablebase_terminate_prob for _ in range(batch_size)]
+    # White-POV objective outcome for games ended by Syzygy adjudication (which
+    # leaves the board non-terminal); used as the WDL label for those states.
+    adjudicated_outcome = [None] * batch_size
     shape_on = material_shaping_per_pawn > 0.0
     dtz_shape_on = dtz_shaping_weight > 0.0 and tablebase is not None
     tb_aux_on = tb_value_aux_weight > 0.0 and tablebase is not None
-    clean_value_on = clean_value_weight > 0.0
-    # The clean-value anchor uses the game outcome (computed in the gather loop),
-    # not a per-state Syzygy probe, so the rollout path is unchanged when it's on.
+    wdl_on = wdl_weight > 0.0
+    # The WDL head target is the game outcome (computed in the gather loop), not a
+    # per-state Syzygy probe, so the rollout path is unchanged when it's on.
 
     # π-vs-search rollout diagnostics (only meaningful when trainee_search).
     search_kl_sum = 0.0
@@ -351,6 +354,7 @@ def generate_batch(actor_critic_net,
                     white_rewards[gid][-1] += white_term
                 if black_rewards[gid]:
                     black_rewards[gid][-1] += black_term
+                adjudicated_outcome[gid] = white_term   # white-POV ±1/0 for WDL
                 done[gid] = True
             live_ids = [i for i in live_ids if not done[i]]
             if not live_ids:
@@ -509,8 +513,9 @@ def generate_batch(actor_critic_net,
                 if dtz_phi_b is not None:
                     black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_b - last_dtz_phi_black[gid])
 
-        # Clean-value anchor: objective game outcome (mover POV) for every state,
-        # None on a max-plies timeout (unknown result -> masked from the anchor).
+        # WDL-head label source: objective game outcome (white POV) for every
+        # state. Real terminal -> board result; Syzygy-adjudicated -> the stored
+        # adjudicated outcome; genuine max-plies timeout -> None (masked).
         if board.is_game_over():
             final_w, final_b = _terminal_rewards(board, draw_penalty=draw_penalty)
             if white_rewards[gid]:
@@ -519,10 +524,12 @@ def generate_batch(actor_critic_net,
                 black_rewards[gid][-1] += final_b
             res = board.result()
             white_outcome = 1.0 if res == "1-0" else (-1.0 if res == "0-1" else 0.0)
+        elif adjudicated_outcome[gid] is not None:
+            white_outcome = adjudicated_outcome[gid]   # Syzygy-adjudicated result
         else:
             white_outcome = None  # max-plies timeout: result unknown, mask it
-        # else: max-plies timeout. Keep the per-ply step-penalty rewards and let
-        # GAE bootstrap from 0 — discarding the trajectory wasted training data.
+        # timeout: keep the per-ply step-penalty rewards and let GAE bootstrap
+        # from 0 — discarding the trajectory would waste training data.
 
         for is_white, (traj, rewards) in (
                 (True, (white_traj[gid], white_rewards[gid])),
@@ -655,7 +662,7 @@ def train_actor_critic(actor_critic_net,
                        material_shaping_per_pawn: float = 0.0,
                        dtz_shaping_weight: float = 0.0,
                        tb_value_aux_weight: float = 0.0,
-                       clean_value_weight: float = 0.0,
+                       wdl_weight: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
                        lookahead_value_weight: float = 1.0,
@@ -671,6 +678,11 @@ def train_actor_critic(actor_critic_net,
     actor_critic_net.to(device)
     scheduler = LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(num_batches, 0.1))
     mirror_perm = MIRROR_ACTION_PERM.to(device)
+    # Clip core (policy+critic+trunk) and WDL-head grads separately, so a large
+    # WDL-head gradient cannot scale down the PPO update via a shared global norm.
+    core_params = [p for n, p in actor_critic_net.named_parameters()
+                   if not n.startswith("wdl_head.")]
+    wdl_params = list(actor_critic_net.wdl_head.parameters())
 
     engine_pool: Optional[EnginePool] = None
     if engine_path is not None and engine_ratio > 0.0:
@@ -761,7 +773,7 @@ def train_actor_critic(actor_critic_net,
                 material_shaping_per_pawn=material_shaping_per_pawn,
                 dtz_shaping_weight=dtz_shaping_weight,
                 tb_value_aux_weight=tb_value_aux_weight,
-                clean_value_weight=clean_value_weight,
+                wdl_weight=wdl_weight,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
                 trainee_search=trainee_search_now,
@@ -789,8 +801,8 @@ def train_actor_critic(actor_critic_net,
                     [float("nan") if t is None else t for t in tb_targets],
                     dtype=torch.float32, device=device,
                 )
-            clean_value_on = clean_value_weight > 0.0 and any(t is not None for t in outcome_targets)
-            if clean_value_on:
+            wdl_on = wdl_weight > 0.0 and any(t is not None for t in outcome_targets)
+            if wdl_on:
                 # Dense objective-outcome anchor (mover POV, Syzygy-exact in the
                 # endgame). NaN = timeout game with unknown result -> masked out.
                 outcome_target_t = torch.tensor(
@@ -845,7 +857,7 @@ def train_actor_critic(actor_critic_net,
             if tb_aux_on:
                 # Tablebase value target is invariant to the file-flip mirror.
                 tb_target_t = torch.cat([tb_target_t, tb_target_t], 0)
-            if clean_value_on:
+            if wdl_on:
                 # Game outcome is invariant to the file-flip mirror.
                 outcome_target_t = torch.cat([outcome_target_t, outcome_target_t], 0)
 
@@ -873,7 +885,7 @@ def train_actor_critic(actor_critic_net,
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
             distill_loss_sum = 0.0
             tb_aux_loss_sum = 0.0
-            clean_value_loss_sum = 0.0
+            wdl_loss_sum = 0.0
             approx_kl_sum = clip_frac_sum = 0.0
             update_count = 0
             early_stopped_at: Optional[int] = None
@@ -894,7 +906,10 @@ def train_actor_critic(actor_critic_net,
                     mb_adv = advantages[mb]
                     mb_ret = returns_t[mb]
 
-                    logits, values = actor_critic_net(mb_states)
+                    if wdl_on:
+                        logits, values, wdl_logits = actor_critic_net(mb_states, with_wdl=True)
+                    else:
+                        logits, values = actor_critic_net(mb_states)
                     masked = logits.masked_fill(~mb_masks, -1e9)
                     dist = torch.distributions.Categorical(logits=masked)
                     new_lp = dist.log_prob(mb_actions)
@@ -938,31 +953,39 @@ def train_actor_critic(actor_critic_net,
                             tb_aux_loss = torch.zeros((), device=device)
                     else:
                         tb_aux_loss = torch.zeros((), device=device)
-                    if clean_value_on:
-                        # Dense supervision of the value head toward objective
-                        # outcome — keeps it a calibrated evaluator so search stays
-                        # useful; separate from the GAE critic target and the
-                        # reward stream (never touches the actor directly).
+                    if wdl_on:
+                        # Separate WDL head supervised on objective game outcome
+                        # (win/draw/loss, mover POV). The forward DETACHES the shared
+                        # trunk for this head, so the loss updates only wdl_head — it
+                        # never touches the policy/critic/trunk (unlike supervising the
+                        # value scalar, which destabilises PPO). A calibrated zero-sum
+                        # evaluator for search, riding along as a safe passenger.
                         mb_ct = outcome_target_t[mb]
-                        ct_valid = ~torch.isnan(mb_ct)
-                        if ct_valid.any():
-                            clean_value_loss = F.mse_loss(values.view(-1)[ct_valid], mb_ct[ct_valid])
+                        cls = torch.full(mb_ct.shape, -1, dtype=torch.long, device=device)
+                        cls[mb_ct > 0] = 0   # win
+                        cls[mb_ct == 0] = 1  # draw
+                        cls[mb_ct < 0] = 2   # loss   (NaN stays -1 = ignore)
+                        wdl_valid = cls >= 0
+                        if wdl_valid.any():
+                            wdl_loss = F.cross_entropy(wdl_logits[wdl_valid], cls[wdl_valid])
                         else:
-                            clean_value_loss = torch.zeros((), device=device)
+                            wdl_loss = torch.zeros((), device=device)
                     else:
-                        clean_value_loss = torch.zeros((), device=device)
+                        wdl_loss = torch.zeros((), device=device)
                     total_loss = (
                         actor_loss
                         + critic_loss_weight * critic_loss
                         + entropy_weight * entropy_loss
                         + distill_weight * distill_loss
                         + tb_value_aux_weight * tb_aux_loss
-                        + clean_value_weight * clean_value_loss
+                        + wdl_weight * wdl_loss
                     )
 
                     optimizer.zero_grad()
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor_critic_net.parameters(), max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(core_params, max_norm=0.5)
+                    if wdl_on:
+                        torch.nn.utils.clip_grad_norm_(wdl_params, max_norm=0.5)
                     optimizer.step()
 
                     with torch.no_grad():
@@ -977,7 +1000,7 @@ def train_actor_critic(actor_critic_net,
                     entropy_loss_sum += entropy_loss.item()
                     distill_loss_sum += distill_loss.item()
                     tb_aux_loss_sum += tb_aux_loss.item()
-                    clean_value_loss_sum += clean_value_loss.item()
+                    wdl_loss_sum += wdl_loss.item()
                     approx_kl_sum += approx_kl
                     clip_frac_sum += clip_frac
                     update_count += 1
@@ -995,7 +1018,7 @@ def train_actor_critic(actor_critic_net,
             avg_entropy = entropy_loss_sum / denom
             avg_distill = distill_loss_sum / denom
             avg_tb_aux = tb_aux_loss_sum / denom
-            avg_clean_value = clean_value_loss_sum / denom
+            avg_wdl = wdl_loss_sum / denom
             avg_kl = approx_kl_sum / denom
             avg_clip = clip_frac_sum / denom
             t2 = perf_counter()
@@ -1012,7 +1035,7 @@ def train_actor_critic(actor_critic_net,
                 )
             distill_info = f" Distill: {avg_distill:.4f}" if distill_weight > 0 else ""
             tb_aux_info = f" TBaux: {avg_tb_aux:.4f}" if tb_value_aux_weight > 0 else ""
-            clean_value_info = f" CleanV: {avg_clean_value:.4f}" if clean_value_weight > 0 else ""
+            wdl_info = f" WDLce: {avg_wdl:.4f}" if wdl_weight > 0 else ""
             outcome_info = ""
             outcomes = rollout_stats.get("trainee_outcomes")
             if outcomes is not None:
@@ -1033,7 +1056,7 @@ def train_actor_critic(actor_critic_net,
                 f"[Batch {batch+1}] {source} | DataGen: {t1 - t0:.2f}s "
                 f"Train: {t2 - t1:.2f}s{suffix} | "
                 f"Actor: {avg_actor:.4f} Critic: {avg_critic:.4f} "
-                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info}{clean_value_info} "
+                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info}{wdl_info} "
                 f"KL: {avg_kl:.4f} Clip: {avg_clip:.3f}"
                 f"{search_info}"
                 f"{outcome_info}"
@@ -1102,11 +1125,11 @@ def _parse_args() -> argparse.Namespace:
              "actor for reaching a won position.",
     )
     parser.add_argument(
-        "--clean-value-weight", type=float, default=0.0,
-        help="Weight on a dense value-head-only anchor toward objective game "
-             "outcome (mover POV, Syzygy-exact in the endgame; 0 = off). Keeps "
-             "the value head a calibrated evaluator during RL so search stays "
-             "useful. Separate from the GAE critic target and the reward stream.",
+        "--wdl-weight", type=float, default=0.0,
+        help="Weight on the separate WDL head's cross-entropy toward objective "
+             "game outcome (win/draw/loss, mover POV; 0 = off). The head's forward "
+             "detaches the shared trunk, so this trains ONLY wdl_head and never "
+             "perturbs the policy/critic — a calibrated evaluator for search.",
     )
     parser.add_argument(
         "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
@@ -1176,7 +1199,7 @@ def main() -> None:
         "distill_weight": 0.0,
         "dtz_shaping_weight": args.dtz_shaping_weight,
         "tb_value_aux_weight": args.tb_value_aux_weight,
-        "clean_value_weight": args.clean_value_weight,
+        "wdl_weight": args.wdl_weight,
         "tablebase_path": "syzygy",
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
     }

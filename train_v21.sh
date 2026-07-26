@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# v21: clean-value RL. Warm-start from v19@449 (champion) with the validated
-# search-in-training recipe PLUS a dense clean-value anchor (--clean-value-weight):
-# the value head is supervised toward objective game outcome (mover POV,
-# Syzygy-exact in the endgame) every batch, so it stays a calibrated evaluator
-# and search remains useful. Value-only anchor — the policy is never imitated.
+# v21: WDL-head RL. Warm-start from v19@449 (champion) with the validated
+# search-in-training recipe PLUS training the SEPARATE WDL head (--wdl-weight):
+# cross-entropy toward objective game outcome, with the shared trunk DETACHED so
+# it only updates wdl_head and never perturbs the policy/critic (unlike the
+# earlier value-scalar anchor, which destabilised PPO). A calibrated evaluator
+# for search, trained on the self-play distribution as a safe passenger.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -33,7 +34,7 @@ nohup venv-rocm/bin/python train.py \
     --lookahead-alpha 1.0 \
     --value-weight 1.0 \
     --dtz-shaping-weight 0.15 \
-    --clean-value-weight 0.5 \
+    --wdl-weight 1.0 \
     --seed 1401 \
     > "${LOG}" 2>&1 &
 
