@@ -1125,6 +1125,11 @@ def _parse_args() -> argparse.Namespace:
              "actor for reaching a won position.",
     )
     parser.add_argument(
+        "--engine-ratio", type=float, default=0.1,
+        help="Fraction of batches played vs the Stockfish engine (the above-level "
+             "teacher). Raise it to lean the curriculum harder on the engine.",
+    )
+    parser.add_argument(
         "--wdl-weight", type=float, default=0.0,
         help="Weight on the separate WDL head's cross-entropy toward objective "
              "game outcome (win/draw/loss, mover POV; 0 = off). The head's forward "
@@ -1184,7 +1189,7 @@ def main() -> None:
         "target_kl": 0.015,
         "opponent_ratio": 0.45,
         "opponent_temperature": 1.0,
-        "engine_ratio": 0.1,
+        "engine_ratio": args.engine_ratio,
         "engine_path": "./stockfish/stockfish",
         "engine_pool_size": 4,
         "engine_move_time": 0.01,
