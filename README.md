@@ -57,14 +57,6 @@ This loads model weights but starts a fresh optimizer and 400-batch cosine
 scheduler. The normal entrypoint uses raw-policy PPO rollouts, no distillation,
 and FP32. Use a distinct model name for every phase.
 
-## Completed v13 Experiment
-
-The pure-PPO control beat v11@399 70W/29D/2L and beat the search-training arm
-82W/16D/3L. The search arm lost to v11@399 17W/45D/39L. Both sides used the
-same lookahead search during H2H evaluation; "pure PPO" refers only to rollout
-generation. See `logs/v13_matched_experiment_final_report_20260715.md` for the
-full analysis.
-
 ## Supervised Pretraining from PGNs
 
 You can optionally warm-start the model on real games before reinforcement learning by running `pretrain_from_pgn.py`. Point it at one or more PGN files and it will optimize the policy head to mimic the human moves while teaching the value head to predict the eventual outcome from each position.
