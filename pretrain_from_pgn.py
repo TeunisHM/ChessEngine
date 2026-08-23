@@ -84,7 +84,7 @@ class PGNSupervisedDataset(Dataset):
         pgn_paths: Iterable[str],
         max_games: Optional[int] = None,
         max_positions: Optional[int] = None,
-        min_result: float = -1.0,
+        min_result: float = -1.5,
         value_discount: float = 0.99,
     ) -> None:
         self.fens: List[str] = []
@@ -147,9 +147,14 @@ class PGNSupervisedDataset(Dataset):
 
                         current_player = 1.0 if board.turn == chess.WHITE else -1.0
                         plies_to_end = total_plies - t
+                        # Filter on the UNDISCOUNTED mover outcome: with
+                        # per-ply discounting, targets shrink into (-1, 1],
+                        # so thresholding the discounted target never filters
+                        # anything (e.g. min_result=0 would keep every loss).
+                        mover_outcome = result * current_player
                         value_target = result * current_player * (value_discount ** plies_to_end)
 
-                        if value_target >= min_result:
+                        if mover_outcome >= min_result:
                             self.fens.append(fen)
                             self.policy_targets.append(move_idx)
                             self.value_targets.append(value_target)
@@ -291,7 +296,9 @@ def parse_args() -> argparse.Namespace:
         "--min-result",
         type=float,
         default=-1.5,
-        help="Minimum eventual outcome for the side to move (-1 loss, 0 draw, 1 win).",
+        help="Minimum UNDISCOUNTED eventual outcome for the side to move "
+             "(-1 loss, 0 draw, 1 win). Default -1.5 keeps everything; "
+             "e.g. 0 drops lost games, 0.01 keeps wins only.",
     )
     parser.add_argument(
         "--batch-size",

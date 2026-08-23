@@ -19,7 +19,12 @@ from helper import (
     mirror_board_tensor,
     move_to_index,
 )
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import (
+    ActorCriticResNet,
+    DEFAULT_NUM_FILTERS,
+    DEFAULT_NUM_RESIDUAL_BLOCKS,
+    load_actor_critic_state_dict,
+)
 
 
 _PIECE_CHOICES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
@@ -287,6 +292,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--value-loss-weight", type=float, default=1.5)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--se", action="store_true",
+        help="Build the net with squeeze-excitation blocks in the residual tower.",
+    )
+    p.add_argument(
+        "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
+        help="Residual tower channel width.",
+    )
+    p.add_argument(
+        "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
+        help="Number of residual blocks in the tower.",
+    )
     p.add_argument("--init-model", default="pretrained.pt",
                    help="Optional .pt to initialize from.")
     p.add_argument("--output-model", default="pretrained_tb.pt")
@@ -309,7 +326,11 @@ def main() -> None:
         print("[ERROR] No samples generated.")
         return
 
-    model = ActorCriticResNet()
+    model = ActorCriticResNet(
+        use_se=args.se,
+        num_filters=args.num_filters,
+        num_residual_blocks=args.num_residual_blocks,
+    )
     if args.init_model and os.path.exists(args.init_model):
         print(f"[INFO] Loading initial weights from {args.init_model}")
         state_dict = torch.load(args.init_model, map_location="cpu")

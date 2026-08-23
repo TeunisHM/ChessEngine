@@ -25,16 +25,35 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import board_to_tensor, move_to_index
-from models import ActorCriticResNet, load_actor_critic_state_dict
+from models import (
+    ActorCriticResNet,
+    DEFAULT_NUM_FILTERS,
+    DEFAULT_NUM_RESIDUAL_BLOCKS,
+    load_actor_critic_state_dict,
+)
 from pretrain_from_pgn import PGNSupervisedDataset, supervised_pretrain
 
 csv.field_size_limit(sys.maxsize)
 
 _TimeBar = PGNSupervisedDataset._TimeBar
 
+# Themes where "solver has a forced/decisive win" is defensible as a value
+# label of +1. Everything else (advantage, defensiveMove, quietMove, endgame
+# conversions, ...) gets a conservative 0.0 instead — a +1 label on defensive
+# puzzles trains the value head to shout "winning" whenever a tactic exists.
+WINNING_THEMES = {
+    "mate", "mateIn1", "mateIn2", "mateIn3", "mateIn4", "mateIn5",
+    "crushing", "winningMaterial",
+}
+
 
 class PuzzleSupervisedDataset(Dataset):
-    """Lichess puzzle CSV → (state, correct_move_idx, value_target=+1)."""
+    """Lichess puzzle CSV → (state, correct_move_idx, value_target).
+
+    value_mode="themes": +1.0 only when the puzzle's themes include a winning
+    theme; otherwise 0.0. value_mode="const": legacy behavior (+1.0 for every
+    solver position).
+    """
 
     def __init__(
         self,
@@ -44,6 +63,7 @@ class PuzzleSupervisedDataset(Dataset):
         max_rating: Optional[int] = None,
         min_rating: Optional[int] = None,
         themes_required: Optional[List[str]] = None,
+        value_mode: str = "themes",
     ) -> None:
         self.fens: List[str] = []
         self.policy_targets: List[int] = []
@@ -55,10 +75,11 @@ class PuzzleSupervisedDataset(Dataset):
             max_rating=max_rating,
             min_rating=min_rating,
             themes_required=set(themes_required) if themes_required else None,
+            value_mode=value_mode,
         )
 
     def _load(self, csv_path, max_puzzles, max_positions, max_rating,
-              min_rating, themes_required):
+              min_rating, themes_required, value_mode):
         bar = _TimeBar(label="[LOAD puzzles]", total=max_positions)
         n_puzzles = 0
         n_positions = 0
@@ -113,9 +134,13 @@ class PuzzleSupervisedDataset(Dataset):
                         except Exception:
                             drop = True
                             break
+                        if value_mode == "const":
+                            value = 1.0
+                        else:
+                            value = 1.0 if WINNING_THEMES.intersection(themes) else 0.0
                         self.fens.append(board.fen())
                         self.policy_targets.append(move_idx)
-                        self.value_targets.append(1.0)
+                        self.value_targets.append(value)
                         n_positions += 1
                         bar.update(n_positions)
                         if max_positions is not None and n_positions >= max_positions:
@@ -153,6 +178,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--themes-required", type=str, default=None,
                         help="Comma-separated themes; puzzles must include at least one "
                              "(e.g. 'mateIn1,mateIn2,endgame').")
+    parser.add_argument("--value-mode", choices=["themes", "const"], default="themes",
+                        help="Value labels: 'themes' gives +1.0 only on winning-theme "
+                             "puzzles (0.0 otherwise); 'const' is the legacy +1.0 "
+                             "for every solver position.")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -160,6 +189,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value-loss-weight", type=float, default=1.5)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--se", action="store_true",
+        help="Build the net with squeeze-excitation blocks in the residual tower.",
+    )
+    parser.add_argument(
+        "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
+        help="Residual tower channel width.",
+    )
+    parser.add_argument(
+        "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
+        help="Number of residual blocks in the tower.",
+    )
     parser.add_argument("--init-model", type=str, default=None,
                         help="Optional .pt file to initialize weights from.")
     parser.add_argument("--output-model", type=str, default="puzzle_pretrained.pt")
@@ -183,12 +224,17 @@ def main() -> None:
         max_rating=args.max_rating,
         min_rating=args.min_rating,
         themes_required=themes,
+        value_mode=args.value_mode,
     )
     if len(dataset) == 0:
         print("[ERROR] No samples passed the filters.")
         return
 
-    model = ActorCriticResNet()
+    model = ActorCriticResNet(
+        use_se=args.se,
+        num_filters=args.num_filters,
+        num_residual_blocks=args.num_residual_blocks,
+    )
     if args.init_model:
         if os.path.exists(args.init_model):
             print(f"[INFO] Loading initial weights from {args.init_model}")
