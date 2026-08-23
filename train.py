@@ -42,6 +42,7 @@ OPPONENT_WEIGHTS = {
     "ppo_search_v21": 2.0,
     "ppo_search_v22": 2.0,
     "ppo_search_v23": 3.0,
+    "ppo_search_v24": 3.0,
 }
 _OPPONENT_BASE_WEIGHT = 1.0
 
@@ -792,6 +793,7 @@ def train_actor_critic(actor_critic_net,
                         eval_k: int = 4,
                         eval_alpha: float = 1.0,
                         eval_value_weight: float = 1.0,
+                        eval_engine_skill: int = 0,
                         gamma: float = 0.99,
                        gae_lamb: float = 0.95,
                        critic_loss_weight: float = 0.5,
@@ -872,10 +874,12 @@ def train_actor_critic(actor_critic_net,
             pool_size = max(1, min(4, eval_games // 2 or 1))
             eval_engine_pool = EnginePool(engine_path or "./stockfish/stockfish",
                                           size=pool_size)
-            if engine_skill_level is not None:
-                eval_engine_pool.configure_all({"Skill Level": int(engine_skill_level)})
+            # Pinned to the frozen protocol skill independently of the
+            # curriculum engine, so the progress gauge stays comparable
+            # across runs even when the teacher gets stronger.
+            eval_engine_pool.configure_all({"Skill Level": int(eval_engine_skill)})
             print(f"[INFO] eval engine pool x{pool_size} "
-                  f"(skill={engine_skill_level}, {engine_move_time}s/move)")
+                  f"(skill={eval_engine_skill}, {engine_move_time}s/move)")
         except Exception as exc:
             print(f"[WARN] eval engine unavailable ({exc}); evals will no-op")
     elif eval_opponent == "ref" and eval_ref_path:
@@ -1372,6 +1376,12 @@ def _parse_args() -> argparse.Namespace:
              "teacher). Raise it to lean the curriculum harder on the engine.",
     )
     parser.add_argument(
+        "--engine-skill-level", type=int, default=0,
+        help="Stockfish Skill Level of the curriculum engine opponent. The "
+             "in-training progress eval stays at the protocol skill 0 "
+             "regardless, so its scores remain comparable across runs.",
+    )
+    parser.add_argument(
         "--wdl-weight", type=float, default=0.0,
         help="Weight on the separate WDL head's cross-entropy toward objective "
              "game outcome (win/draw/loss, mover POV; 0 = off). The head's forward "
@@ -1443,7 +1453,8 @@ def main() -> None:
         "engine_path": "./stockfish/stockfish",
         "engine_pool_size": 4,
         "engine_move_time": 0.01,
-        "engine_skill_level": 0,
+        "engine_skill_level": args.engine_skill_level,
+        "eval_engine_skill": 0,
         "step_penalty": 0.001,
         "draw_penalty": 0.0,
         "material_shaping_per_pawn": 0.025,
