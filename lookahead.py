@@ -102,79 +102,34 @@ def _ordered_checks(board: chess.Board):
             if not board.is_capture(m) and board.gives_check(m)]
 
 
-@torch.inference_mode()
-def _quiesce_ab(net, board: chess.Board, device,
-                alpha: float, beta: float, depth: int,
-                check_budget: int = 1, use_wdl: bool = False) -> float:
-    """Negamax alpha-beta quiescence with stand-pat cutoff. Side-to-move value.
+def _eval_leaf_batch(net, boards: List[chess.Board], device, use_wdl: bool) -> torch.Tensor:
+    """Side-to-move leaf value in [-1,1] for many boards in a few large forwards.
 
-    Extends through captures at every depth; non-capturing checks are explored
-    while check_budget > 0, decremented after each check expansion. This
-    surfaces forcing-check tactics and mate threats that would otherwise be
-    invisible to a pure capture-only quiescence.
-
-    When the side to move is in check, stand-pat is illegal: we must respond
-    to the check. We skip the stand-pat baseline and search all legal evasions
-    (captures first, then quiet evasions). A hard floor caps recursion so
-    perpetual-check sequences can't run unbounded.
+    Replaces per-leaf single-sample inference (latency-bound on iGPU) with
+    chunked batch evaluation — same values as _leaf_value would produce,
+    computed ~100x cheaper per board.
     """
-    if board.is_game_over(claim_draw=False):
-        return -MATE_SCORE if board.is_checkmate() else 0.0
+    values = torch.empty(len(boards), device=device)
+    chunk = 2048
+    for start in range(0, len(boards), chunk):
+        states = torch.stack(
+            [board_to_tensor(b) for b in boards[start:start + chunk]]
+        ).to(device)
+        end = start + states.shape[0]
+        if use_wdl:
+            _, _, wdl = net(states, with_wdl=True)
+            p = wdl.softmax(-1)
+            values[start:end] = p[:, 0] - p[:, 2]
+        else:
+            _, v = net(states)
+            values[start:end] = v.view(-1)
+    return values
 
-    if board.is_check():
-        # Recursion floor: fall back to the net's evaluation if we're stuck
-        # deep in a check sequence. V here is approximate (net learns mostly
-        # quiet positions) but bounded — better than infinite recursion.
-        if depth <= 0:
-            return _leaf_value(net, board, device, use_wdl)
 
-        # No stand-pat — side to move can't refuse the check. Search all legal
-        # evasions: captures first (often refute the check best), then quiet.
-        for move_set in (_ordered_captures(board),
-                         (m for m in board.legal_moves if not board.is_capture(m))):
-            for move in move_set:
-                child = board.copy(stack=True)
-                child.push(move)
-                score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                                     depth - 1, check_budget, use_wdl)
-                if score >= beta:
-                    return score
-                if score > alpha:
-                    alpha = score
-        return alpha
-
-    stand_pat = _leaf_value(net, board, device, use_wdl)
-
-    # Stand-pat fail-high: side to move could just refuse to capture.
-    if stand_pat >= beta:
-        return stand_pat
-    if stand_pat > alpha:
-        alpha = stand_pat
-    if depth <= 0:
-        return alpha
-
-    for move in _ordered_captures(board):
-        child = board.copy(stack=True)
-        child.push(move)
-        score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                             depth - 1, check_budget, use_wdl)
-        if score >= beta:
-            return score
-        if score > alpha:
-            alpha = score
-
-    if check_budget > 0:
-        for move in _ordered_checks(board):
-            child = board.copy(stack=True)
-            child.push(move)
-            score = -_quiesce_ab(net, child, device, -beta, -alpha,
-                                 depth - 1, check_budget - 1, use_wdl)
-            if score >= beta:
-                return score
-            if score > alpha:
-                alpha = score
-
-    return alpha
+# Hard cap on net evaluations per quiesce level. Stand-pat fail-highs keep
+# real trees far below this; hitting it means a pathological capture-storm,
+# where we prefer correct-but-slow over wrong-fast.
+_MAX_LEVEL_EVALS = 65536
 
 
 @torch.inference_mode()
@@ -186,17 +141,135 @@ def quiesce_batched(
     check_budget: int = 1,
     use_wdl: bool = False,
 ) -> torch.Tensor:
-    """Per-board quiescence via alpha-beta DFS with stand-pat short-circuit and
-    MVV-LVA capture ordering. Returns one value per input board (side-to-move).
+    """Per-board quiescence via level-synchronous batched negamax with windows.
 
-    check_budget allows up to N non-capturing-check extensions per call chain;
-    set to 0 to fall back to pure capture quiescence.
+    Semantics match the previous recursive fail-soft alpha-beta search exactly
+    at each root: stand-pat cutoffs (value >= beta resolves), MVV-LVA capture
+    ordering, check evasions searched without stand-pat, non-capturing checks
+    extended while budget remains, mate scored MATE_SCORE-dominant, and all
+    leaves evaluated by the net in batches (one forward per tree level).
+
+    Returns one value per input board (side-to-move).
     """
     if not boards:
         return torch.empty(0, device=device)
-    out = [_quiesce_ab(net, b, device, -1e9, 1e9, max_qdepth, check_budget, use_wdl)
-           for b in boards]
-    return torch.tensor(out, device=device, dtype=torch.float32)
+
+    def new_node(board, alpha, beta, depth, cbudget, parent=None):
+        return {
+            "board": board, "alpha": alpha, "beta": beta,
+            "depth": depth, "cbudget": cbudget,
+            "parent": parent, "children": [], "open": 0,
+            "best": -1e18, "done": False, "cancelled": False,
+        }
+
+    roots = [new_node(b, -1e9, 1e9, max_qdepth, check_budget) for b in boards]
+
+    def resolve(node, value):
+        # Iteratively settle this node and any ancestors it finishes.
+        while node is not None and not node["cancelled"]:
+            if node["done"]:
+                return
+            node["done"] = True
+            node["best"] = value
+            parent = node["parent"]
+            if parent is None or parent["cancelled"] or parent["done"]:
+                return
+            contribution = -value
+            if contribution > parent["best"]:
+                parent["best"] = contribution
+            if parent["best"] >= parent["beta"]:
+                # Fail high: remaining siblings cannot improve the ancestor.
+                for c in parent["children"]:
+                    c["cancelled"] = True
+                value = parent["best"]
+                node = parent
+            elif all(c["done"] or c["cancelled"] for c in parent["children"]):
+                # Last sibling settled without fail-high: parent's exact max.
+                value = parent["best"]
+                node = parent
+            else:
+                return
+
+    pending = list(roots)
+    while pending:
+        eval_boards: List[chess.Board] = []
+        eval_nodes = []
+        to_expand = []
+        next_pending = []
+        for node in pending:
+            if node["cancelled"]:
+                continue
+            board = node["board"]
+            if board.is_game_over(claim_draw=False):
+                resolve(node, -MATE_SCORE if board.is_checkmate() else 0.0)
+            elif board.is_check():
+                if node["depth"] <= 0:
+                    # In check at the recursion floor: no stand-pat exists.
+                    eval_boards.append(board)
+                    eval_nodes.append(node)
+                else:
+                    to_expand.append(node)
+            else:
+                eval_boards.append(board)   # stand-pat decides expand vs cutoff
+                eval_nodes.append(node)
+
+        if len(eval_boards) > _MAX_LEVEL_EVALS:
+            raise RuntimeError(
+                f"quiesce level exceeded {_MAX_LEVEL_EVALS} leaf evals; "
+                "refusing to truncate (lower max_qdepth/check_budget)"
+            )
+        if eval_boards:
+            vals = _eval_leaf_batch(net, eval_boards, device, use_wdl)
+            for node, v in zip(eval_nodes, vals.tolist()):
+                if node["board"].is_check():
+                    resolve(node, v)
+                    continue
+                if v >= node["beta"]:
+                    resolve(node, v)
+                elif node["depth"] <= 0:
+                    resolve(node, v)
+                else:
+                    node["alpha"] = max(node["alpha"], v)
+                    node["best"] = v
+                    to_expand.append(node)
+
+        for node in to_expand:
+            if node["cancelled"] or node["done"]:
+                continue
+            board = node["board"]
+            children = []
+            if board.is_check():
+                # No stand-pat when in check: search all legal evasions.
+                move_sets = (_ordered_captures(board),
+                             (m for m in board.legal_moves if not board.is_capture(m)))
+                child_depth, child_budget = node["depth"] - 1, node["cbudget"]
+            else:
+                captures = _ordered_captures(board)
+                if node["cbudget"] > 0:
+                    move_sets = (captures, _ordered_checks(board))
+                    budgets = (node["cbudget"], node["cbudget"] - 1)
+                else:
+                    move_sets = (captures,)
+                    budgets = (node["cbudget"],)
+                child_depth = node["depth"] - 1
+            for set_i, moves in enumerate(move_sets):
+                cb = child_budget if board.is_check() else budgets[set_i]
+                for move in moves:
+                    child = board.copy(stack=True)
+                    child.push(move)
+                    cnode = new_node(child, -node["beta"], -node["alpha"],
+                                     child_depth, cb, parent=node)
+                    children.append(cnode)
+            node["children"] = children
+            node["open"] = len(children)
+            if not children:
+                resolve(node, node["best"])
+            else:
+                next_pending.extend(children)
+
+        pending = next_pending
+
+    return torch.tensor([r["best"] for r in roots], device=device, dtype=torch.float32)
 
 
 @torch.inference_mode()
