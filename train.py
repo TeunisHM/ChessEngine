@@ -29,9 +29,21 @@ from models import (
     DEFAULT_NUM_RESIDUAL_BLOCKS,
     net_from_state_dict,
 )
-from evaluate_vs_random import evaluate_vs_random
 
 MODELS_DIR = "models"
+
+# Opponent-pool sampling weights by checkpoint generation prefix. Uniform
+# sampling lets older/weaker nets absorb half the opponent batches; biasing
+# toward recent generations keeps the curriculum signal real (handover:
+# "opponent batches must give real signal"). Unknown prefixes get base weight.
+OPPONENT_WEIGHTS = {
+    "ppo_search_v19": 1.0,
+    "ppo_search_v20": 1.0,
+    "ppo_search_v21": 2.0,
+    "ppo_search_v22": 2.0,
+    "ppo_search_v23": 3.0,
+}
+_OPPONENT_BASE_WEIGHT = 1.0
 
 PIECE_VALUES = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -182,8 +194,16 @@ def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
     return move_fn
 
 
+def _opponent_weight(path: str) -> float:
+    for prefix, weight in OPPONENT_WEIGHTS.items():
+        if os.path.basename(path).startswith(prefix):
+            return weight
+    return _OPPONENT_BASE_WEIGHT
+
+
 def _load_random_opponent(device: str):
-    """Pick a random checkpoint from MODELS_DIR and return it as an eval-mode net."""
+    """Sample a checkpoint from MODELS_DIR weighted by OPPONENT_WEIGHTS and
+    return it as an eval-mode net (plus its path)."""
     if not os.path.isdir(MODELS_DIR):
         return None, None
     files = [
@@ -191,19 +211,19 @@ def _load_random_opponent(device: str):
     ]
     if not files:
         return None, None
-    random.shuffle(files)
-    for filename in files:
-        path = os.path.join(MODELS_DIR, filename)
-        try:
-            state = torch.load(path, map_location=device)
-            # Match the checkpoint's head architecture so legacy dense-head
-            # opponents keep their trained policy instead of a fresh head.
-            net = net_from_state_dict(state, device)
-            net.eval()
-            return net, path
-        except Exception as exc:
-            print(f"[WARN] skipping incompatible checkpoint {path}: {exc}")
-    return None, None
+    weights = [_opponent_weight(f) for f in files]
+    path = random.choices(files, weights=weights, k=1)[0]
+    path = os.path.join(MODELS_DIR, path)
+    try:
+        state = torch.load(path, map_location=device)
+        # Match the checkpoint's head architecture so legacy dense-head
+        # opponents keep their trained policy instead of a fresh head.
+        net = net_from_state_dict(state, device)
+        net.eval()
+        return net, path
+    except Exception as exc:
+        print(f"[WARN] skipping incompatible checkpoint {path}: {exc}")
+        return None, None
 
 
 class EnginePool:
@@ -255,6 +275,122 @@ def _engine_opponent_fn(pool: EnginePool, move_time: float) -> OpponentMoveFn:
     return move_fn
 
 
+# ---- In-training progress eval -------------------------------------------
+# The old evaluate_vs_random check was saturated (100/0/0 forever) — a collapse
+# tripwire only. Progress is now measured by paired-opening games against a
+# fixed opponent: the protocol Stockfish (skill 0 / 10ms) or a frozen reference
+# checkpoint (--eval-ref). Score >50% = progress, <50% = regression.
+
+def _book_start_boards() -> List[chess.Board]:
+    """Playable opening-book positions (same book as training rollouts)."""
+    playable = []
+    for san_line in OPENINGS.values():
+        board = chess.Board()
+        try:
+            for san in san_line:
+                board.push_san(san)
+        except Exception:
+            continue
+        playable.append(board)
+    return playable
+
+
+def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bool,
+                              pool: EnginePool, device: str,
+                              top_k: int, alpha: float, value_weight: float,
+                              move_time: float) -> str:
+    board = start_board.copy(stack=True)
+    while not board.is_game_over():
+        if (board.turn == chess.WHITE) == policy_is_white:
+            idxs, *_ = select_moves_with_lookahead(
+                net, [board], device, top_k=top_k, alpha=alpha,
+                temperature=0.0, value_weight=value_weight,
+            )
+            move = index_to_move(int(idxs[0].item()), board)
+            if move is None or move not in board.legal_moves:
+                move = next(iter(board.legal_moves))
+        else:
+            move = pool._play_one(board, move_time)
+            if move is None or move not in board.legal_moves:
+                move = next(iter(board.legal_moves))
+        board.push(move)
+    return board.result()
+
+
+def _play_eval_game_vs_ref(net, ref_net, start_board: chess.Board,
+                           policy_is_white: bool, device: str,
+                           top_k: int, alpha: float, value_weight: float) -> str:
+    """One H2H game vs the frozen reference net; returns board.result()."""
+    from evaluate_vs_model import play_game as _h2h_play_game
+
+    kwargs = dict(
+        lookahead_k=top_k, lookahead_alpha=alpha, temperature=0.0,
+        value_weight=value_weight,
+    )
+    if policy_is_white:
+        return _h2h_play_game(net, ref_net, device,
+                              a_is_white=True, start_board=start_board, **kwargs)
+    # play_game always seats net_a on White here; recolor by swapping seats.
+    return _h2h_play_game(ref_net, net, device,
+                          a_is_white=True, start_board=start_board, **kwargs)
+
+
+def evaluate_progress(net, device: str, games: int,
+                      opponent: str, engine_pool: Optional[EnginePool],
+                      engine_move_time: float, ref_net,
+                      top_k: int = 4, alpha: float = 1.0,
+                      value_weight: float = 1.0,
+                      label: str = "") -> dict:
+    """Paired-opening mini-match vs a fixed opponent. Returns W/D/L + score."""
+    book = _book_start_boards()
+    if not book:
+        return {"wins": 0, "draws": 0, "losses": 0, "score": 0.0, "games": 0}
+
+    # Pair each book position twice with colors swapped; trim to --games.
+    plan = []
+    while len(plan) < games:
+        for start in book:
+            plan.append((start, True))
+            plan.append((start, False))
+            if len(plan) >= games:
+                break
+    plan = plan[:games]
+
+    results: List[str] = []
+    if opponent == "engine" and engine_pool is not None:
+        with ThreadPoolExecutor(max_workers=len(engine_pool.engines)) as ex:
+            futures = [
+                ex.submit(_play_eval_game_vs_engine, net, start, policy_white,
+                          engine_pool, device, top_k, alpha, value_weight,
+                          engine_move_time)
+                for start, policy_white in plan
+            ]
+            results = [f.result() for f in futures]
+    elif opponent == "ref" and ref_net is not None:
+        for start, policy_white in plan:
+            results.append(_play_eval_game_vs_ref(
+                net, ref_net, start, policy_white, device,
+                top_k, alpha, value_weight))
+    else:
+        return {"wins": 0, "draws": 0, "losses": 0, "score": 0.0, "games": 0}
+
+    wins = draws = losses = 0
+    for (start, policy_white), r in zip(plan, results):
+        if r == "1/2-1/2":
+            draws += 1
+        elif (r == "1-0") == policy_white:
+            wins += 1
+        else:
+            losses += 1
+    n = max(1, len(results))
+    score = (wins + 0.5 * draws) / n
+    tag = label or "Eval"
+    print(f"[{tag}] vs {opponent}: {wins}W/{draws}D/{losses}L "
+          f"| score {score:.3f} over {n} games")
+    return {"wins": wins, "draws": draws, "losses": losses,
+            "score": score, "games": n}
+
+
 # ---- Vectorized batch generation ----------------------------------------
 
 def generate_batch(actor_critic_net,
@@ -266,6 +402,7 @@ def generate_batch(actor_critic_net,
                    opening_prob: float = 0.7,
                    opponent_move_fn: Optional[OpponentMoveFn] = None,
                    max_plies: int = 600,
+                   min_live_boards: int = 0,
                    step_penalty: float = 0.0,
                    draw_penalty: float = 0.0,
                    material_shaping_per_pawn: float = 0.0,
@@ -289,6 +426,11 @@ def generate_batch(actor_critic_net,
     If trainee_search is True the trainee samples moves via the value-lookahead
     search (top-k by π, scored with quiescence). The recorded old_log_prob is
     log b(a|s) — the search behavior policy — so PPO's IS ratio is well-formed.
+
+    Callers cap search batches via max_plies and pass min_live_boards > 0 to
+    stop early once fewer than that many games remain (dead-tail cutoff) —
+    tail plies cost engine calls / TB probes per ply while producing almost
+    no states. Timed-out games bootstrap from 0 and are WDL-masked.
     """
     boards = [_start_position(opening_prob) for _ in range(batch_size)]
     self_play = opponent_move_fn is None
@@ -330,6 +472,12 @@ def generate_batch(actor_critic_net,
     for ply in range(max_plies):
         live_ids = [i for i in range(batch_size) if not done[i] and not boards[i].is_game_over()]
         if not live_ids:
+            break
+        # Dead-tail cutoff: once only a few games remain, the per-ply overhead
+        # (engine calls, TB probes, search) outweighs the data they produce.
+        # Remaining games end as timeouts (bootstrap from 0, WDL-masked).
+        if (opponent_move_fn is not None and min_live_boards > 0
+                and ply > 0 and len(live_ids) < min_live_boards):
             break
 
         if tablebase is not None:
@@ -636,10 +784,15 @@ def train_actor_critic(actor_critic_net,
                        model_name: str,
                        optimizer: torch.optim.Optimizer,
                        device: str = "cpu",
-                       num_batches: int = 1500,
-                       eval_interval: int = 100,
-                       eval_games: int = 100,
-                       gamma: float = 0.99,
+                        num_batches: int = 1500,
+                        eval_interval: int = 100,
+                        eval_games: int = 100,
+                        eval_opponent: str = "engine",
+                        eval_ref_path: Optional[str] = None,
+                        eval_k: int = 4,
+                        eval_alpha: float = 1.0,
+                        eval_value_weight: float = 1.0,
+                        gamma: float = 0.99,
                        gae_lamb: float = 0.95,
                        critic_loss_weight: float = 0.5,
                        entropy_weight: float = 0.02,
@@ -666,12 +819,15 @@ def train_actor_critic(actor_critic_net,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
                        lookahead_value_weight: float = 1.0,
-                       trainee_search: bool = False,
-                       distill_weight: float = 0.0,
-                       tablebase_path: Optional[str] = "syzygy",
-                       tablebase_terminate_prob: float = 1.0,
-                       seed: Optional[int] = None,
-                       run_config: Optional[dict] = None):
+                        trainee_search: bool = False,
+                        distill_weight: float = 0.0,
+                        tablebase_path: Optional[str] = "syzygy",
+                        tablebase_terminate_prob: float = 1.0,
+                        rollout_max_plies: int = 600,
+                        search_max_plies: int = 300,
+                        min_live_boards: int = 3,
+                        seed: Optional[int] = None,
+                        run_config: Optional[dict] = None):
     """PPO training loop with self-play, optional checkpoint and engine opponents."""
     if seed is not None:
         _seed_everything(seed)
@@ -706,6 +862,31 @@ def train_actor_critic(actor_critic_net,
     elif tablebase_path:
         print(f"[INFO] tablebase dir not found: {tablebase_path}; running without TB")
 
+    # Fixed progress-eval opponent. Engine mode mirrors the evaluation
+    # protocol (skill-0 Stockfish, same move time); ref mode plays paired
+    # openings against a frozen checkpoint.
+    eval_engine_pool: Optional[EnginePool] = None
+    eval_ref_net = None
+    if eval_opponent == "engine":
+        try:
+            pool_size = max(1, min(4, eval_games // 2 or 1))
+            eval_engine_pool = EnginePool(engine_path or "./stockfish/stockfish",
+                                          size=pool_size)
+            if engine_skill_level is not None:
+                eval_engine_pool.configure_all({"Skill Level": int(engine_skill_level)})
+            print(f"[INFO] eval engine pool x{pool_size} "
+                  f"(skill={engine_skill_level}, {engine_move_time}s/move)")
+        except Exception as exc:
+            print(f"[WARN] eval engine unavailable ({exc}); evals will no-op")
+    elif eval_opponent == "ref" and eval_ref_path:
+        try:
+            eval_ref_net = net_from_state_dict(
+                torch.load(eval_ref_path, map_location=device), device)
+            eval_ref_net.eval()
+            print(f"[INFO] eval reference net: {eval_ref_path}")
+        except Exception as exc:
+            print(f"[WARN] could not load eval ref ({exc}); evals will no-op")
+
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(
@@ -719,21 +900,27 @@ def train_actor_critic(actor_critic_net,
     _hparams["optimizer"] = type(optimizer).__name__
     _hparams["lr"] = [g["lr"] for g in optimizer.param_groups]
     log_writer.writerow(["# " + " ".join(f"{k}={v}" for k, v in _hparams.items())])
-    log_writer.writerow(["batch", "wins", "draws", "losses"])
+    log_writer.writerow(["batch", "wins", "draws", "losses", "score"])
     print(f"[INFO] eval log: {log_path}")
 
     # Cumulative trainee-vs-Stockfish-engine outcomes across the run.
     engine_cum = {"W": 0, "D": 0, "L": 0, "T": 0}
 
+    def _run_eval(batch_idx: int):
+        return evaluate_progress(
+            actor_critic_net, device, games=eval_games,
+            opponent=eval_opponent,
+            engine_pool=eval_engine_pool,
+            engine_move_time=engine_move_time,
+            ref_net=eval_ref_net,
+            top_k=eval_k, alpha=eval_alpha, value_weight=eval_value_weight,
+            label=f"Eval at batch {batch_idx}",
+        )
+
     try:
-        baseline = evaluate_vs_random(
-            actor_critic_net, num_games=eval_games, device=device,
-        )
-        print(
-            f"[Eval at batch 0] Wins: {baseline['wins']}, "
-            f"Draws: {baseline['draws']}, Losses: {baseline['losses']}"
-        )
-        log_writer.writerow([0, baseline["wins"], baseline["draws"], baseline["losses"]])
+        baseline = _run_eval(0)
+        log_writer.writerow([0, baseline["wins"], baseline["draws"],
+                             baseline["losses"], f"{baseline['score']:.3f}"])
 
         for batch in range(num_batches):
             t0 = perf_counter()
@@ -780,6 +967,10 @@ def train_actor_critic(actor_critic_net,
                 trainee_top_k=lookahead_k,
                 trainee_alpha=lookahead_alpha,
                 trainee_value_weight=lookahead_value_weight,
+                max_plies=(search_max_plies
+                           if (trainee_search_now and opponent_fn is not None)
+                           else rollout_max_plies),
+                min_live_boards=(min_live_boards if opponent_fn is not None else 0),
                 progress_label=f"[Batch {batch+1}/{num_batches}] {source}",
             )
             t1 = perf_counter()
@@ -879,7 +1070,16 @@ def train_actor_critic(actor_critic_net,
             advantages = returns_t - old_v_t
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
-            N = states_t.shape[0]
+            # Drop rows whose behavior probability is <~ 3e-7. Trained nets emit
+            # astronomically negative logits on some (legal, often mirrored)
+            # actions — never supervised, weight_decay=0 — and PPO math there is
+            # numerical garbage: IS ratios underflow or explode, k3-KL spikes by
+            # thousands (fake "KL: 25661" batches, spurious early stops), and
+            # huge gradient spikes leak into shared heads. Such rows carry no
+            # usable policy-gradient signal, so they are excluded outright.
+            valid_rows = torch.nonzero(old_lp_t > -15.0).view(-1)
+
+            N = int(valid_rows.numel())
             mb_size = max(1, min(int(ppo_minibatch_size), N))
 
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
@@ -897,7 +1097,7 @@ def train_actor_critic(actor_critic_net,
                 epoch_steps = 0
                 for start in range(0, N, mb_size):
                     end = min(start + mb_size, N)
-                    mb = perm_idx[start:end]
+                    mb = valid_rows[perm_idx[start:end]]
                     mb_states = states_t[mb]
                     mb_masks = masks_t[mb]
                     mb_actions = actions_t[mb]
@@ -994,6 +1194,14 @@ def train_actor_critic(actor_critic_net,
                         log_r_pi = new_lp - mb_pi_old_lp
                         approx_kl = (torch.exp(log_r_pi) - 1 - log_r_pi).mean().item()
                         clip_frac = ((ratios - 1.0).abs() > ppo_clip_ratio).float().mean().item()
+                        if os.environ.get("DEBUG_PPO_RATIOS") and (
+                                log_r_pi.max() > 3 or log_r_pi.min() < -5):
+                            bad = log_r_pi.abs().argmax()
+                            print(f"[DBG] r range [{log_r_pi.min():.1f}, {log_r_pi.max():.1f}] "
+                                  f"| r<-5: {(log_r_pi < -5).sum().item()} r>3: {(log_r_pi > 3).sum().item()} "
+                                  f"| worst old={mb_old_lp[bad]:.1f} pi_old={mb_pi_old_lp[bad]:.1f} "
+                                  f"new={new_lp[bad]:.1f} legal={mb_masks[bad][mb_actions[bad]].item()} "
+                                  f"is_mirror={int(mb[bad]) >= states_t.shape[0] // 2}")
 
                     actor_loss_sum += actor_loss.item()
                     critic_loss_sum += critic_loss.item()
@@ -1063,15 +1271,10 @@ def train_actor_critic(actor_critic_net,
             )
 
             if (batch + 1) % eval_interval == 0:
-                eval_stats = evaluate_vs_random(
-                    actor_critic_net, num_games=eval_games, device=device,
-                )
-                print(
-                    f"[Eval at batch {batch+1}] Wins: {eval_stats['wins']}, "
-                    f"Draws: {eval_stats['draws']}, Losses: {eval_stats['losses']}"
-                )
+                eval_stats = _run_eval(batch + 1)
                 log_writer.writerow([
-                    batch + 1, eval_stats["wins"], eval_stats["draws"], eval_stats["losses"],
+                    batch + 1, eval_stats["wins"], eval_stats["draws"],
+                    eval_stats["losses"], f"{eval_stats['score']:.3f}",
                 ])
                 os.makedirs(MODELS_DIR, exist_ok=True)
                 torch.save(actor_critic_net.state_dict(),
@@ -1080,6 +1283,8 @@ def train_actor_critic(actor_critic_net,
         log_file.close()
         if engine_pool is not None:
             engine_pool.close()
+        if eval_engine_pool is not None:
+            eval_engine_pool.close()
         if tablebase is not None:
             tablebase.close()
 
@@ -1095,7 +1300,44 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--num-batches", type=int, default=400)
     parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--eval-games", type=int, default=24,
+                        help="Games per in-training progress eval (paired "
+                             "openings vs the eval opponent).")
+    parser.add_argument(
+        "--eval-opponent", choices=["engine", "ref", "none"], default="engine",
+        help="Progress-eval opponent: protocol Stockfish (default), a frozen "
+             "reference checkpoint (--eval-ref), or none.",
+    )
+    parser.add_argument(
+        "--eval-ref", default=None,
+        help="Checkpoint for --eval-opponent ref; defaults to --init-from.",
+    )
+    parser.add_argument(
+        "--eval-k", type=int, default=4,
+        help="Search top-k used by the in-training eval (protocol value).",
+    )
+    parser.add_argument(
+        "--eval-alpha", type=float, default=1.0,
+        help="Search log-pi weight used by the in-training eval.",
+    )
+    parser.add_argument(
+        "--eval-value-weight", type=float, default=1.0,
+        help="Quiescence value weight used by the in-training eval.",
+    )
+    parser.add_argument(
+        "--rollout-max-plies", type=int, default=600,
+        help="Ply cap for self-play rollouts (raw policy, cheap per ply).",
+    )
+    parser.add_argument(
+        "--search-max-plies", type=int, default=300,
+        help="Ply cap for search-based opponent/engine batches; their long "
+             "tail costs per-ply engine calls while producing few states.",
+    )
+    parser.add_argument(
+        "--min-live-boards", type=int, default=3,
+        help="Abort a rollout batch once fewer than this many games remain "
+             "(opponent batches only); survivors end as timeouts.",
+    )
     parser.add_argument("--seed", type=int, default=1401)
     parser.add_argument("--device", default=None)
     parser.add_argument(
@@ -1175,6 +1417,14 @@ def main() -> None:
         "num_batches": args.num_batches,
         "eval_interval": args.eval_interval,
         "eval_games": args.eval_games,
+        "eval_opponent": args.eval_opponent,
+        "eval_ref_path": args.eval_ref or (args.init_from if args.eval_opponent == "ref" else None),
+        "eval_k": args.eval_k,
+        "eval_alpha": args.eval_alpha,
+        "eval_value_weight": args.eval_value_weight,
+        "rollout_max_plies": args.rollout_max_plies,
+        "search_max_plies": args.search_max_plies,
+        "min_live_boards": args.min_live_boards,
         "seed": args.seed,
         "gamma": 0.98,
         "gae_lamb": 0.95,
