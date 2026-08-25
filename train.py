@@ -43,6 +43,7 @@ OPPONENT_WEIGHTS = {
     "ppo_search_v22": 2.0,
     "ppo_search_v23": 3.0,
     "ppo_search_v24": 3.0,
+    "ppo_search_v25": 3.0,
 }
 _OPPONENT_BASE_WEIGHT = 1.0
 

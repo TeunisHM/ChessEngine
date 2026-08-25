@@ -1,30 +1,37 @@
 # Handover — ChessEngine self-play RL
 
-Last updated: 2026-08-23. Full per-run history: the auto-loaded memory index
+Last updated: 2026-08-25. Full per-run history: the auto-loaded memory index
 `~/.claude/projects/-var-home-eunis-Python-ChessEngine/memory/MEMORY.md`.
 
 ## Current state
 
-**Strongest model: `models/ppo_search_v24_checkpoint_299.pt`.** Best objective
-score the project has posted — **50.5% vs Stockfish** (skill 0 / 10ms, search,
-131W/41D/128L over 300 games), up from v23's 39%. Also +37 Elo H2H over v23@299
-(CI [−14,+88], necessary-condition check). **v25 is running** (launched
-2026-08-23): same recipe with the curriculum teacher raised to Skill Level 1.
+**Strongest model: `models/ppo_search_v26_checkpoint_299.pt`** — but only
+nominally: v25@299 and v26@299 are *measurably interchangeable* at **54.0% vs
+Stockfish** (skill 0 / 10ms, search, 300 games). Take either as the baseline.
 
 Lineage (all 16×192 / 11.5M-param net):
 - **v19@449** — scaled-architecture baseline. Scaling broke the small-net ceiling.
 - **v21@449** — WDL-head run. +50 Elo H2H over v19 but flat vs Stockfish (31%).
 - **v23@299** — curriculum (pruned at-level pool + engine-ratio 0.25) → 39%.
 - **v24@299** — curriculum stage 3 (engine-ratio 0.35) on the rewritten batched
-  search → **50.5%**, the biggest single-step gain. Curriculum trend:
-  **31% → 33.5% → 39% → 50.5%** (v21→v22→v23→v24).
+  search → **50.5%** (131/41/128), the biggest single-step gain.
+- **v25@299** — first run at teacher skill 1 → 54.0% (144/36/120), z≈0.9 vs v24.
+- **v26@299** — second run at teacher skill 1 → 54.0% (140/44/116), **z = 0.00
+  vs v25**; H2H +29 Elo, CI [−24,+84]. Flat.
 
-**Proven absolute-strength levers: (1) harder curriculum (validated three runs
-straight), (2) architecture scale-up.** v24 reached *parity* with the skill-0/10ms
-teacher, so further curriculum steps must strengthen the teacher itself.
-Teacher probes on v24@299 (100 games each): **32.5% vs skill-1/10ms** (healthy
-30–40% gap → chosen for v25) vs **46.0% vs skill-0/50ms** — more time is a dead
-knob at skill 0 (the error injection binds, not search depth).
+Curriculum trend: **31% → 33.5% → 39% → 50.5% → 54.0% → 54.0%** (v21→v26).
+
+**The curriculum lever is spent.** 600 batches against the skill-1 teacher bought
++3.5pp over v24 in total (z ≈ 0.93, never significant) and the second 300 added
+exactly nothing. v24's +11.5pp jump came from the engine-ratio 0.35 + rewritten
+batched search recipe, *not* from teacher strength — raising skill 0→1 did not
+reproduce it. **The one remaining proven lever is architecture scale-up** (v19
+is the precedent: scaling decisively broke the previous plateau).
+
+Teacher probes on v24@299 (100 games each, historical): **32.5% vs skill-1/10ms**
+vs **46.0% vs skill-0/50ms** — more move time is a dead knob at skill 0 (the
+error injection binds, not search depth). The 30–40% gap that motivated skill 1
+turned out not to predict a training gain.
 
 ## Key findings
 
@@ -89,16 +96,17 @@ knob at skill 0 (the error injection binds, not search depth).
   --eval-games 4`. Diagnose GPU crashes with `HIP_LAUNCH_BLOCKING=1` (opaque HSA
   exception naming `index_elementwise_kernel` == out-of-bounds tensor index).
 
-## Recipe (v24 = current best; v25 = running)
+## Recipe (v25/v26 = current best, tied)
 
 `--trainee-search --lookahead-alpha 1.0 --value-weight 1.0 --dtz-shaping-weight
-0.15 --wdl-weight 1.0 --engine-ratio 0.35`, `tablebase_terminate_prob 0.25`
-(default). v25 adds `--engine-skill-level 1` (single variable). Trainee search
-applies in checkpoint + engine batches, never self-play. `gamma=0.98`,
-`gae_lamb=0.95`, `entropy=0.005`, `batch_size=32`, `opening_prob=0.6`,
-`temperature=1.0`, `ppo_clip=0.2`, `target_kl=0.015`, `opponent_ratio=0.45`,
-`draw_penalty=0`. AdamW lr=5e-5, cosine to 10%. Launch scripts: `train_v24.sh`,
-`train_v25.sh`.
+0.15 --wdl-weight 1.0 --engine-ratio 0.35 --engine-skill-level 1`,
+`tablebase_terminate_prob 0.25` (default). Trainee search applies in checkpoint
++ engine batches, never self-play. `gamma=0.98`, `gae_lamb=0.95`,
+`entropy=0.005`, `batch_size=32`, `opening_prob=0.6`, `temperature=1.0`,
+`ppo_clip=0.2`, `target_kl=0.015`, `opponent_ratio=0.45`, `draw_penalty=0`.
+AdamW lr=5e-5, cosine to 10%. Launch scripts: `train_v24.sh`, `train_v25.sh`,
+`train_v26.sh`. **Re-running this recipe unchanged is known not to gain** — the
+next run needs a structural change.
 
 ## Code state — load-bearing, don't change without reason
 
@@ -123,16 +131,39 @@ Loader samples `.pt` from `models/` (non-recursive), weighted by
 `OPPONENT_WEIGHTS` generation prefixes (v23/v24 at 3.0, older at 1.0–2.0; a
 running generation's own checkpoints enter at base weight 1.0). Pool is at-level
 16×192 nets only (v19+; weak nets archived in `models/archive_weak/`).
-Strongest: `ppo_search_v24_checkpoint_299.pt`.
+Strongest: `ppo_search_v26_checkpoint_299.pt` (tied with v25@299). `OPPONENT_WEIGHTS`
+currently tops out at v23/v24/v25 = 3.0; **add `"ppo_search_v26": 3.0` before the
+next run.**
 
 ## TODO / open questions
 
-- **v25 verdict** — standalone protocol match at the end; promote only beyond SE.
-- **Combine scale-up + curriculum** — still the big-ticket run (both levers proven).
-- **Conversion baseline** — run `conversion_suite.py` at ≥30 games/class on the
-  baseline (and dtz-shaping on/off) now that the tool exists; the single-piece
-  conversion gap is the known technique hole.
-- **WDL head gate** — TB-finetune (`train_wdl_head.py --tablebase syzygy`), then
-  paired `--use-wdl` H2H; deploy or retire.
+**NEXT UP (user's choice, 2026-08-25): the WDL-head gate.** TB-finetune the
+detached WDL head on `models/ppo_search_v26_checkpoint_299.pt` with
+`train_wdl_head.py --tablebase syzygy`, check calibration with
+`diagnose_wdl.py`, then gate it with a paired H2H —
+`evaluate_vs_model.py --model-a <finetuned> --model-b
+models/ppo_search_v26_checkpoint_299.pt --paired-openings --temperature 0
+--lookahead-k 4 --lookahead-alpha 1.0 --value-weight 1.0 --use-wdl`
+(A searches via the WDL head, B via the value scalar; same weights otherwise, so
+this isolates the head). Deploy or retire the head on the result. Cheap
+(~minutes), orthogonal to training, doesn't consume a training slot. Prior: the
+head calibrates to ~78% but has never beaten the value head in search (within
+noise) — this is the run that settles it.
+
+Then, in rough order:
+- **Scale-up run** — the only proven lever left after the v25/v26 curriculum
+  plateau; v19 is the precedent. Bigger trunk from the v26 seed, teacher held at
+  skill 1.
+- **Conversion baseline** — `conversion_suite.py` at ≥30 games/class on the
+  baseline, dtz-shaping on/off; the single-piece conversion gap (KQvK-type) is
+  the known technique hole. NB: the tool's `except Exception: return True, plies`
+  counts a failed TB probe as a success — fix before trusting the numbers.
 - **Truncation bootstrap** — if dead-tail is ever implicated, bootstrap truncated
   trajectories from the critic's last value instead of 0.
+
+## Uncommitted at last update (2026-08-25)
+
+`train.py` (`OPPONENT_WEIGHTS += "ppo_search_v25": 3.0`) and `train_v26.sh`.
+Never pushed for v26. Also long-uncommitted: `IMPROVEMENTS.md`,
+`conversion_suite.py`, `train_v24.sh`, and edits to `lookahead.py`,
+`pretrain_from_*.py`, `train_wdl_head.py`.
