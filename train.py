@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from queue import Queue
 from time import perf_counter
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import chess
 import chess.engine
@@ -21,6 +21,7 @@ from helper import (
     MIRROR_ACTION_PERM,
     index_to_move,
     mirror_board_tensor_batch,
+    random_endgame_board,
 )
 from lookahead import select_moves_from_policy, select_moves_with_lookahead
 from models import (
@@ -44,8 +45,31 @@ OPPONENT_WEIGHTS = {
     "ppo_search_v23": 3.0,
     "ppo_search_v24": 3.0,
     "ppo_search_v25": 3.0,
+    "ppo_search_v26": 3.0,
+    "ppo_search_v28a": 3.0,
+    "ppo_search_v29": 3.0,
+    "ppo_search_v30": 3.0,
 }
 _OPPONENT_BASE_WEIGHT = 1.0
+ARCHIVE_DIR = os.path.join(MODELS_DIR, "archive_weak")
+# Set from --flat-opponent-weights / --include-archived-opponents in main().
+# Defaults reproduce the historical pool exactly: generation-weighted, and
+# models/ only (archived weak nets invisible).
+_OPPONENT_FLAT_WEIGHTS = False
+_OPPONENT_INCLUDE_ARCHIVED = False
+# None = every generation. Otherwise a list of generation tokens ("v8", "v34");
+# a checkpoint is admitted only if it starts with ppo_search_<token>_. Use to
+# hold the pool near the trainee's level: opponents 400+ Elo above it return
+# ~0% and contribute no gradient signal, just wasted DataGen.
+_OPPONENT_PREFIX_FILTER = None
+# token -> relative share of opponent batches. A generation's share is its
+# weight / sum(weights) REGARDLESS of how many checkpoint files it has: uniform
+# file sampling let v35 (20 files, already scored 0.62) take 51% while v12 (1
+# file, the live stretch rung at 0.175) got 2.6%.
+_OPPONENT_PREFIX_WEIGHTS = None
+# Cap checkpoints kept per generation, chosen evenly spaced across the run.
+# Consecutive checkpoints of one run are near-duplicates; a spread is not.
+_OPPONENT_MAX_PER_GEN = 0
 
 PIECE_VALUES = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -123,8 +147,16 @@ def _tb_value_target(
     return 0.0
 
 
-def _start_position(opening_prob: float) -> chess.Board:
-    """Return a fresh board, optionally seeded with a random opening line."""
+def _start_position(opening_prob: float, endgame_prob: float = 0.0) -> chess.Board:
+    """Return a fresh board, optionally seeded with an opening line or endgame.
+
+    Endgame seeding drops the rollout straight into a random KQvK/KRvK/KPvK/
+    KRPvK position. Ordinary self-play from openings almost never *reaches*
+    bare endgames, so DTZ shaping and conversion technique get essentially no
+    training data; this puts them into the distribution deliberately.
+    """
+    if endgame_prob > 0.0 and random.random() < min(1.0, endgame_prob):
+        return random_endgame_board()
     board = chess.Board()
     if random.random() < max(0.0, min(1.0, opening_prob)):
         _, san_line = random.choice(list(OPENINGS.items()))
@@ -197,10 +229,80 @@ def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
 
 
 def _opponent_weight(path: str) -> float:
+    if _OPPONENT_FLAT_WEIGHTS:
+        return _OPPONENT_BASE_WEIGHT
     for prefix, weight in OPPONENT_WEIGHTS.items():
         if os.path.basename(path).startswith(prefix):
             return weight
     return _OPPONENT_BASE_WEIGHT
+
+
+def _passes_prefix_filter(filename: str) -> bool:
+    """True when no generation whitelist is active, or filename is in it."""
+    return _matched_token(filename) is not None
+
+
+def _matched_token(filename: str):
+    """Whitelist token this checkpoint belongs to, or None if excluded.
+
+    With no whitelist every file is admitted and groups under its own raw
+    generation string, so capping/weighting still behave sensibly.
+    """
+    if not _OPPONENT_PREFIX_FILTER:
+        return filename[len("ppo_search_"):].split("_checkpoint_")[0]
+    for token in _OPPONENT_PREFIX_FILTER:
+        if filename.startswith(f"ppo_search_{token}_"):
+            return token
+    return None
+
+
+def _checkpoint_number(filename: str) -> int:
+    try:
+        return int(filename.split("_checkpoint_")[1].split(".")[0])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _build_opponent_pool(search_dirs):
+    """Return (paths, weights) after per-generation capping and weighting."""
+    groups = {}
+    for directory in search_dirs:
+        for filename in sorted(os.listdir(directory)):
+            if not _is_opponent_checkpoint(filename):
+                continue
+            token = _matched_token(filename)
+            if token is None:
+                continue
+            groups.setdefault(token, []).append(
+                os.path.join(directory, filename))
+
+    paths, weights = [], []
+    for token, files in sorted(groups.items()):
+        files.sort(key=lambda p: _checkpoint_number(os.path.basename(p)))
+        if _OPPONENT_MAX_PER_GEN and len(files) > _OPPONENT_MAX_PER_GEN:
+            n = _OPPONENT_MAX_PER_GEN
+            # Evenly spaced across the generation, always including the last.
+            idx = sorted({round(i * (len(files) - 1) / (n - 1)) if n > 1
+                          else len(files) - 1 for i in range(n)})
+            files = [files[i] for i in idx]
+        share = (_OPPONENT_PREFIX_WEIGHTS or {}).get(token, 1.0)
+        per_file = share / len(files)
+        paths.extend(files)
+        weights.extend([per_file] * len(files))
+    return paths, weights
+
+
+def _is_opponent_checkpoint(filename: str) -> bool:
+    """Only admit ordinary RL checkpoints to the opponent pool.
+
+    Keeping the pool explicit prevents supervised seeds and one-off finetunes
+    placed in models/ from silently changing the training distribution.
+    """
+    return (
+        filename.startswith("ppo_search_")
+        and "_checkpoint_" in filename
+        and filename.endswith(".pt")
+    )
 
 
 def _load_random_opponent(device: str):
@@ -208,14 +310,18 @@ def _load_random_opponent(device: str):
     return it as an eval-mode net (plus its path)."""
     if not os.path.isdir(MODELS_DIR):
         return None, None
-    files = [
-        filename for filename in os.listdir(MODELS_DIR) if filename.endswith(".pt")
-    ]
+    # Sort for reproducible weighted sampling on a fixed pool; os.listdir()
+    # order is filesystem-dependent.
+    search_dirs = [MODELS_DIR]
+    if _OPPONENT_INCLUDE_ARCHIVED and os.path.isdir(ARCHIVE_DIR):
+        search_dirs.append(ARCHIVE_DIR)
+    files, weights = _build_opponent_pool(search_dirs)
     if not files:
         return None, None
-    weights = [_opponent_weight(f) for f in files]
+    if not _OPPONENT_PREFIX_WEIGHTS and not _OPPONENT_MAX_PER_GEN:
+        # No explicit curriculum: keep the historical per-file weighting.
+        weights = [_opponent_weight(f) for f in files]
     path = random.choices(files, weights=weights, k=1)[0]
-    path = os.path.join(MODELS_DIR, path)
     try:
         state = torch.load(path, map_location=device)
         # Match the checkpoint's head architecture so legacy dense-head
@@ -402,6 +508,7 @@ def generate_batch(actor_critic_net,
                    device: str = "cpu",
                    temperature: float = 1.0,
                    opening_prob: float = 0.7,
+                   endgame_start_prob: float = 0.0,
                    opponent_move_fn: Optional[OpponentMoveFn] = None,
                    max_plies: int = 600,
                    min_live_boards: int = 0,
@@ -434,7 +541,15 @@ def generate_batch(actor_critic_net,
     tail plies cost engine calls / TB probes per ply while producing almost
     no states. Timed-out games bootstrap from 0 and are WDL-masked.
     """
-    boards = [_start_position(opening_prob) for _ in range(batch_size)]
+    boards = []
+    endgame_seeded = [False] * batch_size
+    for _bi in range(batch_size):
+        _b = _start_position(opening_prob, endgame_start_prob)
+        # <=5 men at ply 0 means the position came from endgame seeding, not
+        # from an opening line; used below to exempt it from TB adjudication.
+        endgame_seeded[_bi] = (endgame_start_prob > 0.0
+                               and chess.popcount(_b.occupied) <= 5)
+        boards.append(_b)
     self_play = opponent_move_fn is None
     policy_is_white = (
         [True] * batch_size if self_play
@@ -450,7 +565,11 @@ def generate_batch(actor_critic_net,
     last_dtz_phi_white: List[Optional[float]] = [None] * batch_size
     last_dtz_phi_black: List[Optional[float]] = [None] * batch_size
     done = [False] * batch_size
-    tb_terminate = [random.random() < tablebase_terminate_prob for _ in range(batch_size)]
+    # Endgame-seeded games are exempt: they start inside the tablebase, so
+    # adjudicating them would end the rollout at ply 0 and throw away exactly
+    # the conversion experience they were seeded to produce.
+    tb_terminate = [random.random() < tablebase_terminate_prob
+                    and not endgame_seeded[i] for i in range(batch_size)]
     # White-POV objective outcome for games ended by Syzygy adjudication (which
     # leaves the board non-terminal); used as the WDL label for those states.
     adjudicated_outcome = [None] * batch_size
@@ -800,6 +919,10 @@ def train_actor_critic(actor_critic_net,
                        critic_loss_weight: float = 0.5,
                        entropy_weight: float = 0.02,
                        batch_size: int = 64,
+                       lr_min_ratio: float = 0.1,
+                       log_step_cosine: bool = False,
+                       trainee_search_selfplay: bool = False,
+                       log_batch_diversity: bool = False,
                        opening_prob: float = 0.7,
                        temperature: float = 1.0,
                        ppo_clip_ratio: float = 0.2,
@@ -812,7 +935,8 @@ def train_actor_critic(actor_critic_net,
                        engine_path: Optional[str] = None,
                        engine_pool_size: int = 4,
                        engine_move_time: float = 0.05,
-                       engine_skill_level: Optional[int] = None,
+                       engine_skill_level: Optional[Sequence[int]] = None,
+                       endgame_start_prob: float = 0.0,
                        step_penalty: float = 0.001,
                        draw_penalty: float = 0.0,
                        material_shaping_per_pawn: float = 0.0,
@@ -835,7 +959,14 @@ def train_actor_critic(actor_critic_net,
     if seed is not None:
         _seed_everything(seed)
     actor_critic_net.to(device)
-    scheduler = LambdaLR(optimizer, lr_lambda=_cosine_lr_lambda(num_batches, 0.1))
+    engine_skill_levels = (
+        [0] if engine_skill_level is None
+        else ([int(engine_skill_level)] if isinstance(engine_skill_level, int)
+              else [int(v) for v in engine_skill_level]) )
+
+    scheduler = LambdaLR(optimizer,
+                         lr_lambda=_cosine_lr_lambda(num_batches, lr_min_ratio))
+
     mirror_perm = MIRROR_ACTION_PERM.to(device)
     # Clip core (policy+critic+trunk) and WDL-head grads separately, so a large
     # WDL-head gradient cannot scale down the PPO update via a shared global norm.
@@ -848,7 +979,11 @@ def train_actor_critic(actor_critic_net,
         try:
             engine_pool = EnginePool(engine_path, size=engine_pool_size)
             if engine_skill_level is not None:
-                engine_pool.configure_all({"Skill Level": int(engine_skill_level)})
+                # A list means "mix": one level is sampled per engine batch and
+                # applied with configure_all (a UCI setoption, no restart), so
+                # the trainee never overfits a single opponent error profile.
+                engine_pool.configure_all(
+                    {"Skill Level": int(engine_skill_levels[0])})
             print(f"[INFO] engine pool: {engine_path} x{len(engine_pool.engines)}")
         except Exception as exc:
             print(f"[WARN] could not start engine at {engine_path}: {exc}")
@@ -908,6 +1043,32 @@ def train_actor_critic(actor_critic_net,
     log_writer.writerow(["batch", "wins", "draws", "losses", "score"])
     print(f"[INFO] eval log: {log_path}")
 
+    # Update-direction diagnostic. Measures whether consecutive PPO updates
+    # point the same way; a random walk (cosine ~ 0) means extra batches add
+    # variance, not progress. Tagged by batch source so objective heterogeneity
+    # (self-play vs checkpoint vs engine) can be separated from intrinsic noise.
+    def _flat_weights():
+        return torch.cat([p.detach().reshape(-1)
+                          for p in actor_critic_net.parameters()]).clone()
+    step_cos_writer = None
+    if log_step_cosine:
+        _p = os.path.join(log_dir, f"{model_name}_stepcos.csv")
+        step_cos_file = open(_p, "w", newline="")
+        step_cos_writer = csv.writer(step_cos_file)
+        step_cos_writer.writerow(["batch", "source", "prev_source",
+                                  "cosine", "step_norm"])
+        print(f"[INFO] step-cosine log: {_p}")
+    div_writer = None
+    if log_batch_diversity:
+        _dp = os.path.join(log_dir, f"{model_name}_batchdiv.csv")
+        div_file = open(_dp, "w", newline="")
+        div_writer = csv.writer(div_file)
+        div_writer.writerow(["batch", "source", "n_minibatch", "mean_pair_cos",
+                             "mean_grad_norm"])
+        print(f"[INFO] batch-diversity log: {_dp}")
+    prev_step_vec = None
+    prev_source = None
+
     # Cumulative trainee-vs-Stockfish-engine outcomes across the run.
     engine_cum = {"W": 0, "D": 0, "L": 0, "T": 0}
 
@@ -933,8 +1094,13 @@ def train_actor_critic(actor_critic_net,
             r = random.random()
             trainee_search_now = False
             if engine_pool is not None and r < engine_ratio:
+                if len(engine_skill_levels) > 1:
+                    _skill = random.choice(engine_skill_levels)
+                    engine_pool.configure_all({"Skill Level": int(_skill)})
+                else:
+                    _skill = engine_skill_levels[0]
                 opponent_fn = _engine_opponent_fn(engine_pool, engine_move_time)
-                source = "engine"
+                source = f"engine(skill {_skill})"
                 trainee_search_now = trainee_search
             elif r < engine_ratio + opponent_ratio:
                 opp_net, opp_path = _load_random_opponent(device)
@@ -954,12 +1120,20 @@ def train_actor_critic(actor_critic_net,
             else:
                 opponent_fn = None
                 source = "self-play"
+                # Normally self-play is the ONE source where the trainee plays
+                # raw pi. That makes "self-play" and "no search" perfectly
+                # confounded, so a per-source gradient comparison cannot tell
+                # which of the two drives the difference. This flag breaks the
+                # confound for the diagnostic.
+                if trainee_search_selfplay:
+                    trainee_search_now = trainee_search
 
             actor_critic_net.eval()
             (states, masks, actions, old_lps, old_vs, returns,
              topk_idxs, log_b_topks, tb_targets, outcome_targets, rollout_stats) = generate_batch(
                 actor_critic_net, batch_size=batch_size, gamma=gamma, gae_lamb=gae_lamb,
                 device=device, temperature=temperature, opening_prob=opening_prob,
+                endgame_start_prob=endgame_start_prob,
                 opponent_move_fn=opponent_fn,
                 step_penalty=step_penalty, draw_penalty=draw_penalty,
                 material_shaping_per_pawn=material_shaping_per_pawn,
@@ -1094,6 +1268,10 @@ def train_actor_critic(actor_critic_net,
             approx_kl_sum = clip_frac_sum = 0.0
             update_count = 0
             early_stopped_at: Optional[int] = None
+            _mb_grads: List[torch.Tensor] = []
+
+            if step_cos_writer is not None:
+                _w_before = _flat_weights()
 
             actor_critic_net.train()
             for epoch in range(max(1, ppo_epochs)):
@@ -1188,6 +1366,14 @@ def train_actor_critic(actor_critic_net,
 
                     optimizer.zero_grad()
                     total_loss.backward()
+                    if div_writer is not None and epoch == 0 and len(_mb_grads) < 8:
+                        # Keep snapshots on CPU: 8 x 16.7M floats on the GPU
+                        # raises memory pressure enough to push attention onto
+                        # an accelerated SDPA kernel gfx1151 cannot run.
+                        _mb_grads.append(torch.cat([
+                            (p.grad.detach().reshape(-1) if p.grad is not None
+                             else torch.zeros(p.numel(), device=device))
+                            for p in actor_critic_net.parameters()]).to("cpu"))
                     torch.nn.utils.clip_grad_norm_(core_params, max_norm=0.5)
                     if wdl_on:
                         torch.nn.utils.clip_grad_norm_(wdl_params, max_norm=0.5)
@@ -1195,9 +1381,25 @@ def train_actor_critic(actor_critic_net,
 
                     with torch.no_grad():
                         # Trust-region check: drift of π_new from π_old, NOT from b.
-                        # Schulman k3 estimator: unbiased, non-negative.
+                        # Schulman k3 estimator, importance-corrected.
+                        #
+                        # k3 = r - 1 - log r is only unbiased for a ~ π_old. On
+                        # searched batches actions come from b, so rows where
+                        # π_old(a) is tiny (search picked a move the policy
+                        # would not) make exp(log_r_pi) explode — observed KL
+                        # up to 5e2 and 8e18 against a 0.015 target, aborting
+                        # every searched batch at epoch 1.
+                        #
+                        # Reweighting by w = π_old/b is exactly the correction
+                        # for sampling from b, and it also bounds the estimator:
+                        # w*r = π_new/b, which IS the actor's `ratios`. So the
+                        # exploding term never has to be formed. When b == π_old
+                        # (any unsearched batch) w == 1 and this reduces
+                        # identically to the previous expression.
                         log_r_pi = new_lp - mb_pi_old_lp
-                        approx_kl = (torch.exp(log_r_pi) - 1 - log_r_pi).mean().item()
+                        w = torch.exp((mb_pi_old_lp - mb_old_lp).clamp(max=30.0))
+                        approx_kl = ((ratios - w - w * log_r_pi).sum()
+                                     / w.sum().clamp(min=1e-8)).item()
                         clip_frac = ((ratios - 1.0).abs() > ppo_clip_ratio).float().mean().item()
                         if os.environ.get("DEBUG_PPO_RATIOS") and (
                                 log_r_pi.max() > 3 or log_r_pi.min() < -5):
@@ -1223,6 +1425,29 @@ def train_actor_critic(actor_critic_net,
                 if epoch_kl_sum / max(1, epoch_steps) > 1.5 * target_kl:
                     early_stopped_at = epoch + 1
                     break
+
+            if div_writer is not None and len(_mb_grads) >= 2:
+                _g = torch.stack([v / (v.norm() + 1e-12) for v in _mb_grads])
+                _cm = _g @ _g.T
+                _k = _cm.shape[0]
+                _off = (_cm.sum() - _cm.diag().sum()) / (_k * (_k - 1))
+                div_writer.writerow([
+                    batch + 1, source, _k, f"{float(_off):.6f}",
+                    f"{float(torch.stack([v.norm() for v in _mb_grads]).mean()):.6f}"])
+                div_file.flush()
+            _mb_grads = []
+
+            if step_cos_writer is not None:
+                _after = _flat_weights()
+                _step = _after - _w_before
+                _n = float(_step.norm())
+                _cos = (float(torch.dot(_step, prev_step_vec) /
+                              (_n * float(prev_step_vec.norm()) + 1e-12))
+                        if prev_step_vec is not None and _n > 0 else float("nan"))
+                step_cos_writer.writerow([batch + 1, source, prev_source,
+                                          f"{_cos:.6f}", f"{_n:.6f}"])
+                step_cos_file.flush()
+                prev_step_vec, prev_source = _step, source
 
             scheduler.step()
             denom = max(1, update_count)
@@ -1344,6 +1569,39 @@ def _parse_args() -> argparse.Namespace:
              "(opponent batches only); survivors end as timeouts.",
     )
     parser.add_argument("--seed", type=int, default=1401)
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Parallel games per rollout batch.",
+    )
+    parser.add_argument(
+        "--opponent-ratio", type=float, default=0.45,
+        help="Fraction of batches played against a sampled pool checkpoint. "
+             "engine_ratio + opponent_ratio = 1.0 leaves no self-play at all.",
+    )
+    parser.add_argument(
+        "--trainee-search-selfplay", action="store_true",
+        help="Also use trainee search in self-play batches. Normally self-play "
+             "is the only raw-pi source, which confounds 'self-play' with 'no "
+             "search' in any per-source comparison.",
+    )
+    parser.add_argument(
+        "--log-batch-diversity", action="store_true",
+        help="Log mean pairwise cosine between epoch-0 minibatch gradients to "
+             "<model>_batchdiv.csv. Measures whether games within one batch "
+             "agree; decides if averaging more games per update can help.",
+    )
+    parser.add_argument(
+        "--log-step-cosine", action="store_true",
+        help="Log the cosine between consecutive PPO update directions to "
+             "<model>_stepcos.csv, tagged by batch source. Diagnostic for "
+             "whether training makes directed progress or random-walks.",
+    )
+    parser.add_argument(
+        "--lr-min-ratio", type=float, default=0.1,
+        help="Floor of the cosine LR schedule as a fraction of the peak LR. "
+             "1.0 disables annealing entirely (constant LR), since the cosine "
+             "term is multiplied by (1 - min_ratio).",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--trainee-search", action="store_true",
@@ -1357,6 +1615,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--value-weight", type=float, default=1.0,
         help="Weight beta on net-derived quiescence values in the search score.",
+    )
+    parser.add_argument(
+        "--endgame-start-prob", type=float, default=0.0,
+        help="Fraction of rollouts that start from a random bare endgame "
+             "(KQvK/KRvK/KPvK/KRPvK) instead of the opening book. Puts "
+             "conversion positions into the training distribution; seeded "
+             "games are exempt from tablebase adjudication so they play out.",
     )
     parser.add_argument(
         "--dtz-shaping-weight", type=float, default=0.0,
@@ -1377,7 +1642,7 @@ def _parse_args() -> argparse.Namespace:
              "teacher). Raise it to lean the curriculum harder on the engine.",
     )
     parser.add_argument(
-        "--engine-skill-level", type=int, default=0,
+        "--engine-skill-level", type=int, nargs="+", default=[0],
         help="Stockfish Skill Level of the curriculum engine opponent. The "
              "in-training progress eval stays at the protocol skill 0 "
              "regardless, so its scores remain comparable across runs.",
@@ -1388,6 +1653,69 @@ def _parse_args() -> argparse.Namespace:
              "game outcome (win/draw/loss, mover POV; 0 = off). The head's forward "
              "detaches the shared trunk, so this trains ONLY wdl_head and never "
              "perturbs the policy/critic — a calibrated evaluator for search.",
+    )
+    parser.add_argument(
+        "--opponent-prefixes", default=None,
+        help="Comma-separated generation tokens restricting the opponent pool, "
+             "each optionally with a relative share: 'v12:3,v35:2,v14:1'. A "
+             "generation's share is weight/sum(weights) regardless of how many "
+             "checkpoint files it has (uniform file sampling gave a 20-file "
+             "generation 51%% and the live stretch rung 2.6%%). Bare tokens "
+             "default to weight 1. Default: every generation, historical "
+             "per-file weighting.",
+    )
+    parser.add_argument(
+        "--opponent-max-per-gen", type=int, default=0,
+        help="Keep at most N checkpoints per generation, sampled evenly across "
+             "the run and always including the last (0 = keep all). Consecutive "
+             "checkpoints of one run are near-duplicates.",
+    )
+    parser.add_argument(
+        "--flat-opponent-weights", action="store_true",
+        help="Sample the opponent pool uniformly instead of by the "
+             "OPPONENT_WEIGHTS generation table (which favours v23-v30 at 3.0 "
+             "while a running generation sits at 1.0). Use when the trainee is "
+             "far weaker than the strong end of the pool and needs opponents "
+             "it can actually compete with.",
+    )
+    parser.add_argument(
+        "--include-archived-opponents", action="store_true",
+        help="Also sample models/archive_weak/ (the loader is non-recursive by "
+             "default, so archived weak nets are normally invisible).",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=5e-5,
+        help="AdamW peak learning rate, cosine-annealed to --lr-min-ratio of "
+             "it. NOTE: --init-from restarts the schedule at the full peak, so "
+             "a continuation of a CONVERGED run must lower this. The source run "
+             "ended at lr*lr_min_ratio; resuming at the original peak takes "
+             "steps a sharpened policy cannot absorb and KL explodes (v35 "
+             "first attempt: KL 7-62 vs a 0.015 target, every batch "
+             "early-stopping at epoch 1).",
+    )
+    parser.add_argument(
+        "--lookahead-k", type=int, default=4,
+        help="Top-k policy candidates in the search support. The set is "
+             "top-k(pi) U captures U checks, so raising k adds fewer new "
+             "candidates than it appears.",
+    )
+    parser.add_argument(
+        "--entropy-weight", type=float, default=0.005,
+        help="Policy entropy bonus coefficient.",
+    )
+    parser.add_argument(
+        "--num-attention-layers", type=int, default=None,
+        help="Cold start only: attention layers in the tower (1 = legacy "
+             "single trailing layer). Ignored with --init-from, where the "
+             "architecture is inferred from the checkpoint.",
+    )
+    parser.add_argument(
+        "--rel-bias", action="store_true",
+        help="Cold start only: relative-position bias in attention.",
+    )
+    parser.add_argument(
+        "--attn-after-stem", action="store_true",
+        help="Cold start only: one attention layer on the stem output.",
     )
     parser.add_argument(
         "--num-filters", type=int, default=DEFAULT_NUM_FILTERS,
@@ -1413,6 +1741,24 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     run_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    global _OPPONENT_FLAT_WEIGHTS, _OPPONENT_INCLUDE_ARCHIVED
+    global _OPPONENT_PREFIX_FILTER, _OPPONENT_PREFIX_WEIGHTS, _OPPONENT_MAX_PER_GEN
+    _OPPONENT_FLAT_WEIGHTS = args.flat_opponent_weights
+    _OPPONENT_INCLUDE_ARCHIVED = args.include_archived_opponents
+    _OPPONENT_MAX_PER_GEN = args.opponent_max_per_gen
+    if args.opponent_prefixes:
+        spec = {}
+        for entry in args.opponent_prefixes.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            token, _, weight = entry.partition(":")
+            spec[token.strip()] = float(weight) if weight else 1.0
+        _OPPONENT_PREFIX_FILTER = list(spec)
+        _OPPONENT_PREFIX_WEIGHTS = spec
+    else:
+        _OPPONENT_PREFIX_FILTER = None
+        _OPPONENT_PREFIX_WEIGHTS = None
     if torch.version.hip is not None:
         os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
@@ -1440,15 +1786,19 @@ def main() -> None:
         "gamma": 0.98,
         "gae_lamb": 0.95,
         "critic_loss_weight": 0.5,
-        "entropy_weight": 0.005,
-        "batch_size": 32,
+        "entropy_weight": args.entropy_weight,
+        "batch_size": args.batch_size,
+        "lr_min_ratio": args.lr_min_ratio,
+        "log_step_cosine": args.log_step_cosine,
+        "trainee_search_selfplay": args.trainee_search_selfplay,
+        "log_batch_diversity": args.log_batch_diversity,
         "opening_prob": 0.6,
         "temperature": 1.0,
         "ppo_clip_ratio": 0.2,
         "ppo_epochs": 4,
         "ppo_minibatch_size": 256,
         "target_kl": 0.015,
-        "opponent_ratio": 0.45,
+        "opponent_ratio": args.opponent_ratio,
         "opponent_temperature": 1.0,
         "engine_ratio": args.engine_ratio,
         "engine_path": "./stockfish/stockfish",
@@ -1459,11 +1809,12 @@ def main() -> None:
         "step_penalty": 0.001,
         "draw_penalty": 0.0,
         "material_shaping_per_pawn": 0.025,
-        "lookahead_k": 4,
+        "lookahead_k": args.lookahead_k,
         "lookahead_alpha": args.lookahead_alpha,
         "lookahead_value_weight": args.value_weight,
         "trainee_search": args.trainee_search,
         "distill_weight": 0.0,
+        "endgame_start_prob": args.endgame_start_prob,
         "dtz_shaping_weight": args.dtz_shaping_weight,
         "tb_value_aux_weight": args.tb_value_aux_weight,
         "wdl_weight": args.wdl_weight,
@@ -1489,14 +1840,23 @@ def main() -> None:
     else:
         print(f"Cold start: fresh net "
               f"({args.num_filters} filters x {args.num_residual_blocks} blocks)")
+        attn_kwargs = {}
+        if args.num_attention_layers is not None:
+            attn_kwargs["num_attention_layers"] = args.num_attention_layers
+        if args.rel_bias:
+            attn_kwargs["rel_bias"] = True
+        if args.attn_after_stem:
+            attn_kwargs["attn_after_stem"] = True
+        print(f"  attention: {attn_kwargs or 'legacy default (1 trailing layer)'}")
         actor_critic_net = ActorCriticResNet(
             use_se=False,
             num_filters=args.num_filters,
             num_residual_blocks=args.num_residual_blocks,
+            **attn_kwargs,
         ).to(run_device)
 
     optimizer = torch.optim.AdamW(
-        actor_critic_net.parameters(), lr=5e-5, betas=(0.9, 0.999), weight_decay=0.0
+        actor_critic_net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.0
     )
 
     train_actor_critic(

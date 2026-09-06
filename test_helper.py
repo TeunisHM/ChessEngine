@@ -9,6 +9,8 @@ from helper import (
     legal_moves_mask,
     move_to_index,
 )
+from models import ActorCriticResNet
+from train import _is_opponent_checkpoint
 
 class TestHelperFunctions(unittest.TestCase):
 
@@ -150,6 +152,40 @@ class TestHelperFunctions(unittest.TestCase):
                         idx_mirror,
                         f"Canonical index mismatch for move {move.uci()} (mirror {mirrored_move.uci()}) in FEN '{fen}'",
                     )
+
+    def test_opponent_pool_accepts_only_rl_checkpoints(self):
+        self.assertTrue(_is_opponent_checkpoint("ppo_search_v28a_checkpoint_49.pt"))
+        self.assertFalse(_is_opponent_checkpoint("pretrain_v28a_attn5_stem_relbias.pt"))
+        self.assertFalse(_is_opponent_checkpoint("ppo_search_v26_299_wdltb.pt"))
+        self.assertFalse(_is_opponent_checkpoint("ppo_search_v28a_checkpoint_49.pt.tmp"))
+
+    def test_attention_positions_follow_loaded_checkpoint(self):
+        source = ActorCriticResNet(
+            num_residual_blocks=4,
+            num_filters=32,
+            num_attention_layers=3,
+            rel_bias=True,
+            attn_after_stem=True,
+        )
+        target = ActorCriticResNet(
+            num_residual_blocks=4,
+            num_filters=32,
+            num_attention_layers=3,
+            rel_bias=True,
+            attn_after_stem=False,
+        )
+        self.assertEqual(source._attn_after, [0, 2])
+        self.assertEqual(target._attn_after, [1, 3])
+        target.load_state_dict(source.state_dict())
+        self.assertEqual(target._attn_after, [0, 2])
+
+    def test_duplicate_attention_positions_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            ActorCriticResNet(
+                num_residual_blocks=2,
+                num_filters=32,
+                num_attention_layers=6,
+            )
 
 if __name__ == '__main__':
     unittest.main()
