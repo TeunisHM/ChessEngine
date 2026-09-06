@@ -282,6 +282,7 @@ def select_moves_with_lookahead(
     alpha: float = 0.33,
     temperature: float = 0.0,
     max_qdepth: int = 2,
+    check_budget: int = 1,
     value_weight: float = 1.0,
     use_wdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
@@ -378,7 +379,7 @@ def select_moves_with_lookahead(
 
     if child_boards:
         child_values = quiesce_batched(net, child_boards, device, max_qdepth=max_qdepth,
-                                       use_wdl=use_wdl)
+                                       check_budget=check_budget, use_wdl=use_wdl)
         rows_t = torch.tensor(child_rows, device=device, dtype=torch.long)
         cols_t = torch.tensor(child_cols, device=device, dtype=torch.long)
         # value_weight scales only net-derived quiescence values; ground-truth

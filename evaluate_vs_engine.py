@@ -73,6 +73,26 @@ def parse_args() -> argparse.Namespace:
         help="Weight on log pi(a) in the lookahead score: -V(child) + alpha*log pi.",
     )
     parser.add_argument(
+        "--paired-openings",
+        action="store_true",
+        help="Play each book opening twice with colors reversed, cycling the "
+             "66-line book until --games is reached. Removes opening+color as "
+             "noise sources; with a deterministic policy the standard start "
+             "position makes all games correlated draws from one game tree.",
+    )
+    parser.add_argument(
+        "--max-qdepth",
+        type=int,
+        default=2,
+        help="Quiescence depth (plies of capture/check resolution below each candidate).",
+    )
+    parser.add_argument(
+        "--check-budget",
+        type=int,
+        default=1,
+        help="Non-capturing checks extended per quiescence line.",
+    )
+    parser.add_argument(
         "--raw",
         action="store_true",
         help="Play the raw policy (no lookahead search).",
@@ -82,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Weight on net-derived quiescence values in the search score.",
+    )
+    parser.add_argument(
+        "--use-wdl",
+        action="store_true",
+        help="Evaluate search leaves with the separate WDL head "
+             "(P(win)-P(loss)) instead of the value scalar.",
     )
     parser.add_argument(
         "--opening-prob",
@@ -113,16 +139,23 @@ def _play_game(
     engine_move_time: float,
     lookahead_k: int = 8,
     lookahead_alpha: float = 0.33,
+    max_qdepth: int = 2,
+    check_budget: int = 1,
     raw: bool = False,
     value_weight: float = 1.0,
+    use_wdl: bool = False,
     opening_prob: float = 0.0,
+    start_board: "chess.Board | None" = None,
+    policy_is_white: "bool | None" = None,
 ) -> Dict[str, int]:
-    if opening_prob > 0.0:
+    if start_board is not None:
+        board = start_board.copy(stack=True)
+    elif opening_prob > 0.0:
         from train import _start_position  # lazy: avoid train.py's heavier deps by default
         board = _start_position(opening_prob)
     else:
         board = chess.Board()
-    is_policy_white = (game_index % 2 == 0)
+    is_policy_white = (game_index % 2 == 0) if policy_is_white is None else policy_is_white
     move_count = 0
 
     while not board.is_game_over():
@@ -147,6 +180,8 @@ def _play_game(
                     net, [board], device,
                     top_k=lookahead_k, alpha=lookahead_alpha,
                     temperature=temperature, value_weight=value_weight,
+                    max_qdepth=max_qdepth, check_budget=check_budget,
+                    use_wdl=use_wdl,
                 )
                 idx = int(idxs[0].item())
             move = index_to_move(idx, board)
@@ -200,8 +235,33 @@ def main() -> None:
     policy_white_wins = policy_black_wins = 0
     game_lengths = []
 
+    # Game plan: (policy_is_white, start_board). Paired openings play each line
+    # twice with colors reversed, cycling the book to fill --games, so opening
+    # and color are removed as noise sources rather than left to vary.
+    if args.paired_openings:
+        from helper import OPENINGS
+        book = []
+        for san_line in OPENINGS.values():
+            b_ = chess.Board()
+            try:
+                for san in san_line:
+                    b_.push_san(san)
+            except Exception:
+                continue
+            book.append(b_)
+        plan = []
+        while len(plan) < args.games:
+            for b_ in book:
+                plan.append((True, b_)); plan.append((False, b_))
+                if len(plan) >= args.games:
+                    break
+        plan = plan[:args.games]
+    else:
+        plan = [(None, None)] * args.games
+
     try:
         for g in range(args.games):
+            policy_is_white, start_board = plan[g]
             stats = _play_game(
                 net=net,
                 engine=engine,
@@ -211,9 +271,14 @@ def main() -> None:
                 engine_move_time=args.engine_move_time,
                 lookahead_k=args.lookahead_k,
                 lookahead_alpha=args.lookahead_alpha,
+                max_qdepth=args.max_qdepth,
+                check_budget=args.check_budget,
                 raw=args.raw,
                 value_weight=args.value_weight,
+                use_wdl=args.use_wdl,
                 opening_prob=args.opening_prob,
+                start_board=start_board,
+                policy_is_white=policy_is_white,
             )
             game_lengths.append(stats["plies"])
             result = stats["result"]
@@ -241,9 +306,11 @@ def main() -> None:
 
     print("\n--- Evaluation vs Engine ---")
     mode = "raw" if args.raw else (
-        f"search k={args.lookahead_k} a={args.lookahead_alpha} vw={args.value_weight}"
+        f"search k={args.lookahead_k} a={args.lookahead_alpha} vw={args.value_weight} "
+        f"qd={args.max_qdepth} cb={args.check_budget}"
     )
-    print(f"Model: {args.model} [{mode}] | "
+    book_tag = " | paired-openings" if args.paired_openings else ""
+    print(f"Model: {args.model} [{mode}]{book_tag} | "
           f"skill={args.engine_skill_level} move_time={args.engine_move_time}")
     print(f"Wins: {wins} | Draws: {draws} | Losses: {losses}")
     print(f"Policy as White Wins: {policy_white_wins} | Policy as Black Wins: {policy_black_wins}")

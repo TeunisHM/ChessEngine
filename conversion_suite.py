@@ -33,6 +33,19 @@ MATERIAL_CLASSES = {
 }
 
 
+def _material_sig(board: chess.Board) -> str:
+    """Compact material signature, e.g. KQvK / KRvKP — winner (White) first."""
+    order = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
+    sym = {chess.QUEEN: "Q", chess.ROOK: "R", chess.BISHOP: "B",
+           chess.KNIGHT: "N", chess.PAWN: "P"}
+    def side(color):
+        out = "K"
+        for pt in order:
+            out += sym[pt] * len(board.pieces(pt, color))
+        return out
+    return f"{side(chess.WHITE)}v{side(chess.BLACK)}"
+
+
 def _sample_won_position(tb, rng, n_extra):
     """Random position with a clean TB win for White. None on miss.
 
@@ -93,22 +106,30 @@ def _net_move(net, board, device, k, alpha, vw, use_wdl, temperature=0.0):
     return move
 
 
-def play_conversion(net, start, init_dtz, tb, device, args):
-    """Winner (White) played by the net; defender (Black) = same net greedy.
-    Returns (converted: bool, plies_used: int)."""
+def play_conversion(net, start, init_dtz, tb, device, args, defender=None):
+    """Winner (White) played by `net`; defender (Black) by `defender` (same net
+    if None). Pinning the defender to a fixed model separates *winning
+    technique* from *defensive collapse* — with a shared net, a model that
+    merely defends worse converts more without mating any better.
+
+    Returns (converted: bool, plies_used: int, reason: str).
+    """
+    dnet = net if defender is None else defender
     board = start.copy(stack=True)
     plies = 0
     while not board.is_game_over(claim_draw=False):
         if board.halfmove_clock >= 100:
-            return False, plies          # 50-move rule: conversion failed
+            return False, plies, "50-move"
+        if plies >= args.max_plies:
+            return False, plies, "max-plies"
         if board.turn == chess.WHITE:
             move = _net_move(net, board, device, args.k, args.alpha,
                              args.value_weight, args.use_wdl)
         else:
-            move = _net_move(net, board, device, max(2, args.k - 2),
+            move = _net_move(dnet, board, device, max(2, args.k - 2),
                              args.alpha, args.value_weight, False)
         if move is None:
-            return False, plies
+            return False, plies, "no-move"
         zeroing = board.is_zeroing(move)
         board.push(move)
         plies += 1
@@ -122,14 +143,19 @@ def play_conversion(net, start, init_dtz, tb, device, args):
             try:
                 wdl = tb.probe_wdl(board)
             except Exception:
-                return True, plies
-            wdl_white = wdl if board.turn == chess.WHITE else -wdl
-            if wdl_white == 2:
-                return True, plies
-        if plies > args.max_plies:
-            break
+                wdl = None      # unknown: keep playing, let the result decide
+            if wdl is not None:
+                wdl_white = wdl if board.turn == chess.WHITE else -wdl
+                if wdl_white == 2:
+                    return True, plies, "zeroing-win"
     result = board.result(claim_draw=False)
-    return result == "1-0", plies
+    if result == "1-0":
+        return True, plies, "checkmate"
+    if board.is_stalemate():
+        return False, plies, "STALEMATE"
+    if board.is_insufficient_material():
+        return False, plies, "insufficient-material"
+    return False, plies, f"draw({result})"
 
 
 def main():
@@ -143,6 +169,11 @@ def main():
     ap.add_argument("--alpha", type=float, default=1.0)
     ap.add_argument("--value-weight", type=float, default=1.0)
     ap.add_argument("--use-wdl", action="store_true")
+    ap.add_argument("--defender-model", default=None,
+                    help="Play the defending (bare) side with this model "
+                         "instead of the model under test. Pin it to a fixed "
+                         "reference so conversion rates measure winning "
+                         "technique, not the opponent's defensive decay.")
     ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1401)
     ap.add_argument("--device", default=None)
@@ -153,30 +184,61 @@ def main():
     tb = chess.syzygy.open_tablebase(args.tablebase)
     net = net_from_state_dict(torch.load(args.model, map_location=dev), dev)
     net.eval()
+    defender_net = None
+    if args.defender_model:
+        defender_net = net_from_state_dict(
+            torch.load(args.defender_model, map_location=dev), dev)
+        defender_net.eval()
+        print(f"defender pinned to: {args.defender_model}")
 
     print(f"model: {args.model} | k={args.k} alpha={args.alpha} "
           f"vw={args.value_weight} wdl={args.use_wdl}")
     total_ok = total_n = 0
     for n_extra in args.classes:
-        wins = plies_sum = optimal_sum = n = 0
+        wins = n = 0
+        ok_plies = ok_dtz = fail_plies = fail_dtz = 0
+        sig_stats = {}          # material signature -> [converted, total]
+        reasons = {}            # outcome reason -> count
         attempts = 0
         while n < args.games_per_class and attempts < args.games_per_class * 60:
             attempts += 1
             start, dtz = _sample_won_position(tb, rng, n_extra)
             if start is None:
                 continue
-            ok, used = play_conversion(net, start, dtz, tb, dev, args)
+            ok, used, why = play_conversion(net, start, dtz, tb, dev, args,
+                                            defender=defender_net)
+            reasons[why] = reasons.get(why, 0) + 1
             wins += int(ok)
-            plies_sum += used
-            optimal_sum += dtz
+            if ok:
+                ok_plies += used
+                ok_dtz += dtz
+            else:
+                fail_plies += used
+                fail_dtz += dtz
+            sig = _material_sig(start)
+            rec = sig_stats.setdefault(sig, [0, 0])
+            rec[0] += int(ok); rec[1] += 1
             n += 1
             print(f"\r  {n}/{args.games_per_class}", end="", flush=True)
         print("\r", end="")
         rate = wins / n if n else float("nan")
-        excess = (plies_sum - optimal_sum) / n if n else float("nan")
-        print(f"[{n_extra}-extra] converted {wins}/{n} ({rate*100:.0f}%) | "
-              f"mean plies {plies_sum/max(n,1):.0f} vs mean DTZ "
-              f"{optimal_sum/max(n,1):.0f} (+{excess:.0f})")
+        nf = n - wins
+        # Excess plies is only interpretable on games that actually converted;
+        # mixing failed games (often long cutoff runs) into it inflates the
+        # mean. Report the two populations separately.
+        print(f"[{n_extra}-extra] converted {wins}/{n} ({rate*100:.0f}%)")
+        if wins:
+            print(f"    converted: mean plies {ok_plies/wins:.0f} vs mean DTZ "
+                  f"{ok_dtz/wins:.0f} (+{(ok_plies-ok_dtz)/wins:.0f})")
+        if nf:
+            print(f"    failed   : {nf} game(s), mean plies {fail_plies/nf:.0f}, "
+                  f"mean start DTZ "
+                  f"{fail_dtz/nf:.0f}")
+        for sig in sorted(sig_stats, key=lambda k: -sig_stats[k][1]):
+            w, t = sig_stats[sig]
+            print(f"      {sig:<14} {w}/{t}")
+        print("    outcomes: " + "  ".join(
+            f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
         total_ok += wins
         total_n += n
     print(f"TOTAL: {total_ok}/{total_n} ({100*total_ok/max(1,total_n):.0f}%)")

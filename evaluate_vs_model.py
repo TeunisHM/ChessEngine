@@ -40,7 +40,7 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
                 net, [board], device,
                 top_k=lookahead_k, alpha=lookahead_alpha,
                 temperature=temperature, value_weight=value_weight,
-                max_qdepth=max_qdepth, use_wdl=use_wdl,
+                max_qdepth=max_qdepth, use_wdl=use_wdl and a_turn,
             )
             idx = int(idxs[0].item())
         move = index_to_move(idx, board)
