@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 from typing import Iterable, List, Optional, Tuple
 from time import perf_counter
 
@@ -205,7 +206,12 @@ def supervised_pretrain(
     weight_decay: float,
     value_loss_weight: float,
     num_workers: int,
+    seed: int,
 ) -> None:
+    # Keep data order independent of how many random tensors an architecture
+    # consumes during construction (arm A has extra attention parameters).
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(seed)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -213,6 +219,7 @@ def supervised_pretrain(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
+        generator=loader_generator,
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -324,6 +331,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
+        "--seed", type=int, default=1401,
+        help="Seed for model initialization and the independent DataLoader "
+             "shuffle generator.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -341,6 +353,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-residual-blocks", type=int, default=DEFAULT_NUM_RESIDUAL_BLOCKS,
         help="Number of residual blocks in the tower.",
+    )
+    parser.add_argument(
+        "--num-attention-layers", type=int, default=None,
+        help="Board-attention layers in the trunk. 0 = pure conv tower (no "
+             "attention at all); N>1 interleaves N-1 through the tower plus "
+             "one after it. Defaults to the model default (1, trailing only).",
+    )
+    parser.add_argument(
+        "--rel-bias", action="store_true",
+        help="Give attention a per-head (dRank,dFile) relative-position bias.",
+    )
+    parser.add_argument(
+        "--attn-after-stem", action="store_true",
+        help="Place one attention layer directly on the stem output, before "
+             "any residual block (sees raw per-square piece identity).",
     )
     parser.add_argument(
         "--init-model",
@@ -364,6 +391,10 @@ def main() -> None:
         if args.device is not None
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     dataset = PGNSupervisedDataset(
         args.pgn,
@@ -376,11 +407,20 @@ def main() -> None:
         print("[ERROR] No training samples were loaded from the PGNs.")
         return
 
-    model = ActorCriticResNet(
+    arch = dict(
         use_se=args.se,
         num_filters=args.num_filters,
         num_residual_blocks=args.num_residual_blocks,
+        rel_bias=args.rel_bias,
+        attn_after_stem=args.attn_after_stem,
     )
+    if args.num_attention_layers is not None:
+        arch["num_attention_layers"] = args.num_attention_layers
+    model = ActorCriticResNet(**arch)
+    print(f"[arch] {args.num_residual_blocks}x{args.num_filters} "
+          f"attn={args.num_attention_layers} rel_bias={args.rel_bias} "
+          f"after_stem={args.attn_after_stem} seed={args.seed} | "
+          f"{sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
     if args.init_model:
         if os.path.exists(args.init_model):
             print(f"[INFO] Loading initial weights from {args.init_model}")
@@ -399,6 +439,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         value_loss_weight=args.value_loss_weight,
         num_workers=args.num_workers,
+        seed=args.seed,
     )
 
     torch.save(model.state_dict(), args.output_model)

@@ -8,6 +8,25 @@ DEFAULT_INPUT_CHANNELS = BOARD_TENSOR_PLANES
 DEFAULT_NUM_RESIDUAL_BLOCKS = 8
 DEFAULT_NUM_FILTERS = 128
 DEFAULT_TRANSFORMER_HEADS = 4
+DEFAULT_NUM_ATTENTION_LAYERS = 1     # 1 == legacy: a single layer after the tower
+
+# (dRank, dFile) each in [-7, 7] -> 15*15 = 225 relative-position buckets.
+_REL_BUCKETS = 225
+
+
+def _relative_index() -> torch.Tensor:
+    """(64,64) long tensor mapping square pairs to a (dRank, dFile) bucket.
+
+    A full relative-position table subsumes the chess relations that matter --
+    same rank (dRank=0), same file (dFile=0), diagonals (|dRank|==|dFile|),
+    knight jumps, and distance -- without hand-coding any of them, at 225
+    parameters per head.
+    """
+    ar = torch.arange(64)
+    r, f = ar // 8, ar % 8
+    dr = r[None, :] - r[:, None] + 7
+    df = f[None, :] - f[:, None] + 7
+    return (dr * 15 + df).long()
 
 def _norm2d(num_channels):
     # GroupNorm does not depend on running batch statistics, so PPO rollouts
@@ -70,11 +89,21 @@ class BoardTransformerLayer(nn.Module):
     """Pre-LN self-attention + FFN over the 64 board squares as tokens."""
 
     def __init__(self, num_channels, num_heads=DEFAULT_TRANSFORMER_HEADS,
-                 dim_feedforward=None, dropout=0.0):
+                 dim_feedforward=None, dropout=0.0, rel_bias=False):
         super().__init__()
         if dim_feedforward is None:
             dim_feedforward = 4 * num_channels
+        self.num_heads = num_heads
         self.pos_embed = nn.Parameter(torch.zeros(64, num_channels))
+        if rel_bias:
+            # Per-head additive bias on attention logits, indexed by the
+            # (dRank, dFile) offset between squares. Gives attention the board
+            # geometry directly instead of making it rediscover that a1 and h1
+            # share a rank from a free-form pos_embed.
+            self.register_buffer("rel_index", _relative_index(), persistent=False)
+            self.rel_bias = nn.Parameter(torch.zeros(num_heads, _REL_BUCKETS))
+        else:
+            self.rel_bias = None
         self.layer = nn.TransformerEncoderLayer(
             d_model=num_channels,
             nhead=num_heads,
@@ -88,7 +117,28 @@ class BoardTransformerLayer(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         tokens = x.flatten(2).transpose(1, 2) + self.pos_embed
-        tokens = self.layer(tokens)
+        mask = None
+        if self.rel_bias is not None:
+            # (heads,64,64) -> (B*heads,64,64), the layout MultiheadAttention
+            # expects for a 3D float attn_mask (batch-major, head-minor).
+            bias = self.rel_bias[:, self.rel_index]
+            mask = bias.unsqueeze(0).expand(B, -1, -1, -1).reshape(
+                B * self.num_heads, 64, 64)
+        if mask is None:
+            tokens = self.layer(tokens)
+        else:
+            # nn.TransformerEncoderLayer's fused kernel returns NaN for a 3D
+            # float src_mask on this ROCm build (raw MultiheadAttention with the
+            # same mask is fine), so run the pre-LN block explicitly. Uses the
+            # layer's own submodules, so parameter names -- and therefore
+            # checkpoint compatibility -- are unchanged.
+            lyr = self.layer
+            h = lyr.norm1(tokens)
+            attn, _ = lyr.self_attn(h, h, h, attn_mask=mask, need_weights=False)
+            tokens = tokens + lyr.dropout1(attn)
+            h = lyr.norm2(tokens)
+            ff = lyr.linear2(lyr.dropout(lyr.activation(lyr.linear1(h))))
+            tokens = tokens + lyr.dropout2(ff)
         return tokens.transpose(1, 2).reshape(B, C, H, W)
 
 
@@ -123,6 +173,10 @@ class ActorCriticResNet(nn.Module):
         transformer_heads=DEFAULT_TRANSFORMER_HEADS,
         policy_head_style="conv",
         use_se=False,
+        num_attention_layers=DEFAULT_NUM_ATTENTION_LAYERS,
+        rel_bias=False,
+        attn_after_stem=False,
+        attn_positions=None,
     ):
         super().__init__()
 
@@ -136,7 +190,43 @@ class ActorCriticResNet(nn.Module):
             *[ResidualBlock(num_filters, use_se=use_se) for _ in range(num_residual_blocks)]
         )
 
-        self.transformer = BoardTransformerLayer(num_filters, num_heads=transformer_heads)
+        # Attention is cheap over 64 tokens (~69% of a residual block in
+        # compute), so it is interleaved rather than bolted on once at the end:
+        # with a single trailing layer the whole tower runs on purely local
+        # information. `mid_attn` holds the interleaved layers; `transformer`
+        # stays the final one so pre-v28 checkpoints keep loading unchanged.
+        n_mid = max(0, int(num_attention_layers) - 1)
+        self.mid_attn = nn.ModuleList([
+            BoardTransformerLayer(num_filters, num_heads=transformer_heads,
+                                  rel_bias=rel_bias)
+            for _ in range(n_mid)
+        ])
+        # Placement, in "after this many residual blocks"; 0 == straight after
+        # the stem, so attention sees raw per-square piece identity before any
+        # convolution has mixed it. Saved as a buffer so the exact layout is
+        # recoverable from the checkpoint rather than re-derived by rule.
+        if attn_positions is not None:
+            self._attn_after = [int(v) for v in attn_positions]
+        elif attn_after_stem and n_mid > 0:
+            rest = n_mid - 1
+            self._attn_after = [0] + [
+                round((j + 1) * num_residual_blocks / (rest + 1)) for j in range(rest)
+            ]
+        else:
+            self._attn_after = [
+                round((j + 1) * num_residual_blocks / (n_mid + 1)) for j in range(n_mid)
+            ]
+        self._validate_attn_positions(self._attn_after)
+        self.register_buffer("attn_positions",
+                             torch.tensor(self._attn_after, dtype=torch.long),
+                             persistent=True)
+        # num_attention_layers=0 removes attention entirely (pure conv tower),
+        # the control arm for "does attention earn its place at all".
+        self.transformer = (
+            BoardTransformerLayer(num_filters, num_heads=transformer_heads,
+                                  rel_bias=rel_bias)
+            if int(num_attention_layers) > 0 else None
+        )
 
         if policy_head_style == "conv":
             self.policy_head = ConvPolicyHead(num_filters)
@@ -183,10 +273,48 @@ class ActorCriticResNet(nn.Module):
             nn.Linear(256, 3),          # logits: [win, draw, loss], mover POV
         )
 
+    def _validate_attn_positions(self, positions):
+        if len(positions) != len(self.mid_attn):
+            raise ValueError(
+                f"expected {len(self.mid_attn)} interleaved attention positions, "
+                f"got {len(positions)}"
+            )
+        n_blocks = len(self.residual_tower)
+        if any(p < 0 or p > n_blocks for p in positions):
+            raise ValueError(
+                f"attention positions must be in [0, {n_blocks}], got {positions}"
+            )
+        if positions != sorted(set(positions)):
+            raise ValueError(
+                f"attention positions must be strictly increasing, got {positions}"
+            )
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        result = super().load_state_dict(state_dict, *args, **kwargs)
+        # forward() uses this cached Python list to avoid a GPU->CPU sync on
+        # every call. Refresh it after any direct state-dict load so the saved
+        # placement buffer remains the single source of truth.
+        positions = [int(v) for v in self.attn_positions.detach().cpu().tolist()]
+        self._validate_attn_positions(positions)
+        self._attn_after = positions
+        return result
+
     def forward(self, x, with_wdl=False, wdl_detach=True):
         out = self.stem(x)
-        out = self.residual_tower(out)
-        out = self.transformer(out)
+        if self.mid_attn:
+            ai = 0
+            if self._attn_after and self._attn_after[0] == 0:
+                out = self.mid_attn[0](out)      # raw piece info, pre-convolution
+                ai = 1
+            for i, blk in enumerate(self.residual_tower):
+                out = blk(out)
+                if ai < len(self.mid_attn) and (i + 1) == self._attn_after[ai]:
+                    out = self.mid_attn[ai](out)
+                    ai += 1
+        else:
+            out = self.residual_tower(out)
+        if self.transformer is not None:
+            out = self.transformer(out)
         policy_logits = self.policy_head(out)
         state_value = self.value_head(out)
         if with_wdl:
@@ -237,6 +365,20 @@ def infer_num_residual_blocks(state_dict) -> int:
     return max(indices) + 1 if indices else DEFAULT_NUM_RESIDUAL_BLOCKS
 
 
+def infer_num_attention_layers(state_dict) -> int:
+    """Interleaved `mid_attn.N.*` layers plus the trailing one, if present.
+
+    Returns 0 for a pure-conv checkpoint (no attention at all).
+    """
+    idx = {int(k.split(".")[1]) for k in state_dict if k.startswith("mid_attn.")}
+    has_final = any(k.startswith("transformer.") for k in state_dict)
+    return len(idx) + (1 if has_final else 0)
+
+
+def infer_rel_bias(state_dict) -> bool:
+    return any(k.endswith(".rel_bias") for k in state_dict)
+
+
 def net_from_state_dict(state_dict, device="cpu") -> ActorCriticResNet:
     """Build a net whose architecture matches the checkpoint (policy-head style,
     SE blocks, filter width, and residual depth all auto-detected), so
@@ -248,6 +390,10 @@ def net_from_state_dict(state_dict, device="cpu") -> ActorCriticResNet:
         use_se=infer_use_se(state_dict),
         num_filters=infer_num_filters(state_dict),
         num_residual_blocks=infer_num_residual_blocks(state_dict),
+        num_attention_layers=infer_num_attention_layers(state_dict),
+        rel_bias=infer_rel_bias(state_dict),
+        attn_positions=(state_dict["attn_positions"].tolist()
+                        if "attn_positions" in state_dict else None),
     ).to(device)
     load_actor_critic_state_dict(net, state_dict)
     return net
