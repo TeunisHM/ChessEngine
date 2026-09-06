@@ -58,3 +58,7 @@ claude.md
 train_explanation.txt
 train_improvements.md
 .claude/
+
+# Per-run launcher / diagnostic scripts (one-off, not shared infra)
+*.sh
+!pretrain_and_train.sh
