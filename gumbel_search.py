@@ -98,7 +98,19 @@ def _completed_q(node: _Node) -> Tuple[np.ndarray, float]:
     return np.where(visited, q, v_mix), sum_n
 
 
-def _sigma(q: np.ndarray, node: _Node, c_visit: float, c_scale: float) -> np.ndarray:
+def _sigma(q: np.ndarray, node: _Node, c_visit: float, c_scale: float,
+           rescale: bool = True) -> np.ndarray:
+    """sigma(q) = (c_visit + max_b N(b)) * c_scale * q.
+
+    q is min-max rescaled to [0,1] across the node's actions first, as the
+    reference implementation does (mctx qtransform_completed_by_mix_value,
+    rescale_values=True). Without it the multiplier -- which grows with the
+    visit count -- is applied to raw [-1,1] values and pi' collapses to nearly
+    one-hot, which in turn makes log b(chosen) unusable as a PPO denominator.
+    """
+    if rescale and q.size:
+        lo, hi = float(q.min()), float(q.max())
+        q = (q - lo) / (hi - lo) if hi - lo > 1e-8 else np.zeros_like(q)
     max_n = float(node.N.max()) if node.N.size else 0.0
     return (c_visit + max_n) * c_scale * q
 

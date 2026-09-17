@@ -962,9 +962,26 @@ def train_actor_critic(actor_critic_net,
                         min_live_boards: int = 3,
                         search_cfg: Optional[dict] = None,
                         opponent_search_cfg: Optional[dict] = None,
+                        policy_objective: str = "ppo",
                         seed: Optional[int] = None,
                         run_config: Optional[dict] = None):
-    """PPO training loop with self-play, optional checkpoint and engine opponents."""
+    """PPO training loop with self-play, optional checkpoint and engine opponents.
+
+    With policy_objective="az" the PPO objective is replaced by AlphaZero's:
+    policy cross-entropy toward the search's improved policy, value regression
+    toward the game outcome. Shaped rewards (step_penalty, material and DTZ
+    shaping) still shape `returns`, but AZ does not read them -- its value
+    target is z."""
+    if policy_objective not in ("ppo", "az"):
+        raise ValueError(f"unknown policy_objective {policy_objective!r}")
+    if policy_objective == "az":
+        # Every trainee move must carry a pi' target, so the search cannot be
+        # limited to opponent batches the way the PPO recipe limits it.
+        if not (trainee_search and trainee_search_selfplay):
+            print("[INFO] policy_objective=az forces --trainee-search and "
+                  "--trainee-search-selfplay (every state needs a pi' target)")
+        trainee_search = True
+        trainee_search_selfplay = True
     if seed is not None:
         _seed_everything(seed)
     actor_critic_net.to(device)
@@ -1184,7 +1201,15 @@ def train_actor_critic(actor_critic_net,
                     dtype=torch.float32, device=device,
                 )
             wdl_on = wdl_weight > 0.0 and any(t is not None for t in outcome_targets)
-            if wdl_on:
+            # AlphaZero objective: policy cross-entropy toward the search's
+            # improved policy pi', value regression toward the game outcome z.
+            # Needs the same per-candidate tensors the distill path builds, plus
+            # the outcome target whether or not the WDL head is enabled.
+            az_on = (
+                policy_objective == "az"
+                and topk_idxs and topk_idxs[0] is not None
+            )
+            if wdl_on or az_on:
                 # Dense objective-outcome anchor (mover POV, Syzygy-exact in the
                 # endgame). NaN = timeout game with unknown result -> masked out.
                 outcome_target_t = torch.tensor(
@@ -1195,7 +1220,7 @@ def train_actor_critic(actor_critic_net,
                 distill_weight > 0.0 and trainee_search
                 and topk_idxs and topk_idxs[0] is not None
             )
-            if distill_on:
+            if distill_on or az_on:
                 # Per-ply candidate sets have variable length (widened lookahead
                 # unions top-k(π) with captures/checks, which differs per board).
                 # Pad to the rollout-global max so torch.stack works; padding
@@ -1232,14 +1257,14 @@ def train_actor_critic(actor_critic_net,
             masks_t = torch.cat([masks_t, m_masks], 0)
             actions_t = torch.cat([actions_t, m_actions], 0)
             returns_t = torch.cat([returns_t, returns_t], 0)
-            if distill_on:
+            if distill_on or az_on:
                 m_topk_idx = mirror_perm[topk_idx_t]
                 topk_idx_t = torch.cat([topk_idx_t, m_topk_idx], 0)
                 log_b_topk_t = torch.cat([log_b_topk_t, log_b_topk_t], 0)
             if tb_aux_on:
                 # Tablebase value target is invariant to the file-flip mirror.
                 tb_target_t = torch.cat([tb_target_t, tb_target_t], 0)
-            if wdl_on:
+            if wdl_on or az_on:
                 # Game outcome is invariant to the file-flip mirror.
                 outcome_target_t = torch.cat([outcome_target_t, outcome_target_t], 0)
 
@@ -1250,7 +1275,12 @@ def train_actor_critic(actor_critic_net,
                 actor_critic_net, states_t, masks_t, actions_t,
                 ppo_minibatch_size,
             )
-            if trainee_search_now and old_lps:
+            if az_on:
+                # No importance sampling under AZ: the policy is fit to pi'
+                # directly, so `ratios` below degenerates to pi_new/pi_old and
+                # serves only the KL / clip-fraction diagnostics.
+                old_lp_t = pi_old_lp_t
+            elif trainee_search_now and old_lps:
                 # IS ratio uses log b (the search behavior policy) as denominator,
                 # so the actor loss is π_new(a|s) / b(a|s) — correct under search
                 # rollouts. Mirror states inherit b by symmetry of the search.
@@ -1311,10 +1341,26 @@ def train_actor_critic(actor_critic_net,
                     entropies = dist.entropy()
                     ratios = torch.exp(new_lp - mb_old_lp)
                     clipped = torch.clamp(ratios, 1.0 - ppo_clip_ratio, 1.0 + ppo_clip_ratio)
-                    actor_loss = -torch.min(ratios * mb_adv, clipped * mb_adv).mean()
-                    critic_loss = F.mse_loss(values.view(-1), mb_ret)
                     entropy_loss = -entropies.mean()
-                    if distill_on:
+                    if az_on:
+                        # Policy: -sum_a pi'(a) log pi_new(a) over the search's
+                        # candidate set. pi' is normalised over those actions, so
+                        # this is a proper cross-entropy and also pulls mass onto
+                        # the candidate set, exactly as an AZ visit-count target
+                        # does. No advantages, no clipping.
+                        new_log_pi = F.log_softmax(masked, dim=1)
+                        target = log_b_topk_t[mb].exp()
+                        actor_loss = -(target * new_log_pi.gather(1, topk_idx_t[mb])).sum(1).mean()
+                        # Value: regression to the game outcome z (mover POV),
+                        # not to the shaped GAE return.
+                        mb_z = outcome_target_t[mb]
+                        z_valid = ~torch.isnan(mb_z)
+                        critic_loss = (F.mse_loss(values.view(-1)[z_valid], mb_z[z_valid])
+                                       if z_valid.any() else torch.zeros((), device=device))
+                    else:
+                        actor_loss = -torch.min(ratios * mb_adv, clipped * mb_adv).mean()
+                        critic_loss = F.mse_loss(values.view(-1), mb_ret)
+                    if distill_on and not az_on:
                         # Soft cross-entropy toward the search distribution b:
                         #   per-state loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
                         # Outcome-filtered: only states where the search-chosen action
@@ -1747,6 +1793,13 @@ def _parse_args() -> argparse.Namespace:
              "--tb-value-aux-weight, so the actor never gets an injected "
              "terminal reward for merely reaching a won position).",
     )
+    parser.add_argument(
+        "--policy-objective", choices=("ppo", "az"), default="ppo",
+        help="'ppo' is the historical clipped-ratio objective. 'az' replaces it "
+             "with AlphaZero's: cross-entropy to the search's improved policy "
+             "and value regression to the game outcome. 'az' requires a search "
+             "backend that returns an improved policy (gumbel).",
+    )
     add_search_args(parser)
     return parser.parse_args()
 
@@ -1835,6 +1888,7 @@ def main() -> None:
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
         "search_cfg": search_config(args),
         "opponent_search_cfg": opponent_search_config(args),
+        "policy_objective": args.policy_objective,
     }
 
     print("[INFO] training configuration")
