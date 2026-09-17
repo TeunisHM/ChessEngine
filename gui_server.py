@@ -69,12 +69,12 @@ def _raw_move(net, board: chess.Board, temperature: float) -> chess.Move:
     return move if move is not None and move in board.legal_moves else next(iter(board.legal_moves))
 
 
-def _search_move(net, board: chess.Board, temperature: float, k: int, alpha: float, value_weight: float,
+def _search_move(net, board: chess.Board, temperature: float, k: int, alpha: float,
                  search_cfg: "dict | None" = None) -> chess.Move:
     with torch.no_grad():
         idxs, *_ = select_moves(
             net, [board], _device, top_k=k, alpha=alpha, temperature=temperature,
-            value_weight=value_weight, **(search_cfg or {}),
+            **(search_cfg or {}),
         )
     move = index_to_move(int(idxs[0].item()), board)
     return move if move is not None and move in board.legal_moves else next(iter(board.legal_moves))
@@ -83,22 +83,21 @@ def _search_move(net, board: chess.Board, temperature: float, k: int, alpha: flo
 class ModelPlayer:
     """One side of a game controlled by a checkpoint, raw or search-wrapped."""
 
-    def __init__(self, path: str, raw: bool, temperature: float, k: int, alpha: float, value_weight: float):
+    def __init__(self, path: str, raw: bool, temperature: float, k: int, alpha: float):
         self.path = path
         self.net = get_net(path)
         self.raw = raw
         self.temperature = temperature
         self.k = k
         self.alpha = alpha
-        self.value_weight = value_weight
 
     def pick_move(self, board: chess.Board) -> chess.Move:
         if self.raw:
             return _raw_move(self.net, board, self.temperature)
-        return _search_move(self.net, board, self.temperature, self.k, self.alpha, self.value_weight)
+        return _search_move(self.net, board, self.temperature, self.k, self.alpha)
 
     def label(self) -> str:
-        mode = "raw" if self.raw else f"search k={self.k} a={self.alpha} vw={self.value_weight}"
+        mode = "raw" if self.raw else f"search k={self.k} a={self.alpha}"
         return f"{os.path.basename(self.path)} [{mode}]"
 
 
@@ -185,7 +184,6 @@ def api_new_game():
             temperature=float(cfg.get("temperature", 1.0)),
             k=int(cfg.get("k", 4)),
             alpha=float(cfg.get("alpha", 1.0)),
-            value_weight=float(cfg.get("value_weight", 2.0)),
         )
 
     game = {"id": game_id, "board": board, "mode": mode, "san_history": []}

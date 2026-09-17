@@ -168,22 +168,13 @@ def _root_rank(node: _Node, perturbed: np.ndarray, c_visit: float, c_scale: floa
     return lambda a: float(scores[a])
 
 
-def _expand(net, nodes: List[_Node], device, use_wdl: bool, value_weight: float):
-    """One batched forward for every frontier node discovered this round.
-
-    value_weight is accepted only to keep one signature across backends; see
-    select_moves_with_gumbel's docstring for why it cannot do anything here.
-    """
+def _expand(net, nodes: List[_Node], device):
+    """One batched forward for every frontier node discovered this round."""
     if not nodes:
         return
     states = torch.stack([board_to_tensor(n.board) for n in nodes]).to(device)
-    if use_wdl:
-        logits, _, wdl = net(states, with_wdl=True)
-        p = wdl.softmax(-1)
-        values = (p[:, 0] - p[:, 2]).view(-1)
-    else:
-        logits, values = net(states)
-        values = values.view(-1)
+    logits, values = net(states)
+    values = values.view(-1)
     logits_np = logits.float().cpu().numpy()
     values_np = values.float().cpu().numpy()
     for i, node in enumerate(nodes):
@@ -218,8 +209,6 @@ def select_moves_with_gumbel(
     temperature: float = 0.0,
     c_visit: float = C_VISIT,
     c_scale: float = C_SCALE,
-    value_weight: float = 1.0,
-    use_wdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pick a move per board with Gumbel top-k root sampling + Sequential Halving.
@@ -239,15 +228,9 @@ def select_moves_with_gumbel(
     divided by the temperature before the noise is added, so the root sample is
     drawn from softmax(logits / T).
 
-value_weight is ACCEPTED AND IGNORED here; it is a quiescence-backend knob.
-    sigma min-max rescales completedQ, so scaling every value by a constant
-    leaves the improved policy exactly unchanged -- the transform is invariant
-    to it. Scaling only the network's values while proven terminals keep their
-    exact +/-1 does have an effect, but strictly a harmful one: it lets a
-    saturated estimate tie or outrank a real checkmate (measured: mate-in-1
-    detection fell 101/120 -> 89/120 at value_weight=8). To weigh the learned
-    evaluation against the policy prior here, use c_visit / c_scale, which is
-    the knob this search actually has for it.
+c_visit / c_scale are what weigh the learned evaluation against the policy
+    prior; sigma min-max rescales completedQ, so a uniform rescaling of the
+    values themselves would leave the improved policy exactly unchanged.
     """
     n = len(boards)
     states = torch.stack([board_to_tensor(b) for b in boards]).to(device)
@@ -333,7 +316,7 @@ value_weight is ACCEPTED AND IGNORED here; it is a quiescence-backend knob.
             if leaf_value is not None:
                 _backup(path, leaf_value)
 
-        _expand(net, pending, device, use_wdl, value_weight)
+        _expand(net, pending, device)
         for node, path in zip(pending, pending_paths):
             _backup(path, node.value)
 

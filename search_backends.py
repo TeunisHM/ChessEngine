@@ -87,8 +87,6 @@ def select_moves(
     *,
     backend: str = DEFAULT_BACKEND,
     temperature: float = 0.0,
-    value_weight: float = 1.0,
-    use_wdl: bool = False,
     # quiescence knobs
     top_k: int = 8,
     alpha: float = 0.33,
@@ -104,12 +102,10 @@ def select_moves(
         return select_moves_with_gumbel(
             net, boards, device, m=gumbel_m, sims=gumbel_sims,
             temperature=temperature, c_visit=c_visit, c_scale=c_scale,
-            value_weight=value_weight, use_wdl=use_wdl,
         )
     if backend != "quiescence":
         raise ValueError(f"unknown search backend {backend!r}; expected one of {BACKENDS}")
     return select_moves_with_lookahead(
         net, boards, device, top_k=top_k, alpha=alpha, temperature=temperature,
         max_qdepth=max_qdepth, check_budget=check_budget,
-        value_weight=value_weight, use_wdl=use_wdl,
     )

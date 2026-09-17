@@ -21,7 +21,6 @@ from helper import (
     MIRROR_ACTION_PERM,
     index_to_move,
     mirror_board_tensor_batch,
-    random_endgame_board,
 )
 from lookahead import select_moves_from_policy
 from search_backends import (add_search_args, opponent_search_config,
@@ -122,43 +121,8 @@ def _dtz_progress_potential(
     return -abs(dtz_color) / 100.0
 
 
-def _tb_value_target(
-    tablebase: Optional[chess.syzygy.Tablebase], board: chess.Board, color: chess.Color
-) -> Optional[float]:
-    """Ground-truth value target for `color` from the <=5-man tablebase, or
-    None outside its domain / on a probe miss.
-
-    Unlike _dtz_progress_potential this is defined on every in-domain
-    position (win, draw, or loss), for use as a value-head-only auxiliary
-    supervision target — kept out of the reward stream so it corrects the
-    critic's baseline without directly rewarding the actor. Cursed win /
-    blessed loss (50-move-rule edge cases) collapse to 0, same conservative
-    mapping as the WDL bootstrap termination.
-    """
-    if tablebase is None or chess.popcount(board.occupied) > 5:
-        return None
-    try:
-        wdl = tablebase.probe_wdl(board)
-    except (chess.syzygy.MissingTableError, KeyError):
-        return None
-    wdl_color = wdl if board.turn == color else -wdl
-    if wdl_color >= 2:
-        return 1.0
-    if wdl_color <= -2:
-        return -1.0
-    return 0.0
-
-
-def _start_position(opening_prob: float, endgame_prob: float = 0.0) -> chess.Board:
-    """Return a fresh board, optionally seeded with an opening line or endgame.
-
-    Endgame seeding drops the rollout straight into a random KQvK/KRvK/KPvK/
-    KRPvK position. Ordinary self-play from openings almost never *reaches*
-    bare endgames, so DTZ shaping and conversion technique get essentially no
-    training data; this puts them into the distribution deliberately.
-    """
-    if endgame_prob > 0.0 and random.random() < min(1.0, endgame_prob):
-        return random_endgame_board()
+def _start_position(opening_prob: float) -> chess.Board:
+    """Return a fresh board, optionally seeded with an opening line."""
     board = chess.Board()
     if random.random() < max(0.0, min(1.0, opening_prob)):
         _, san_line = random.choice(list(OPENINGS.items()))
@@ -171,18 +135,14 @@ def _start_position(opening_prob: float, endgame_prob: float = 0.0) -> chess.Boa
     return board
 
 
-def _terminal_rewards(board: chess.Board, draw_penalty: float = 0.0):
-    """Win/loss/draw signal from each color's perspective.
-
-    Draw penalty makes draws strictly worse than ongoing-but-winnable play, so the
-    sparse terminal signal pushes toward decisive games rather than shuffling.
-    """
+def _terminal_rewards(board: chess.Board):
+    """Win/loss/draw signal from each color's perspective."""
     result = board.result() if board.is_game_over() else "*"
     if result == "1-0":
         return 1.25, -1.0
     if result == "0-1":
         return -1.0, 1.25
-    return -draw_penalty, -draw_penalty
+    return 0.0, 0.0
 
 
 def calculate_gae_returns(rewards, values, gamma=0.99, lam=0.95):
@@ -207,7 +167,6 @@ OpponentMoveFn = Callable[[List[chess.Board]], List[Optional[chess.Move]]]
 
 def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
                             top_k: int, alpha: float,
-                            value_weight: float = 1.0,
                             search_cfg: Optional[dict] = None) -> OpponentMoveFn:
     """Vectorized opponent that picks moves with a frozen ActorCriticResNet using
     the same search the policy player uses."""
@@ -216,7 +175,7 @@ def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
         idxs, *_ = select_moves(
             opponent_net, boards, device,
             top_k=top_k, alpha=alpha, temperature=temperature,
-            value_weight=value_weight, **(search_cfg or {}),
+            **(search_cfg or {}),
         )
         idxs_cpu = idxs.cpu().tolist()
         out: List[Optional[chess.Move]] = []
@@ -238,11 +197,6 @@ def _opponent_weight(path: str) -> float:
         if os.path.basename(path).startswith(prefix):
             return weight
     return _OPPONENT_BASE_WEIGHT
-
-
-def _passes_prefix_filter(filename: str) -> bool:
-    """True when no generation whitelist is active, or filename is in it."""
-    return _matched_token(filename) is not None
 
 
 def _matched_token(filename: str):
@@ -408,7 +362,7 @@ def _book_start_boards() -> List[chess.Board]:
 
 def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bool,
                               pool: EnginePool, device: str,
-                              top_k: int, alpha: float, value_weight: float,
+                              top_k: int, alpha: float,
                               move_time: float,
                               search_cfg: Optional[dict] = None) -> str:
     board = start_board.copy(stack=True)
@@ -416,7 +370,7 @@ def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bo
         if (board.turn == chess.WHITE) == policy_is_white:
             idxs, *_ = select_moves(
                 net, [board], device, top_k=top_k, alpha=alpha,
-                temperature=0.0, value_weight=value_weight, **(search_cfg or {}),
+                temperature=0.0, **(search_cfg or {}),
             )
             move = index_to_move(int(idxs[0].item()), board)
             if move is None or move not in board.legal_moves:
@@ -431,14 +385,14 @@ def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bo
 
 def _play_eval_game_vs_ref(net, ref_net, start_board: chess.Board,
                            policy_is_white: bool, device: str,
-                           top_k: int, alpha: float, value_weight: float,
+                           top_k: int, alpha: float,
                            search_cfg: Optional[dict] = None) -> str:
     """One H2H game vs the frozen reference net; returns board.result()."""
     from evaluate_vs_model import play_game as _h2h_play_game
 
     kwargs = dict(
         lookahead_k=top_k, lookahead_alpha=alpha, temperature=0.0,
-        value_weight=value_weight, search_cfg=search_cfg,
+        search_cfg=search_cfg,
     )
     if policy_is_white:
         return _h2h_play_game(net, ref_net, device,
@@ -452,7 +406,6 @@ def evaluate_progress(net, device: str, games: int,
                       opponent: str, engine_pool: Optional[EnginePool],
                       engine_move_time: float, ref_net,
                       top_k: int = 4, alpha: float = 1.0,
-                      value_weight: float = 1.0,
                       search_cfg: Optional[dict] = None,
                       label: str = "") -> dict:
     """Paired-opening mini-match vs a fixed opponent. Returns W/D/L + score."""
@@ -475,7 +428,7 @@ def evaluate_progress(net, device: str, games: int,
         with ThreadPoolExecutor(max_workers=len(engine_pool.engines)) as ex:
             futures = [
                 ex.submit(_play_eval_game_vs_engine, net, start, policy_white,
-                          engine_pool, device, top_k, alpha, value_weight,
+                          engine_pool, device, top_k, alpha,
                           engine_move_time, search_cfg)
                 for start, policy_white in plan
             ]
@@ -484,7 +437,7 @@ def evaluate_progress(net, device: str, games: int,
         for start, policy_white in plan:
             results.append(_play_eval_game_vs_ref(
                 net, ref_net, start, policy_white, device,
-                top_k, alpha, value_weight, search_cfg))
+                top_k, alpha, search_cfg))
     else:
         return {"wins": 0, "draws": 0, "losses": 0, "score": 0.0, "games": 0}
 
@@ -514,22 +467,18 @@ def generate_batch(actor_critic_net,
                    device: str = "cpu",
                    temperature: float = 1.0,
                    opening_prob: float = 0.7,
-                   endgame_start_prob: float = 0.0,
                    opponent_move_fn: Optional[OpponentMoveFn] = None,
                    max_plies: int = 600,
                    min_live_boards: int = 0,
                    step_penalty: float = 0.0,
-                   draw_penalty: float = 0.0,
                    material_shaping_per_pawn: float = 0.0,
                    dtz_shaping_weight: float = 0.0,
-                   tb_value_aux_weight: float = 0.0,
                    wdl_weight: float = 0.0,
                    tablebase: Optional[chess.syzygy.Tablebase] = None,
                    tablebase_terminate_prob: float = 1.0,
                    trainee_search: bool = False,
                    trainee_top_k: int = 6,
                    trainee_alpha: float = 0.33,
-                   trainee_value_weight: float = 1.0,
                    search_cfg: Optional[dict] = None,
                    progress_label: str = ""):
     """Lockstep batch of games. One forward pass per ply across all live games.
@@ -548,15 +497,7 @@ def generate_batch(actor_critic_net,
     tail plies cost engine calls / TB probes per ply while producing almost
     no states. Timed-out games bootstrap from 0 and are WDL-masked.
     """
-    boards = []
-    endgame_seeded = [False] * batch_size
-    for _bi in range(batch_size):
-        _b = _start_position(opening_prob, endgame_start_prob)
-        # <=5 men at ply 0 means the position came from endgame seeding, not
-        # from an opening line; used below to exempt it from TB adjudication.
-        endgame_seeded[_bi] = (endgame_start_prob > 0.0
-                               and chess.popcount(_b.occupied) <= 5)
-        boards.append(_b)
+    boards = [_start_position(opening_prob) for _ in range(batch_size)]
     self_play = opponent_move_fn is None
     policy_is_white = (
         [True] * batch_size if self_play
@@ -572,17 +513,13 @@ def generate_batch(actor_critic_net,
     last_dtz_phi_white: List[Optional[float]] = [None] * batch_size
     last_dtz_phi_black: List[Optional[float]] = [None] * batch_size
     done = [False] * batch_size
-    # Endgame-seeded games are exempt: they start inside the tablebase, so
-    # adjudicating them would end the rollout at ply 0 and throw away exactly
-    # the conversion experience they were seeded to produce.
     tb_terminate = [random.random() < tablebase_terminate_prob
-                    and not endgame_seeded[i] for i in range(batch_size)]
+                    for _ in range(batch_size)]
     # White-POV objective outcome for games ended by Syzygy adjudication (which
     # leaves the board non-terminal); used as the WDL label for those states.
     adjudicated_outcome = [None] * batch_size
     shape_on = material_shaping_per_pawn > 0.0
     dtz_shape_on = dtz_shaping_weight > 0.0 and tablebase is not None
-    tb_aux_on = tb_value_aux_weight > 0.0 and tablebase is not None
     wdl_on = wdl_weight > 0.0
     # The WDL head target is the game outcome (computed in the gather loop), not a
     # per-state Syzygy probe, so the rollout path is unchanged when it's on.
@@ -655,7 +592,7 @@ def generate_batch(actor_critic_net,
                  topk_idx_step, log_b_topk_step) = select_moves(
                     actor_critic_net, pol_boards, device,
                     top_k=trainee_top_k, alpha=trainee_alpha, temperature=temperature,
-                    value_weight=trainee_value_weight, **(search_cfg or {}),
+                    **(search_cfg or {}),
                 )
                 # Diagnostics: how much does search disagree with raw π?
                 search_kl_sum += float(kl_b_pi_step.sum().item())
@@ -718,8 +655,6 @@ def generate_batch(actor_critic_net,
                             black_rewards[gid][-1] += dtz_shaping_weight * (gamma * dtz_phi_now - dtz_last)
                         last_dtz_phi_black[gid] = dtz_phi_now
 
-                tb_target = _tb_value_target(tablebase, board, current_player) if tb_aux_on else None
-
                 step = (
                     states[k].detach(),
                     masks[k].detach(),
@@ -728,7 +663,6 @@ def generate_batch(actor_critic_net,
                     values[k].detach().view(-1),
                     topk_idx_step[k].detach() if trainee_search else None,
                     log_b_topk_step[k].detach() if trainee_search else None,
-                    tb_target,
                 )
                 if current_player == chess.WHITE:
                     white_traj[gid].append(step)
@@ -763,7 +697,6 @@ def generate_batch(actor_critic_net,
     all_states, all_masks, all_actions = [], [], []
     all_old_log_probs, all_old_values, all_returns = [], [], []
     all_topk_idx, all_log_b_topk = [], []
-    all_tb_targets = []
     all_outcome_targets = []
 
     for gid in range(batch_size):
@@ -793,7 +726,7 @@ def generate_batch(actor_critic_net,
         # state. Real terminal -> board result; Syzygy-adjudicated -> the stored
         # adjudicated outcome; genuine max-plies timeout -> None (masked).
         if board.is_game_over():
-            final_w, final_b = _terminal_rewards(board, draw_penalty=draw_penalty)
+            final_w, final_b = _terminal_rewards(board)
             if white_rewards[gid]:
                 white_rewards[gid][-1] += final_w
             if black_rewards[gid]:
@@ -814,10 +747,10 @@ def generate_batch(actor_critic_net,
                 continue
             mover_outcome = None if white_outcome is None else (
                 white_outcome if is_white else -white_outcome)
-            vals = [float(v.item()) for (_, _, _, _, v, _, _, _) in traj]
+            vals = [float(v.item()) for (_, _, _, _, v, _, _) in traj]
             returns = calculate_gae_returns(rewards, vals, gamma=gamma, lam=gae_lamb)
             for (state_tensor, mask, action_idx, old_lp, old_v,
-                 topk_idx, log_b_topk, tb_target), ret in zip(traj, returns):
+                 topk_idx, log_b_topk), ret in zip(traj, returns):
                 all_states.append(state_tensor)
                 all_masks.append(mask)
                 all_actions.append(action_idx)
@@ -826,7 +759,6 @@ def generate_batch(actor_critic_net,
                 all_returns.append(ret)
                 all_topk_idx.append(topk_idx)
                 all_log_b_topk.append(log_b_topk)
-                all_tb_targets.append(tb_target)
                 # Objective game outcome (mover POV), None on timeout -> masked.
                 # Game outcomes alone calibrate the value head well (pretrained_big
                 # reached ~90% endgame WDL from PGN results with no tablebase).
@@ -864,7 +796,7 @@ def generate_batch(actor_critic_net,
 
     return (all_states, all_masks, all_actions, all_old_log_probs,
             all_old_values, all_returns, all_topk_idx, all_log_b_topk,
-            all_tb_targets, all_outcome_targets, stats)
+            all_outcome_targets, stats)
 
 
 # ---- Training loop ------------------------------------------------------
@@ -919,7 +851,6 @@ def train_actor_critic(actor_critic_net,
                         eval_ref_path: Optional[str] = None,
                         eval_k: int = 4,
                         eval_alpha: float = 1.0,
-                        eval_value_weight: float = 1.0,
                         eval_engine_skill: int = 0,
                         gamma: float = 0.99,
                        gae_lamb: float = 0.95,
@@ -943,18 +874,13 @@ def train_actor_critic(actor_critic_net,
                        engine_pool_size: int = 4,
                        engine_move_time: float = 0.05,
                        engine_skill_level: Optional[Sequence[int]] = None,
-                       endgame_start_prob: float = 0.0,
                        step_penalty: float = 0.001,
-                       draw_penalty: float = 0.0,
                        material_shaping_per_pawn: float = 0.0,
                        dtz_shaping_weight: float = 0.0,
-                       tb_value_aux_weight: float = 0.0,
                        wdl_weight: float = 0.0,
                        lookahead_k: int = 5,
                        lookahead_alpha: float = 0.5,
-                       lookahead_value_weight: float = 1.0,
                         trainee_search: bool = False,
-                        distill_weight: float = 0.0,
                         tablebase_path: Optional[str] = "syzygy",
                         tablebase_terminate_prob: float = 1.0,
                         rollout_max_plies: int = 600,
@@ -1105,7 +1031,7 @@ def train_actor_critic(actor_critic_net,
             engine_pool=eval_engine_pool,
             engine_move_time=engine_move_time,
             ref_net=eval_ref_net,
-            top_k=eval_k, alpha=eval_alpha, value_weight=eval_value_weight,
+            top_k=eval_k, alpha=eval_alpha,
             search_cfg=search_cfg,
             label=f"Eval at batch {batch_idx}",
         )
@@ -1138,7 +1064,6 @@ def train_actor_critic(actor_critic_net,
                     opponent_fn = _checkpoint_opponent_fn(
                         opp_net, device, opponent_temperature,
                         top_k=lookahead_k, alpha=lookahead_alpha,
-                        value_weight=lookahead_value_weight,
                         search_cfg=opponent_search_cfg or search_cfg,
                     )
                     source = f"checkpoint ({os.path.basename(opp_path)})"
@@ -1158,22 +1083,19 @@ def train_actor_critic(actor_critic_net,
 
             actor_critic_net.eval()
             (states, masks, actions, old_lps, old_vs, returns,
-             topk_idxs, log_b_topks, tb_targets, outcome_targets, rollout_stats) = generate_batch(
+             topk_idxs, log_b_topks, outcome_targets, rollout_stats) = generate_batch(
                 actor_critic_net, batch_size=batch_size, gamma=gamma, gae_lamb=gae_lamb,
                 device=device, temperature=temperature, opening_prob=opening_prob,
-                endgame_start_prob=endgame_start_prob,
                 opponent_move_fn=opponent_fn,
-                step_penalty=step_penalty, draw_penalty=draw_penalty,
+                step_penalty=step_penalty,
                 material_shaping_per_pawn=material_shaping_per_pawn,
                 dtz_shaping_weight=dtz_shaping_weight,
-                tb_value_aux_weight=tb_value_aux_weight,
                 wdl_weight=wdl_weight,
                 tablebase=tablebase,
                 tablebase_terminate_prob=tablebase_terminate_prob,
                 trainee_search=trainee_search_now,
                 trainee_top_k=lookahead_k,
                 trainee_alpha=lookahead_alpha,
-                trainee_value_weight=lookahead_value_weight,
                 search_cfg=search_cfg,
                 max_plies=(search_max_plies
                            if (trainee_search_now and opponent_fn is not None)
@@ -1192,19 +1114,11 @@ def train_actor_critic(actor_critic_net,
             masks_t = torch.stack(masks).to(device)
             actions_t = torch.tensor(actions, dtype=torch.long, device=device)
             returns_t = torch.stack(returns).view(-1).to(device)
-            tb_aux_on = tb_value_aux_weight > 0.0 and any(t is not None for t in tb_targets)
-            if tb_aux_on:
-                # NaN marks "no tablebase target" (outside the domain); masked
-                # out of the auxiliary loss, never treated as a real value.
-                tb_target_t = torch.tensor(
-                    [float("nan") if t is None else t for t in tb_targets],
-                    dtype=torch.float32, device=device,
-                )
             wdl_on = wdl_weight > 0.0 and any(t is not None for t in outcome_targets)
             # AlphaZero objective: policy cross-entropy toward the search's
             # improved policy pi', value regression toward the game outcome z.
-            # Needs the same per-candidate tensors the distill path builds, plus
-            # the outcome target whether or not the WDL head is enabled.
+            # Needs the per-candidate tensors below, plus the outcome target
+            # whether or not the WDL head is enabled.
             az_on = (
                 policy_objective == "az"
                 and topk_idxs and topk_idxs[0] is not None
@@ -1216,16 +1130,11 @@ def train_actor_critic(actor_critic_net,
                     [float("nan") if t is None else t for t in outcome_targets],
                     dtype=torch.float32, device=device,
                 )
-            distill_on = (
-                distill_weight > 0.0 and trainee_search
-                and topk_idxs and topk_idxs[0] is not None
-            )
-            if distill_on or az_on:
+            if az_on:
                 # Per-ply candidate sets have variable length (widened lookahead
                 # unions top-k(π) with captures/checks, which differs per board).
                 # Pad to the rollout-global max so torch.stack works; padding
-                # slots get b ≈ 0 via -1e9, so they contribute nothing to the
-                # distill cross-entropy.
+                # slots get b ≈ 0 via -1e9 and contribute nothing to the loss.
                 max_k_global = max(t.shape[0] for t in topk_idxs)
                 padded_idxs, padded_logbs = [], []
                 for idx, lb in zip(topk_idxs, log_b_topks):
@@ -1257,13 +1166,10 @@ def train_actor_critic(actor_critic_net,
             masks_t = torch.cat([masks_t, m_masks], 0)
             actions_t = torch.cat([actions_t, m_actions], 0)
             returns_t = torch.cat([returns_t, returns_t], 0)
-            if distill_on or az_on:
+            if az_on:
                 m_topk_idx = mirror_perm[topk_idx_t]
                 topk_idx_t = torch.cat([topk_idx_t, m_topk_idx], 0)
                 log_b_topk_t = torch.cat([log_b_topk_t, log_b_topk_t], 0)
-            if tb_aux_on:
-                # Tablebase value target is invariant to the file-flip mirror.
-                tb_target_t = torch.cat([tb_target_t, tb_target_t], 0)
             if wdl_on or az_on:
                 # Game outcome is invariant to the file-flip mirror.
                 outcome_target_t = torch.cat([outcome_target_t, outcome_target_t], 0)
@@ -1304,8 +1210,6 @@ def train_actor_critic(actor_critic_net,
             mb_size = max(1, min(int(ppo_minibatch_size), N))
 
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
-            distill_loss_sum = 0.0
-            tb_aux_loss_sum = 0.0
             wdl_loss_sum = 0.0
             approx_kl_sum = clip_frac_sum = 0.0
             update_count = 0
@@ -1360,40 +1264,6 @@ def train_actor_critic(actor_critic_net,
                     else:
                         actor_loss = -torch.min(ratios * mb_adv, clipped * mb_adv).mean()
                         critic_loss = F.mse_loss(values.view(-1), mb_ret)
-                    if distill_on and not az_on:
-                        # Soft cross-entropy toward the search distribution b:
-                        #   per-state loss = -E_b[log π_new] = KL(b ‖ π_new) − H(b).
-                        # Outcome-filtered: only states where the search-chosen action
-                        # had positive advantage contribute. This aligns the distill
-                        # gradient with the PPO actor signal (also advantage-weighted)
-                        # — search picks that the rollout vindicated reinforce π;
-                        # search picks that lost don't get copied. Without this filter,
-                        # the asymmetric clip protects the actor but distill flows
-                        # unrestricted, dragging π toward b's biased choices.
-                        new_log_pi = F.log_softmax(masked, dim=1)
-                        new_log_pi_topk = new_log_pi.gather(1, topk_idx_t[mb])
-                        mb_b_topk = log_b_topk_t[mb].exp()
-                        distill_per_state = -(mb_b_topk * new_log_pi_topk).sum(dim=1)
-                        pos_mask = (mb_adv > 0).float()
-                        n_pos = pos_mask.sum().clamp(min=1.0)
-                        distill_loss = (distill_per_state * pos_mask).sum() / n_pos
-                    else:
-                        distill_loss = torch.zeros((), device=device)
-                    if tb_aux_on:
-                        # Value-head-only supervision toward tablebase ground
-                        # truth — kept off the reward stream so it corrects the
-                        # critic's baseline without directly rewarding the actor;
-                        # a better-calibrated baseline still sharpens the actor's
-                        # advantage (and thus its training signal) for failed
-                        # conversions, but only via the normal PPO mechanism.
-                        mb_tb_target = tb_target_t[mb]
-                        tb_valid = ~torch.isnan(mb_tb_target)
-                        if tb_valid.any():
-                            tb_aux_loss = F.mse_loss(values.view(-1)[tb_valid], mb_tb_target[tb_valid])
-                        else:
-                            tb_aux_loss = torch.zeros((), device=device)
-                    else:
-                        tb_aux_loss = torch.zeros((), device=device)
                     if wdl_on:
                         # Separate WDL head supervised on objective game outcome
                         # (win/draw/loss, mover POV). The forward DETACHES the shared
@@ -1417,8 +1287,6 @@ def train_actor_critic(actor_critic_net,
                         actor_loss
                         + critic_loss_weight * critic_loss
                         + entropy_weight * entropy_loss
-                        + distill_weight * distill_loss
-                        + tb_value_aux_weight * tb_aux_loss
                         + wdl_weight * wdl_loss
                     )
 
@@ -1471,8 +1339,6 @@ def train_actor_critic(actor_critic_net,
                     actor_loss_sum += actor_loss.item()
                     critic_loss_sum += critic_loss.item()
                     entropy_loss_sum += entropy_loss.item()
-                    distill_loss_sum += distill_loss.item()
-                    tb_aux_loss_sum += tb_aux_loss.item()
                     wdl_loss_sum += wdl_loss.item()
                     approx_kl_sum += approx_kl
                     clip_frac_sum += clip_frac
@@ -1512,8 +1378,6 @@ def train_actor_critic(actor_critic_net,
             avg_actor = actor_loss_sum / denom
             avg_critic = critic_loss_sum / denom
             avg_entropy = entropy_loss_sum / denom
-            avg_distill = distill_loss_sum / denom
-            avg_tb_aux = tb_aux_loss_sum / denom
             avg_wdl = wdl_loss_sum / denom
             avg_kl = approx_kl_sum / denom
             avg_clip = clip_frac_sum / denom
@@ -1529,8 +1393,6 @@ def train_actor_critic(actor_critic_net,
                     f"rank: {s['mean_pick_rank']:.2f} "
                     f"Δlogp@a: {s['mean_delta_logp_at_chosen']:+.3f}"
                 )
-            distill_info = f" Distill: {avg_distill:.4f}" if distill_weight > 0 else ""
-            tb_aux_info = f" TBaux: {avg_tb_aux:.4f}" if tb_value_aux_weight > 0 else ""
             wdl_info = f" WDLce: {avg_wdl:.4f}" if wdl_weight > 0 else ""
             outcome_info = ""
             outcomes = rollout_stats.get("trainee_outcomes")
@@ -1552,7 +1414,7 @@ def train_actor_critic(actor_critic_net,
                 f"[Batch {batch+1}] {source} | DataGen: {t1 - t0:.2f}s "
                 f"Train: {t2 - t1:.2f}s{suffix} | "
                 f"Actor: {avg_actor:.4f} Critic: {avg_critic:.4f} "
-                f"Entropy: {avg_entropy:.4f}{distill_info}{tb_aux_info}{wdl_info} "
+                f"Entropy: {avg_entropy:.4f}{wdl_info} "
                 f"KL: {avg_kl:.4f} Clip: {avg_clip:.3f}"
                 f"{search_info}"
                 f"{outcome_info}"
@@ -1607,10 +1469,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-alpha", type=float, default=1.0,
         help="Search log-pi weight used by the in-training eval.",
-    )
-    parser.add_argument(
-        "--eval-value-weight", type=float, default=1.0,
-        help="Quiescence value weight used by the in-training eval.",
     )
     parser.add_argument(
         "--rollout-max-plies", type=int, default=600,
@@ -1671,28 +1529,10 @@ def _parse_args() -> argparse.Namespace:
         help="Weight on log pi in the search score (1.0 = policy-scale formula).",
     )
     parser.add_argument(
-        "--value-weight", type=float, default=1.0,
-        help="Weight beta on net-derived quiescence values in the search score.",
-    )
-    parser.add_argument(
-        "--endgame-start-prob", type=float, default=0.0,
-        help="Fraction of rollouts that start from a random bare endgame "
-             "(KQvK/KRvK/KPvK/KRPvK) instead of the opening book. Puts "
-             "conversion positions into the training distribution; seeded "
-             "games are exempt from tablebase adjudication so they play out.",
-    )
-    parser.add_argument(
         "--dtz-shaping-weight", type=float, default=0.0,
         help="Weight on the DTZ conversion-progress potential inside <=5-man "
              "tablebase wins (0 = off). Dense reward for shrinking distance "
              "to the forced zeroing move; silent outside a confirmed win.",
-    )
-    parser.add_argument(
-        "--tb-value-aux-weight", type=float, default=0.0,
-        help="Weight on a value-head-only auxiliary loss toward tablebase "
-             "ground truth (0 = off). Kept out of the reward stream so it "
-             "corrects the critic's baseline without directly rewarding the "
-             "actor for reaching a won position.",
     )
     parser.add_argument(
         "--engine-ratio", type=float, default=0.1,
@@ -1789,9 +1629,7 @@ def _parse_args() -> argparse.Namespace:
         "--tablebase-terminate-prob", type=float, default=0.25,
         help="Per-game probability of auto-terminating with the WDL result "
              "the instant a <=5-man tablebase position is reached. Set to 0 "
-             "to always play out endgames (e.g. when using "
-             "--tb-value-aux-weight, so the actor never gets an injected "
-             "terminal reward for merely reaching a won position).",
+             "to always play out endgames.",
     )
     parser.add_argument(
         "--policy-objective", choices=("ppo", "az"), default="ppo",
@@ -1844,7 +1682,6 @@ def main() -> None:
         "eval_ref_path": args.eval_ref or (args.init_from if args.eval_opponent == "ref" else None),
         "eval_k": args.eval_k,
         "eval_alpha": args.eval_alpha,
-        "eval_value_weight": args.eval_value_weight,
         "rollout_max_plies": args.rollout_max_plies,
         "search_max_plies": args.search_max_plies,
         "min_live_boards": args.min_live_boards,
@@ -1873,16 +1710,11 @@ def main() -> None:
         "engine_skill_level": args.engine_skill_level,
         "eval_engine_skill": 0,
         "step_penalty": 0.001,
-        "draw_penalty": 0.0,
         "material_shaping_per_pawn": 0.025,
         "lookahead_k": args.lookahead_k,
         "lookahead_alpha": args.lookahead_alpha,
-        "lookahead_value_weight": args.value_weight,
         "trainee_search": args.trainee_search,
-        "distill_weight": 0.0,
-        "endgame_start_prob": args.endgame_start_prob,
         "dtz_shaping_weight": args.dtz_shaping_weight,
-        "tb_value_aux_weight": args.tb_value_aux_weight,
         "wdl_weight": args.wdl_weight,
         "tablebase_path": "syzygy",
         "tablebase_terminate_prob": args.tablebase_terminate_prob,

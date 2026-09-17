@@ -98,18 +98,6 @@ def parse_args() -> argparse.Namespace:
         help="Play the raw policy (no lookahead search).",
     )
     parser.add_argument(
-        "--value-weight",
-        type=float,
-        default=1.0,
-        help="Weight on net-derived quiescence values in the search score.",
-    )
-    parser.add_argument(
-        "--use-wdl",
-        action="store_true",
-        help="Evaluate search leaves with the separate WDL head "
-             "(P(win)-P(loss)) instead of the value scalar.",
-    )
-    parser.add_argument(
         "--opening-prob",
         type=float,
         default=0.0,
@@ -143,8 +131,6 @@ def _play_game(
     max_qdepth: int = 2,
     check_budget: int = 1,
     raw: bool = False,
-    value_weight: float = 1.0,
-    use_wdl: bool = False,
     opening_prob: float = 0.0,
     search_cfg: "dict | None" = None,
     start_board: "chess.Board | None" = None,
@@ -181,9 +167,9 @@ def _play_game(
                 idxs, *_ = select_moves(
                     net, [board], device,
                     top_k=lookahead_k, alpha=lookahead_alpha,
-                    temperature=temperature, value_weight=value_weight,
+                    temperature=temperature,
                     max_qdepth=max_qdepth, check_budget=check_budget,
-                    use_wdl=use_wdl, **(search_cfg or {}),
+                    **(search_cfg or {}),
                 )
                 idx = int(idxs[0].item())
             move = index_to_move(idx, board)
@@ -276,8 +262,6 @@ def main() -> None:
                 max_qdepth=args.max_qdepth,
                 check_budget=args.check_budget,
                 raw=args.raw,
-                value_weight=args.value_weight,
-                use_wdl=args.use_wdl,
                 opening_prob=args.opening_prob,
                 search_cfg=search_config(args),
                 start_board=start_board,
@@ -315,7 +299,7 @@ def main() -> None:
                 f"c_visit={args.gumbel_c_visit} c_scale={args.gumbel_c_scale}")
     else:
         mode = (f"quiescence k={args.lookahead_k} a={args.lookahead_alpha} "
-                f"vw={args.value_weight} qd={args.max_qdepth} cb={args.check_budget}")
+                f"qd={args.max_qdepth} cb={args.check_budget}")
     book_tag = " | paired-openings" if args.paired_openings else ""
     print(f"Model: {args.model} [{mode}]{book_tag} | "
           f"skill={args.engine_skill_level} move_time={args.engine_move_time}")

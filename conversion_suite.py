@@ -22,15 +22,9 @@ import torch
 if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
-from helper import index_to_move, random_endgame_board, board_to_tensor, legal_moves_mask
+from helper import index_to_move
 from search_backends import add_search_args, search_config, select_moves
 from models import net_from_state_dict
-
-MATERIAL_CLASSES = {
-    "KQvK": (1,),
-    "KRvK": (1,),
-    "KQvKP": None,   # unused placeholder; classes below use piece counts
-}
 
 
 def _material_sig(board: chess.Board) -> str:
@@ -95,11 +89,10 @@ def _sample_won_position(tb, rng, n_extra):
     return None, None
 
 
-def _net_move(net, board, device, k, alpha, vw, use_wdl, temperature=0.0,
-              search_cfg=None):
+def _net_move(net, board, device, k, alpha, temperature=0.0, search_cfg=None):
     idxs, *_ = select_moves(
         net, [board], device, top_k=k, alpha=alpha,
-        temperature=temperature, value_weight=vw, use_wdl=use_wdl,
+        temperature=temperature,
         **(search_cfg or {}),
     )
     move = index_to_move(int(idxs[0].item()), board)
@@ -126,12 +119,10 @@ def play_conversion(net, start, init_dtz, tb, device, args, defender=None):
             return False, plies, "max-plies"
         if board.turn == chess.WHITE:
             move = _net_move(net, board, device, args.k, args.alpha,
-                             args.value_weight, args.use_wdl,
                              search_cfg=search_config(args))
         else:
             move = _net_move(dnet, board, device, max(2, args.k - 2),
-                             args.alpha, args.value_weight, False,
-                             search_cfg=search_config(args))
+                             args.alpha, search_cfg=search_config(args))
         if move is None:
             return False, plies, "no-move"
         zeroing = board.is_zeroing(move)
@@ -171,8 +162,6 @@ def main():
                     help="Extra-piece counts (Syzygy max 3: <=5 men total).")
     ap.add_argument("--k", type=int, default=4)
     ap.add_argument("--alpha", type=float, default=1.0)
-    ap.add_argument("--value-weight", type=float, default=1.0)
-    ap.add_argument("--use-wdl", action="store_true")
     ap.add_argument("--defender-model", default=None,
                     help="Play the defending (bare) side with this model "
                          "instead of the model under test. Pin it to a fixed "
@@ -196,8 +185,7 @@ def main():
         defender_net.eval()
         print(f"defender pinned to: {args.defender_model}")
 
-    print(f"model: {args.model} | k={args.k} alpha={args.alpha} "
-          f"vw={args.value_weight} wdl={args.use_wdl}")
+    print(f"model: {args.model} | k={args.k} alpha={args.alpha}")
     total_ok = total_n = 0
     for n_extra in args.classes:
         wins = n = 0

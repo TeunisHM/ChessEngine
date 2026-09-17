@@ -27,7 +27,7 @@ def _raw_policy_index(net, board, device, temperature: float) -> int:
 def play_game(net_a, net_b, device, *, a_is_white: bool,
               lookahead_k: int, lookahead_alpha: float, temperature: float,
               raw_a: bool = False, raw_b: bool = False,
-              value_weight: float = 1.0, max_qdepth: int = 2, use_wdl: bool = False,
+              max_qdepth: int = 2,
               search_cfg: "dict | None" = None,
               start_board: "chess.Board | None" = None):
     board = chess.Board() if start_board is None else start_board.copy()
@@ -40,8 +40,7 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
             idxs, *_ = select_moves(
                 net, [board], device,
                 top_k=lookahead_k, alpha=lookahead_alpha,
-                temperature=temperature, value_weight=value_weight,
-                max_qdepth=max_qdepth, use_wdl=use_wdl and a_turn,
+                temperature=temperature, max_qdepth=max_qdepth,
                 **(search_cfg or {}),
             )
             idx = int(idxs[0].item())
@@ -65,17 +64,10 @@ def main():
                         help="Model A plays the raw policy (no lookahead).")
     parser.add_argument("--raw-b", action="store_true",
                         help="Model B plays the raw policy (no lookahead).")
-    parser.add_argument("--value-weight", type=float, default=1.0,
-                        help="Weight on net-derived quiescence values in the "
-                             "search score (0 ablates the learned evaluation; "
-                             "terminal ground truth keeps full weight).")
     parser.add_argument("--max-qdepth", type=int, default=2,
                         help="Max forcing-move plies quiescence extends below "
                              "each candidate (default 2). Higher = deeper "
                              "tactical horizon along captures/checks.")
-    parser.add_argument("--use-wdl", action="store_true",
-                        help="Model A's search evaluates leaves with the separate "
-                             "WDL head (P(win)-P(loss)) instead of the value scalar.")
     parser.add_argument("--paired-openings", action="store_true",
                         help="Play every opening in the book twice with colors "
                              "reversed (removes opening+color noise); ignores --games.")
@@ -127,9 +119,7 @@ def main():
                 temperature=args.temperature,
                 raw_a=args.raw_a,
                 raw_b=args.raw_b,
-                value_weight=args.value_weight,
                 max_qdepth=args.max_qdepth,
-                use_wdl=args.use_wdl,
                 search_cfg=search_config(args),
                 start_board=start_board,
             )
@@ -160,8 +150,8 @@ def main():
             )
     print()
     print("\n--- Model vs Model ---")
-    mode_a = "raw" if args.raw_a else f"search vw={args.value_weight}"
-    mode_b = "raw" if args.raw_b else f"search vw={args.value_weight}"
+    mode_a = "raw" if args.raw_a else "search"
+    mode_b = "raw" if args.raw_b else "search"
     print(f"A = {args.model_a} [{mode_a}]")
     print(f"B = {args.model_b} [{mode_b}]")
     print(f"A wins: {a_wins} (white {a_white_wins}, black {a_black_wins}) | "

@@ -1,7 +1,6 @@
 import json
 import os
 import glob
-from statistics import mean
 import matplotlib.pyplot as plt
 
 def load_logs(log_dir="eval_logs2"):

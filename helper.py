@@ -89,28 +89,8 @@ OPENINGS = {
     "vienna_gambit": ["e4", "e5", "Nc3", "Nf6", "f4"],
 }
 
-DIRECTIONS = [
-    (0, 1),    # up
-    (1, 1),    # up-right
-    (1, 0),    # right
-    (1, -1),   # down-right
-    (0, -1),   # down
-    (-1, -1),  # down-left
-    (-1, 0),   # left
-    (-1, 1)    # up-left
-]
-
-KNIGHT_DIRS = [
-    (1, 2), (2, 1), (2, -1), (1, -2),
-    (-1, -2), (-2, -1), (-2, 1), (-1, 2)
-]
-
-PROMOTION_PIECES = ['n', 'r', 'q']  # Promotion piece order (standard)
 BOARD_TENSOR_PLANES = 20
 ACTION_SPACE_SIZE = 64 * 73
-
-def square_to_coords(square):
-    return chess.square_file(square), chess.square_rank(square)
 
 def get_move_plane(move: chess.Move):
     """
@@ -286,28 +266,6 @@ def decode_plane_to_move(from_square: int, plane: int, board: chess.Board) -> ch
         else:
             return chess.Move(from_square, to_square)
 
-def piece_planes(board: chess.Board) -> torch.Tensor:
-    # Your existing 12x8x8 encoding here
-    tensor = torch.zeros((12, 8, 8), dtype=torch.float32)
-    player = board.turn
-
-    # Planes 0-11: Piece Positions (own pieces 0-5, opp pieces 6-11) ---
-    # Rotate 180 deg for Black to make the net always see "player" at bottom
-    for square, piece in board.piece_map().items():
-        if player == chess.BLACK:
-            square = chess.square_mirror(square)
-
-        rank = chess.square_rank(square)
-        file = chess.square_file(square)
-
-        if piece.color == player:
-            plane = piece.piece_type - 1
-        else:
-            plane = piece.piece_type - 1 + 6
-
-        tensor[plane, rank, file] = 1.0
-    return tensor  
-
 def board_to_tensor(board: chess.Board) -> torch.Tensor:
     """
     Converts the board state to a canonical tensor representation (20, 8, 8).
@@ -388,16 +346,6 @@ def legal_moves_mask(board: chess.Board) -> torch.Tensor:
             print(f"Could not encode legal move: {move.uci()} for board {board.fen()}. Error: {e}")
     return mask
 
-def eval_material(board):
-    score = 0
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            value = PIECE_VALUES[piece.piece_type]
-            score += value if piece.color == chess.WHITE else -value
-    return score
-
-
 # --- Horizontal mirror augmentation ---------------------------------------
 # A horizontal (file) mirror of a chess position is strategically equivalent
 # except for castling rights (king-side <-> queen-side). We use this to
@@ -467,44 +415,6 @@ _ENDGAME_MATERIAL = [
 ]
 
 
-def random_endgame_board(max_attempts: int = 40) -> chess.Board:
-    """Generate a random simple-endgame starting position. Returns Board()
-    as a fallback if a valid legal position cannot be constructed.
-    """
-    for _ in range(max_attempts):
-        setup = random.choice(_ENDGAME_MATERIAL)
-        white_pieces, black_pieces = setup
-        squares = random.sample(range(64), 2 + len(white_pieces) + len(black_pieces))
-        board = chess.Board.empty()
-        try:
-            board.set_piece_at(squares[0], chess.Piece(chess.KING, chess.WHITE))
-            board.set_piece_at(squares[1], chess.Piece(chess.KING, chess.BLACK))
-            i = 2
-            for pt in white_pieces:
-                # Pawns cannot be on rank 1 or 8.
-                sq = squares[i]
-                if pt == chess.PAWN:
-                    rank = chess.square_rank(sq)
-                    if rank == 0 or rank == 7:
-                        raise ValueError("pawn on back rank")
-                board.set_piece_at(sq, chess.Piece(pt, chess.WHITE))
-                i += 1
-            for pt in black_pieces:
-                sq = squares[i]
-                if pt == chess.PAWN:
-                    rank = chess.square_rank(sq)
-                    if rank == 0 or rank == 7:
-                        raise ValueError("pawn on back rank")
-                board.set_piece_at(sq, chess.Piece(pt, chess.BLACK))
-                i += 1
-            board.turn = random.choice([chess.WHITE, chess.BLACK])
-            if board.is_valid() and not board.is_game_over():
-                return board
-        except (ValueError, AssertionError):
-            continue
-    return chess.Board()
-
-
 def mirror_board_tensor(t: torch.Tensor) -> torch.Tensor:
     """Horizontal mirror of a canonical (C,8,8) board tensor.
 
@@ -521,11 +431,6 @@ def mirror_board_tensor_batch(batch: torch.Tensor) -> torch.Tensor:
     out = batch.flip(-1).clone()
     out[:, [12, 13, 14, 15]] = out[:, [13, 12, 15, 14]]
     return out
-
-
-def mirror_legal_mask_batch(mask: torch.Tensor) -> torch.Tensor:
-    """Reorder a (B,4672) legal-move mask into its mirrored positions."""
-    return mask[:, MIRROR_ACTION_PERM.to(mask.device)]
 
 
 def mirror_action_index(idx: int) -> int:

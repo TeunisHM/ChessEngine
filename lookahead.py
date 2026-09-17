@@ -11,7 +11,7 @@ under stand-pat-V at quiet leaves.
 temperature <= 0 -> argmax; otherwise sample softmax(score / temperature) over
 the top_k.
 """
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import chess
 import torch
@@ -19,21 +19,9 @@ import torch.nn.functional as F
 
 from helper import board_to_tensor, index_to_move, legal_moves_mask, move_to_index
 
-# Proven-mate score: dominant and independent of value_weight, so a forced mate
-# always outranks any learned evaluation (fixes value_weight>1 rejecting mate).
+# Proven-mate score: dominant over any learned evaluation, so a forced mate
+# always wins the comparison at a node.
 MATE_SCORE = 1000.0
-
-
-def _leaf_value(net, board: chess.Board, device, use_wdl: bool) -> float:
-    """Side-to-move leaf evaluation in [-1,1]. use_wdl -> P(win)-P(loss) from the
-    separate WDL head (zero-sum, calibrated); else the scalar value head."""
-    state = board_to_tensor(board).unsqueeze(0).to(device)
-    if use_wdl:
-        _, _, wdl = net(state, with_wdl=True)
-        p = wdl.softmax(-1)
-        return float((p[0, 0] - p[0, 2]).item())
-    _, v = net(state)
-    return float(v.item())
 
 
 @torch.inference_mode()
@@ -102,12 +90,11 @@ def _ordered_checks(board: chess.Board):
             if not board.is_capture(m) and board.gives_check(m)]
 
 
-def _eval_leaf_batch(net, boards: List[chess.Board], device, use_wdl: bool) -> torch.Tensor:
+def _eval_leaf_batch(net, boards: List[chess.Board], device) -> torch.Tensor:
     """Side-to-move leaf value in [-1,1] for many boards in a few large forwards.
 
-    Replaces per-leaf single-sample inference (latency-bound on iGPU) with
-    chunked batch evaluation — same values as _leaf_value would produce,
-    computed ~100x cheaper per board.
+    Chunked batch evaluation rather than per-leaf single-sample inference, which
+    is latency-bound on an iGPU; ~100x cheaper per board.
     """
     values = torch.empty(len(boards), device=device)
     chunk = 2048
@@ -116,13 +103,8 @@ def _eval_leaf_batch(net, boards: List[chess.Board], device, use_wdl: bool) -> t
             [board_to_tensor(b) for b in boards[start:start + chunk]]
         ).to(device)
         end = start + states.shape[0]
-        if use_wdl:
-            _, _, wdl = net(states, with_wdl=True)
-            p = wdl.softmax(-1)
-            values[start:end] = p[:, 0] - p[:, 2]
-        else:
-            _, v = net(states)
-            values[start:end] = v.view(-1)
+        _, v = net(states)
+        values[start:end] = v.view(-1)
     return values
 
 
@@ -139,7 +121,6 @@ def quiesce_batched(
     device,
     max_qdepth: int = 2,
     check_budget: int = 1,
-    use_wdl: bool = False,
 ) -> torch.Tensor:
     """Per-board quiescence via level-synchronous batched negamax with windows.
 
@@ -219,7 +200,7 @@ def quiesce_batched(
                 "refusing to truncate (lower max_qdepth/check_budget)"
             )
         if eval_boards:
-            vals = _eval_leaf_batch(net, eval_boards, device, use_wdl)
+            vals = _eval_leaf_batch(net, eval_boards, device)
             for node, v in zip(eval_nodes, vals.tolist()):
                 if node["board"].is_check():
                     resolve(node, v)
@@ -283,8 +264,6 @@ def select_moves_with_lookahead(
     temperature: float = 0.0,
     max_qdepth: int = 2,
     check_budget: int = 1,
-    value_weight: float = 1.0,
-    use_wdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pick a move per board via *widened* candidate set + value quiescence.
@@ -379,17 +358,10 @@ def select_moves_with_lookahead(
 
     if child_boards:
         child_values = quiesce_batched(net, child_boards, device, max_qdepth=max_qdepth,
-                                       check_budget=check_budget, use_wdl=use_wdl)
+                                       check_budget=check_budget)
         rows_t = torch.tensor(child_rows, device=device, dtype=torch.long)
         cols_t = torch.tensor(child_cols, device=device, dtype=torch.long)
-        # value_weight scales only net-derived quiescence values; ground-truth
-        # terminal entries (checkmate/stalemate children) keep full weight, so
-        # value_weight=0 ablates the learned evaluation but not mate detection.
-        # Forced mates found in quiescence (|value| == MATE_SCORE) also bypass the
-        # scaling, so a proven mate stays dominant regardless of value_weight.
-        cv = -child_values.to(neg_v.dtype)
-        cv = torch.where(cv.abs() >= MATE_SCORE, cv, cv * value_weight)
-        neg_v.index_put_((rows_t, cols_t), cv)
+        neg_v.index_put_((rows_t, cols_t), -child_values.to(neg_v.dtype))
 
     score = neg_v + alpha * topk_logp
     score = score.masked_fill(is_invalid, -1e9)
