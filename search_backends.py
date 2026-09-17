@@ -34,6 +34,12 @@ def add_search_args(parser):
              "default and reproduces every pre-2026-09 result.",
     )
     parser.add_argument(
+        "--opponent-search-backend", choices=("same",) + BACKENDS, default="same",
+        help="Search used by frozen checkpoint opponents. 'same' follows "
+             "--search-backend (historical behaviour). Pin it to 'quiescence' to "
+             "change only the trainee's search and hold the curriculum fixed.",
+    )
+    parser.add_argument(
         "--gumbel-m", type=int, default=16,
         help="Gumbel AZ: root actions sampled without replacement (paper's m).",
     )
@@ -62,6 +68,16 @@ def search_config(args) -> dict:
         "c_visit": getattr(args, "gumbel_c_visit", C_VISIT),
         "c_scale": getattr(args, "gumbel_c_scale", C_SCALE),
     }
+
+
+def opponent_search_config(args) -> dict:
+    """Search settings for frozen checkpoint opponents. Defaults to the
+    trainee's, so an unspecified run behaves exactly as before."""
+    cfg = search_config(args)
+    choice = getattr(args, "opponent_search_backend", "same")
+    if choice != "same":
+        cfg["backend"] = choice
+    return cfg
 
 
 def select_moves(

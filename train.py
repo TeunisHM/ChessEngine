@@ -24,7 +24,8 @@ from helper import (
     random_endgame_board,
 )
 from lookahead import select_moves_from_policy
-from search_backends import add_search_args, search_config, select_moves
+from search_backends import (add_search_args, opponent_search_config,
+                             search_config, select_moves)
 from models import (
     ActorCriticResNet,
     DEFAULT_NUM_FILTERS,
@@ -960,6 +961,7 @@ def train_actor_critic(actor_critic_net,
                         search_max_plies: int = 300,
                         min_live_boards: int = 3,
                         search_cfg: Optional[dict] = None,
+                        opponent_search_cfg: Optional[dict] = None,
                         seed: Optional[int] = None,
                         run_config: Optional[dict] = None):
     """PPO training loop with self-play, optional checkpoint and engine opponents."""
@@ -1120,7 +1122,7 @@ def train_actor_critic(actor_critic_net,
                         opp_net, device, opponent_temperature,
                         top_k=lookahead_k, alpha=lookahead_alpha,
                         value_weight=lookahead_value_weight,
-                        search_cfg=search_cfg,
+                        search_cfg=opponent_search_cfg or search_cfg,
                     )
                     source = f"checkpoint ({os.path.basename(opp_path)})"
                     # Trainee search applies in opponent batches (checkpoint and
@@ -1832,6 +1834,7 @@ def main() -> None:
         "tablebase_path": "syzygy",
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
         "search_cfg": search_config(args),
+        "opponent_search_cfg": opponent_search_config(args),
     }
 
     print("[INFO] training configuration")
