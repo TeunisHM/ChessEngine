@@ -37,6 +37,23 @@ DEFAULT_ARMS = [
                                     "--gumbel-sims", "128", "--gumbel-c-visit", "0.5"]),
 ]
 
+# Narrowed set for a high-power re-run once the sweep has thinned the field.
+# 64 games leaves ~0.06 SE, which cannot separate arms a few points apart.
+FINALIST_ARMS = [
+    ("raw policy",               ["--raw"]),
+    ("quiescence k=4 a=1.0",     ["--lookahead-k", "4", "--lookahead-alpha", "1.0"]),
+    ("gumbel n=32 c_visit=0.5",  ["--search-backend", "gumbel", "--gumbel-m", "16",
+                                  "--gumbel-sims", "32", "--gumbel-c-visit", "0.5"]),
+    ("gumbel n=64 c_visit=1",    ["--search-backend", "gumbel", "--gumbel-m", "16",
+                                  "--gumbel-sims", "64", "--gumbel-c-visit", "1"]),
+    ("gumbel n=64 c_visit=0.5",  ["--search-backend", "gumbel", "--gumbel-m", "16",
+                                  "--gumbel-sims", "64", "--gumbel-c-visit", "0.5"]),
+    ("gumbel n=128 c_visit=1",   ["--search-backend", "gumbel", "--gumbel-m", "16",
+                                  "--gumbel-sims", "128", "--gumbel-c-visit", "1"]),
+]
+
+PRESETS = {"sweep": DEFAULT_ARMS, "finalists": FINALIST_ARMS}
+
 _RESULT = re.compile(r"Wins:\s*(\d+)\s*\|\s*Draws:\s*(\d+)\s*\|\s*Losses:\s*(\d+)")
 
 
@@ -61,16 +78,19 @@ def main():
     ap.add_argument("--games", type=int, default=64)
     ap.add_argument("--engine-skill", type=int, default=0)
     ap.add_argument("--engine-move-time", type=float, default=0.01)
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="sweep",
+                    help="'sweep' scans c_visit/budget broadly; 'finalists' re-runs "
+                         "the survivors, meant to be paired with a larger --games.")
     ap.add_argument("--python", default=sys.executable)
     args = ap.parse_args()
 
     print(f"model: {args.model}")
     print(f"protocol: SF skill {args.engine_skill}, {args.engine_move_time}s/move, "
-          f"{args.games} paired-opening games per arm\n")
+          f"{args.games} paired-opening games per arm | preset={args.preset}\n")
     print(f"{'arm':<26} {'W':>4} {'D':>4} {'L':>4} {'score':>8} {'+/-SE':>7}  verdict")
 
     baseline = None
-    for label, flags in DEFAULT_ARMS:
+    for label, flags in PRESETS[args.preset]:
         res = run_arm(args.python, args.model, flags, args.games,
                       args.engine_skill, args.engine_move_time)
         if res is None:
