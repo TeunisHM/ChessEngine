@@ -52,7 +52,16 @@ FINALIST_ARMS = [
                                   "--gumbel-sims", "128", "--gumbel-c-visit", "1"]),
 ]
 
-PRESETS = {"sweep": DEFAULT_ARMS, "finalists": FINALIST_ARMS}
+# Minimum set for comparing two nets rather than two search settings: the
+# no-search baseline, the incumbent search, and the best Gumbel arm.
+ARCH_ARMS = [
+    ("raw policy",            ["--raw"]),
+    ("quiescence k=4 a=1.0",  ["--lookahead-k", "4", "--lookahead-alpha", "1.0"]),
+    ("gumbel n=64 c_visit=1", ["--search-backend", "gumbel", "--gumbel-m", "16",
+                               "--gumbel-sims", "64", "--gumbel-c-visit", "1"]),
+]
+
+PRESETS = {"sweep": DEFAULT_ARMS, "finalists": FINALIST_ARMS, "arch": ARCH_ARMS}
 
 _RESULT = re.compile(r"Wins:\s*(\d+)\s*\|\s*Draws:\s*(\d+)\s*\|\s*Losses:\s*(\d+)")
 
