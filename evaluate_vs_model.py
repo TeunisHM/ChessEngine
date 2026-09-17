@@ -9,7 +9,7 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import board_to_tensor, index_to_move, legal_moves_mask
-from lookahead import select_moves_with_lookahead
+from search_backends import add_search_args, search_config, select_moves
 from models import net_from_state_dict
 
 
@@ -28,6 +28,7 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
               lookahead_k: int, lookahead_alpha: float, temperature: float,
               raw_a: bool = False, raw_b: bool = False,
               value_weight: float = 1.0, max_qdepth: int = 2, use_wdl: bool = False,
+              search_cfg: "dict | None" = None,
               start_board: "chess.Board | None" = None):
     board = chess.Board() if start_board is None else start_board.copy()
     while not board.is_game_over():
@@ -36,11 +37,12 @@ def play_game(net_a, net_b, device, *, a_is_white: bool,
         if raw_a if a_turn else raw_b:
             idx = _raw_policy_index(net, board, device, temperature)
         else:
-            idxs, *_ = select_moves_with_lookahead(
+            idxs, *_ = select_moves(
                 net, [board], device,
                 top_k=lookahead_k, alpha=lookahead_alpha,
                 temperature=temperature, value_weight=value_weight,
                 max_qdepth=max_qdepth, use_wdl=use_wdl and a_turn,
+                **(search_cfg or {}),
             )
             idx = int(idxs[0].item())
         move = index_to_move(idx, board)
@@ -77,6 +79,7 @@ def main():
     parser.add_argument("--paired-openings", action="store_true",
                         help="Play every opening in the book twice with colors "
                              "reversed (removes opening+color noise); ignores --games.")
+    add_search_args(parser)
     args = parser.parse_args()
 
     device = (
@@ -127,6 +130,7 @@ def main():
                 value_weight=args.value_weight,
                 max_qdepth=args.max_qdepth,
                 use_wdl=args.use_wdl,
+                search_cfg=search_config(args),
                 start_board=start_board,
             )
             if result == "1-0":

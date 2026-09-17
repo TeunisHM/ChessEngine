@@ -10,7 +10,7 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import index_to_move
-from lookahead import select_moves_with_lookahead
+from search_backends import add_search_args, search_config, select_moves
 from models import net_from_state_dict
 
 
@@ -19,6 +19,7 @@ def evaluate_vs_random(actor_critic_net,
                        show_progress: bool = True,
                        device: str = "cpu",
                        temperature: float = 0.0,
+                       search_cfg: "dict | None" = None,
                        lookahead_k: int = 8,
                        lookahead_alpha: float = 0.33,
                        max_qdepth: int = 2):
@@ -41,11 +42,11 @@ def evaluate_vs_random(actor_critic_net,
             while not board.is_game_over():
                 policy_turn = (board.turn == chess.WHITE) == is_policy_white
                 if policy_turn:
-                    idxs, *_ = select_moves_with_lookahead(
+                    idxs, *_ = select_moves(
                         actor_critic_net, [board], device,
                         top_k=lookahead_k, alpha=lookahead_alpha,
                         temperature=temperature,
-                        max_qdepth=max_qdepth,
+                        max_qdepth=max_qdepth, **(search_cfg or {}),
                     )
                     move = index_to_move(int(idxs[0].item()), board)
                     if move is None or move not in board.legal_moves:
@@ -130,6 +131,7 @@ def main():
                         help="Weight on log pi(a) in the lookahead score: -V(child) + alpha*log pi.")
     parser.add_argument("--max-qdepth", type=int, default=2,
                         help="Max quiescence search depth for capture extensions.")
+    add_search_args(parser)
     args = parser.parse_args()
 
     device = (
@@ -150,6 +152,7 @@ def main():
         show_progress=True,
         device=str(device),
         temperature=args.temperature,
+        search_cfg=search_config(args),
         lookahead_k=args.lookahead_k,
         lookahead_alpha=args.lookahead_alpha,
         max_qdepth=args.max_qdepth,

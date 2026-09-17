@@ -1,7 +1,7 @@
 """Local web GUI: play the trained models, or watch model-vs-model /
 model-vs-engine games. Reuses the same loading and move-selection code as
-the CLI eval scripts (net_from_state_dict, select_moves_with_lookahead,
-select_moves_from_policy) so play here matches evaluate_vs_*.py exactly.
+the CLI eval scripts (net_from_state_dict, search_backends.select_moves) so play
+here matches evaluate_vs_*.py exactly.
 """
 import os
 import threading
@@ -17,7 +17,7 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import board_to_tensor, index_to_move, legal_moves_mask
-from lookahead import select_moves_with_lookahead
+from search_backends import select_moves
 from models import net_from_state_dict
 
 MODELS_DIRS = ["models", "models_big"]
@@ -69,10 +69,12 @@ def _raw_move(net, board: chess.Board, temperature: float) -> chess.Move:
     return move if move is not None and move in board.legal_moves else next(iter(board.legal_moves))
 
 
-def _search_move(net, board: chess.Board, temperature: float, k: int, alpha: float, value_weight: float) -> chess.Move:
+def _search_move(net, board: chess.Board, temperature: float, k: int, alpha: float, value_weight: float,
+                 search_cfg: "dict | None" = None) -> chess.Move:
     with torch.no_grad():
-        idxs, *_ = select_moves_with_lookahead(
-            net, [board], _device, top_k=k, alpha=alpha, temperature=temperature, value_weight=value_weight,
+        idxs, *_ = select_moves(
+            net, [board], _device, top_k=k, alpha=alpha, temperature=temperature,
+            value_weight=value_weight, **(search_cfg or {}),
         )
     move = index_to_move(int(idxs[0].item()), board)
     return move if move is not None and move in board.legal_moves else next(iter(board.legal_moves))

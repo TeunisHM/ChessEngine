@@ -10,7 +10,7 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import board_to_tensor, index_to_move, legal_moves_mask
-from lookahead import select_moves_with_lookahead
+from search_backends import add_search_args, search_config, select_moves
 from models import ActorCriticResNet, net_from_state_dict
 
 
@@ -118,6 +118,7 @@ def parse_args() -> argparse.Namespace:
              "Match training's opening_prob to test whether the in-training "
              "vs-engine counter differs due to starting-position mix.",
     )
+    add_search_args(parser)
     return parser.parse_args()
 
 def _create_engine(path: str, skill: Optional[int]) -> chess.engine.SimpleEngine:
@@ -145,6 +146,7 @@ def _play_game(
     value_weight: float = 1.0,
     use_wdl: bool = False,
     opening_prob: float = 0.0,
+    search_cfg: "dict | None" = None,
     start_board: "chess.Board | None" = None,
     policy_is_white: "bool | None" = None,
 ) -> Dict[str, int]:
@@ -176,12 +178,12 @@ def _play_game(
                 else:
                     idx = int(masked.argmax().item())
             else:
-                idxs, *_ = select_moves_with_lookahead(
+                idxs, *_ = select_moves(
                     net, [board], device,
                     top_k=lookahead_k, alpha=lookahead_alpha,
                     temperature=temperature, value_weight=value_weight,
                     max_qdepth=max_qdepth, check_budget=check_budget,
-                    use_wdl=use_wdl,
+                    use_wdl=use_wdl, **(search_cfg or {}),
                 )
                 idx = int(idxs[0].item())
             move = index_to_move(idx, board)
@@ -277,6 +279,7 @@ def main() -> None:
                 value_weight=args.value_weight,
                 use_wdl=args.use_wdl,
                 opening_prob=args.opening_prob,
+                search_cfg=search_config(args),
                 start_board=start_board,
                 policy_is_white=policy_is_white,
             )

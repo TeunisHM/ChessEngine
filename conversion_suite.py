@@ -23,7 +23,7 @@ if torch.version.hip is not None:
     os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 from helper import index_to_move, random_endgame_board, board_to_tensor, legal_moves_mask
-from lookahead import select_moves_with_lookahead
+from search_backends import add_search_args, search_config, select_moves
 from models import net_from_state_dict
 
 MATERIAL_CLASSES = {
@@ -95,10 +95,12 @@ def _sample_won_position(tb, rng, n_extra):
     return None, None
 
 
-def _net_move(net, board, device, k, alpha, vw, use_wdl, temperature=0.0):
-    idxs, *_ = select_moves_with_lookahead(
+def _net_move(net, board, device, k, alpha, vw, use_wdl, temperature=0.0,
+              search_cfg=None):
+    idxs, *_ = select_moves(
         net, [board], device, top_k=k, alpha=alpha,
         temperature=temperature, value_weight=vw, use_wdl=use_wdl,
+        **(search_cfg or {}),
     )
     move = index_to_move(int(idxs[0].item()), board)
     if move is None or move not in board.legal_moves:
@@ -124,10 +126,12 @@ def play_conversion(net, start, init_dtz, tb, device, args, defender=None):
             return False, plies, "max-plies"
         if board.turn == chess.WHITE:
             move = _net_move(net, board, device, args.k, args.alpha,
-                             args.value_weight, args.use_wdl)
+                             args.value_weight, args.use_wdl,
+                             search_cfg=search_config(args))
         else:
             move = _net_move(dnet, board, device, max(2, args.k - 2),
-                             args.alpha, args.value_weight, False)
+                             args.alpha, args.value_weight, False,
+                             search_cfg=search_config(args))
         if move is None:
             return False, plies, "no-move"
         zeroing = board.is_zeroing(move)
@@ -177,6 +181,7 @@ def main():
     ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--seed", type=int, default=1401)
     ap.add_argument("--device", default=None)
+    add_search_args(ap)
     args = ap.parse_args()
 
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")

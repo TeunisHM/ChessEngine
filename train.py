@@ -23,7 +23,8 @@ from helper import (
     mirror_board_tensor_batch,
     random_endgame_board,
 )
-from lookahead import select_moves_from_policy, select_moves_with_lookahead
+from lookahead import select_moves_from_policy
+from search_backends import add_search_args, search_config, select_moves
 from models import (
     ActorCriticResNet,
     DEFAULT_NUM_FILTERS,
@@ -205,15 +206,16 @@ OpponentMoveFn = Callable[[List[chess.Board]], List[Optional[chess.Move]]]
 
 def _checkpoint_opponent_fn(opponent_net, device: str, temperature: float,
                             top_k: int, alpha: float,
-                            value_weight: float = 1.0) -> OpponentMoveFn:
+                            value_weight: float = 1.0,
+                            search_cfg: Optional[dict] = None) -> OpponentMoveFn:
     """Vectorized opponent that picks moves with a frozen ActorCriticResNet using
-    the same top-k value lookahead as the policy player."""
+    the same search the policy player uses."""
 
     def move_fn(boards: List[chess.Board]) -> List[Optional[chess.Move]]:
-        idxs, *_ = select_moves_with_lookahead(
+        idxs, *_ = select_moves(
             opponent_net, boards, device,
             top_k=top_k, alpha=alpha, temperature=temperature,
-            value_weight=value_weight,
+            value_weight=value_weight, **(search_cfg or {}),
         )
         idxs_cpu = idxs.cpu().tolist()
         out: List[Optional[chess.Move]] = []
@@ -406,13 +408,14 @@ def _book_start_boards() -> List[chess.Board]:
 def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bool,
                               pool: EnginePool, device: str,
                               top_k: int, alpha: float, value_weight: float,
-                              move_time: float) -> str:
+                              move_time: float,
+                              search_cfg: Optional[dict] = None) -> str:
     board = start_board.copy(stack=True)
     while not board.is_game_over():
         if (board.turn == chess.WHITE) == policy_is_white:
-            idxs, *_ = select_moves_with_lookahead(
+            idxs, *_ = select_moves(
                 net, [board], device, top_k=top_k, alpha=alpha,
-                temperature=0.0, value_weight=value_weight,
+                temperature=0.0, value_weight=value_weight, **(search_cfg or {}),
             )
             move = index_to_move(int(idxs[0].item()), board)
             if move is None or move not in board.legal_moves:
@@ -427,13 +430,14 @@ def _play_eval_game_vs_engine(net, start_board: chess.Board, policy_is_white: bo
 
 def _play_eval_game_vs_ref(net, ref_net, start_board: chess.Board,
                            policy_is_white: bool, device: str,
-                           top_k: int, alpha: float, value_weight: float) -> str:
+                           top_k: int, alpha: float, value_weight: float,
+                           search_cfg: Optional[dict] = None) -> str:
     """One H2H game vs the frozen reference net; returns board.result()."""
     from evaluate_vs_model import play_game as _h2h_play_game
 
     kwargs = dict(
         lookahead_k=top_k, lookahead_alpha=alpha, temperature=0.0,
-        value_weight=value_weight,
+        value_weight=value_weight, search_cfg=search_cfg,
     )
     if policy_is_white:
         return _h2h_play_game(net, ref_net, device,
@@ -448,6 +452,7 @@ def evaluate_progress(net, device: str, games: int,
                       engine_move_time: float, ref_net,
                       top_k: int = 4, alpha: float = 1.0,
                       value_weight: float = 1.0,
+                      search_cfg: Optional[dict] = None,
                       label: str = "") -> dict:
     """Paired-opening mini-match vs a fixed opponent. Returns W/D/L + score."""
     book = _book_start_boards()
@@ -470,7 +475,7 @@ def evaluate_progress(net, device: str, games: int,
             futures = [
                 ex.submit(_play_eval_game_vs_engine, net, start, policy_white,
                           engine_pool, device, top_k, alpha, value_weight,
-                          engine_move_time)
+                          engine_move_time, search_cfg)
                 for start, policy_white in plan
             ]
             results = [f.result() for f in futures]
@@ -478,7 +483,7 @@ def evaluate_progress(net, device: str, games: int,
         for start, policy_white in plan:
             results.append(_play_eval_game_vs_ref(
                 net, ref_net, start, policy_white, device,
-                top_k, alpha, value_weight))
+                top_k, alpha, value_weight, search_cfg))
     else:
         return {"wins": 0, "draws": 0, "losses": 0, "score": 0.0, "games": 0}
 
@@ -524,6 +529,7 @@ def generate_batch(actor_critic_net,
                    trainee_top_k: int = 6,
                    trainee_alpha: float = 0.33,
                    trainee_value_weight: float = 1.0,
+                   search_cfg: Optional[dict] = None,
                    progress_label: str = ""):
     """Lockstep batch of games. One forward pass per ply across all live games.
 
@@ -645,10 +651,10 @@ def generate_batch(actor_critic_net,
             if trainee_search:
                 (move_idxs, log_pi, masks, values, states,
                  log_b_chosen, kl_b_pi_step, pick_rank_step,
-                 topk_idx_step, log_b_topk_step) = select_moves_with_lookahead(
+                 topk_idx_step, log_b_topk_step) = select_moves(
                     actor_critic_net, pol_boards, device,
                     top_k=trainee_top_k, alpha=trainee_alpha, temperature=temperature,
-                    value_weight=trainee_value_weight,
+                    value_weight=trainee_value_weight, **(search_cfg or {}),
                 )
                 # Diagnostics: how much does search disagree with raw π?
                 search_kl_sum += float(kl_b_pi_step.sum().item())
@@ -953,6 +959,7 @@ def train_actor_critic(actor_critic_net,
                         rollout_max_plies: int = 600,
                         search_max_plies: int = 300,
                         min_live_boards: int = 3,
+                        search_cfg: Optional[dict] = None,
                         seed: Optional[int] = None,
                         run_config: Optional[dict] = None):
     """PPO training loop with self-play, optional checkpoint and engine opponents."""
@@ -1080,6 +1087,7 @@ def train_actor_critic(actor_critic_net,
             engine_move_time=engine_move_time,
             ref_net=eval_ref_net,
             top_k=eval_k, alpha=eval_alpha, value_weight=eval_value_weight,
+            search_cfg=search_cfg,
             label=f"Eval at batch {batch_idx}",
         )
 
@@ -1112,6 +1120,7 @@ def train_actor_critic(actor_critic_net,
                         opp_net, device, opponent_temperature,
                         top_k=lookahead_k, alpha=lookahead_alpha,
                         value_weight=lookahead_value_weight,
+                        search_cfg=search_cfg,
                     )
                     source = f"checkpoint ({os.path.basename(opp_path)})"
                     # Trainee search applies in opponent batches (checkpoint and
@@ -1146,6 +1155,7 @@ def train_actor_critic(actor_critic_net,
                 trainee_top_k=lookahead_k,
                 trainee_alpha=lookahead_alpha,
                 trainee_value_weight=lookahead_value_weight,
+                search_cfg=search_cfg,
                 max_plies=(search_max_plies
                            if (trainee_search_now and opponent_fn is not None)
                            else rollout_max_plies),
@@ -1735,6 +1745,7 @@ def _parse_args() -> argparse.Namespace:
              "--tb-value-aux-weight, so the actor never gets an injected "
              "terminal reward for merely reaching a won position).",
     )
+    add_search_args(parser)
     return parser.parse_args()
 
 
@@ -1820,6 +1831,7 @@ def main() -> None:
         "wdl_weight": args.wdl_weight,
         "tablebase_path": "syzygy",
         "tablebase_terminate_prob": args.tablebase_terminate_prob,
+        "search_cfg": search_config(args),
     }
 
     print("[INFO] training configuration")
