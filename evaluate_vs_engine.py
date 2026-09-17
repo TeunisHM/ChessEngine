@@ -308,10 +308,14 @@ def main() -> None:
         engine.quit()
 
     print("\n--- Evaluation vs Engine ---")
-    mode = "raw" if args.raw else (
-        f"search k={args.lookahead_k} a={args.lookahead_alpha} vw={args.value_weight} "
-        f"qd={args.max_qdepth} cb={args.check_budget}"
-    )
+    if args.raw:
+        mode = "raw"
+    elif args.search_backend == "gumbel":
+        mode = (f"gumbel m={args.gumbel_m} n={args.gumbel_sims} "
+                f"c_visit={args.gumbel_c_visit} c_scale={args.gumbel_c_scale}")
+    else:
+        mode = (f"quiescence k={args.lookahead_k} a={args.lookahead_alpha} "
+                f"vw={args.value_weight} qd={args.max_qdepth} cb={args.check_budget}")
     book_tag = " | paired-openings" if args.paired_openings else ""
     print(f"Model: {args.model} [{mode}]{book_tag} | "
           f"skill={args.engine_skill_level} move_time={args.engine_move_time}")
