@@ -169,7 +169,11 @@ def _root_rank(node: _Node, perturbed: np.ndarray, c_visit: float, c_scale: floa
 
 
 def _expand(net, nodes: List[_Node], device, use_wdl: bool, value_weight: float):
-    """One batched forward for every frontier node discovered this round."""
+    """One batched forward for every frontier node discovered this round.
+
+    value_weight is accepted only to keep one signature across backends; see
+    select_moves_with_gumbel's docstring for why it cannot do anything here.
+    """
     if not nodes:
         return
     states = torch.stack([board_to_tensor(n.board) for n in nodes]).to(device)
@@ -184,7 +188,7 @@ def _expand(net, nodes: List[_Node], device, use_wdl: bool, value_weight: float)
     values_np = values.float().cpu().numpy()
     for i, node in enumerate(nodes):
         node.logits = _log_softmax(logits_np[i][node.legal])
-        node.value = float(values_np[i]) * value_weight
+        node.value = float(values_np[i])
         node.expanded = True
 
 
@@ -235,8 +239,15 @@ def select_moves_with_gumbel(
     divided by the temperature before the noise is added, so the root sample is
     drawn from softmax(logits / T).
 
-    value_weight scales net-derived leaf values only; terminal leaves keep their
-    exact +/-1 / 0, mirroring the quiescence backend's treatment of mate scores.
+value_weight is ACCEPTED AND IGNORED here; it is a quiescence-backend knob.
+    sigma min-max rescales completedQ, so scaling every value by a constant
+    leaves the improved policy exactly unchanged -- the transform is invariant
+    to it. Scaling only the network's values while proven terminals keep their
+    exact +/-1 does have an effect, but strictly a harmful one: it lets a
+    saturated estimate tie or outrank a real checkmate (measured: mate-in-1
+    detection fell 101/120 -> 89/120 at value_weight=8). To weigh the learned
+    evaluation against the policy prior here, use c_visit / c_scale, which is
+    the knob this search actually has for it.
     """
     n = len(boards)
     states = torch.stack([board_to_tensor(b) for b in boards]).to(device)
@@ -261,6 +272,10 @@ def select_moves_with_gumbel(
             perturbations.append(None); cand_sets.append([])
             continue
         node.logits = _log_softmax(log_pi_cpu[i][node.legal])
+        # Same scaling as the leaves in _expand: the root's own value feeds
+        # v_mix, so leaving it unscaled would mix weighted and unweighted
+        # estimates in one completedQ. The value returned to the caller stays
+        # raw -- that is the critic's output, not a search quantity.
         node.value = float(root_v_cpu[i])
         node.expanded = True
         if temperature is None or temperature <= 1e-6:
