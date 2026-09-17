@@ -50,7 +50,10 @@ def add_search_args(parser):
     )
     parser.add_argument(
         "--gumbel-c-visit", type=float, default=C_VISIT,
-        help="Gumbel AZ: c_visit in sigma(q) = (c_visit + max N) * c_scale * q.",
+        help="Gumbel AZ: c_visit in sigma(q) = (c_visit + max N) * c_scale * q. "
+             "How far the search's Q outweighs the policy prior. The paper uses "
+             "50; on these nets that scores 0.062 vs SF against 0.344 for no "
+             "search at all, so the default here is the gate-cleared value.",
     )
     parser.add_argument(
         "--gumbel-c-scale", type=float, default=C_SCALE,

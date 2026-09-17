@@ -29,8 +29,16 @@ import torch.nn.functional as F
 
 from helper import board_to_tensor, legal_moves_mask, move_to_index
 
-# sigma(q) = (c_visit + max_b N(b)) * c_scale * q  -- paper's defaults.
-C_VISIT = 50.0
+# sigma(q) = (c_visit + max_b N(b)) * c_scale * q.
+#
+# The paper's c_visit is 50, calibrated for a value head co-trained through the
+# search. On these nets it is catastrophic: sigma's spread reaches 51 nats
+# against a 9.6-nat logit spread, so pi' collapses to value-greedy and the
+# search scores 0.062 vs SF where the raw policy scores 0.344 and the
+# quiescence search 0.500 (search_strength_gate.py, 256 games, pretrain seed).
+# The default here is therefore the value the gate actually cleared.
+PAPER_C_VISIT = 50.0
+C_VISIT = 1.0
 C_SCALE = 1.0
 
 _LOG_ZERO = -1e9
@@ -217,11 +225,18 @@ def select_moves_with_gumbel(
     (action_idx, log_pi, masks, root_values, states,
      log_b_chosen, kl_b_pi, pick_rank, topk_idx, log_b_topk).
 
-    The behavior policy b is the *improved policy* pi' restricted to the m
-    considered actions and renormalised over them -- the same convention the
-    quiescence backend uses for its own candidate set, so PPO's ratio
-    pi_new(a|s) / b(a|s) stays well-formed. log_b_topk is therefore also a
-    ready-made Gumbel-AZ policy target for the --distill-weight path.
+    log_b_topk is the improved policy pi' over EVERY legal action (ordered by
+    descending log pi), which is the Gumbel-AZ policy target. It is not
+    restricted to the m sampled candidates: doing so both changes the target and
+    can collapse its mass to ~0 when the searched actions all back up below
+    v_mix.
+
+    WARNING: log_b_chosen is pi'(chosen), NOT the probability with which
+    Sequential Halving actually selects that action -- SH takes an argmax over
+    Gumbel-perturbed scores, whose induced distribution has no closed form. It
+    is therefore NOT a valid PPO importance-sampling denominator; train.py
+    refuses the gumbel + ppo combination for that reason. AZ uses pi' as a
+    target only.
 
     temperature <= 0 disables the Gumbel perturbation entirely (deterministic
     play, matching the eval scripts' greedy default). Otherwise the logits are
@@ -245,14 +260,13 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
     roots: List[Optional[_Node]] = []
     plans: List[Optional[_SequentialHalving]] = []
     perturbations: List[Optional[np.ndarray]] = []
-    cand_sets: List[List[int]] = []
 
     for i, board in enumerate(boards):
         node = _Node(board)
         node.set_legal()
         if not node.legal:
             roots.append(None); plans.append(None)
-            perturbations.append(None); cand_sets.append([])
+            perturbations.append(None)
             continue
         node.logits = _log_softmax(log_pi_cpu[i][node.legal])
         # Same scaling as the leaves in _expand: the root's own value feeds
@@ -271,7 +285,6 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
         roots.append(node)
         plans.append(_SequentialHalving(candidates, sims))
         perturbations.append(perturbed)
-        cand_sets.append(candidates)
 
     # --- simulations, in lockstep across boards -----------------------------
     for _ in range(max(1, sims)):
@@ -321,7 +334,14 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
             _backup(path, node.value)
 
     # --- outputs ------------------------------------------------------------
-    max_m = max(1, max((len(c) for c in cand_sets), default=1))
+    # The target spans EVERY legal action, not just the sampled candidates.
+    # Restricting it changes the target even when well behaved, and when the
+    # searched actions all back up below v_mix the improved policy puts nearly
+    # all its mass on the UNSEARCHED ones -- renormalising what is left then
+    # gives a row summing to ~1e-11, i.e. no learning signal at all.
+    # improved is already a softmax over the legal actions, so taken whole it
+    # needs no renormalisation.
+    max_m = max(1, max((len(r.legal) if r is not None else 0 for r in roots), default=1))
 
     topk_idx = torch.zeros(n, max_m, dtype=torch.long)
     log_b_topk = torch.full((n, max_m), _LOG_ZERO, dtype=torch.float32)
@@ -338,21 +358,19 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
         winner_local = plan.winner(rank)
 
         improved, _ = _improved_policy(root, c_visit, c_scale)
-        cands = list(cand_sets[i])
-        m_i = len(cands)
         # Order by descending log pi so pick_rank keeps its meaning across
-        # backends: 0 == the policy's own favourite among the candidates.
-        cands.sort(key=lambda a: -float(root.logits[a]))
+        # backends: 0 == the policy's own favourite.
+        order = sorted(range(len(root.legal)), key=lambda a: -float(root.logits[a]))
+        m_i = len(order)
 
-        b = improved[cands]
-        b = b / max(float(b.sum()), 1e-12)
-        log_b = np.log(np.clip(b, 1e-12, None))
+        b = improved[order]
+        log_b = np.log(np.clip(b, 1e-38, None))
 
-        action_indices = [root.legal[a] for a in cands]
+        action_indices = [root.legal[a] for a in order]
         topk_idx[i, :m_i] = torch.tensor(action_indices, dtype=torch.long)
         log_b_topk[i, :m_i] = torch.tensor(log_b, dtype=torch.float32)
 
-        pos = cands.index(winner_local)
+        pos = order.index(winner_local)
         chosen[i] = root.legal[winner_local]
         log_b_chosen[i] = float(log_b[pos])
         pick_rank[i] = pos

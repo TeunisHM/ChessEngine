@@ -900,6 +900,17 @@ def train_actor_critic(actor_critic_net,
     target is z."""
     if policy_objective not in ("ppo", "az"):
         raise ValueError(f"unknown policy_objective {policy_objective!r}")
+    if (policy_objective == "ppo" and trainee_search
+            and (search_cfg or {}).get("backend") == "gumbel"):
+        raise ValueError(
+            "gumbel + ppo is refused: Sequential Halving selects by an argmax "
+            "over Gumbel-perturbed scores, and the probability the backend "
+            "reports for that action is pi'(a), not the probability it was "
+            "actually selected with (m=1 on a uniform 20-move policy reports "
+            "1.0 where the true value is 0.05). PPO would use that as its "
+            "importance-sampling denominator. Use --policy-objective az, or "
+            "--search-backend quiescence."
+        )
     if policy_objective == "az":
         # Every trainee move must carry a pi' target, so the search cannot be
         # limited to opponent batches the way the PPO recipe limits it.
@@ -1197,16 +1208,31 @@ def train_actor_critic(actor_critic_net,
             advantages = returns_t - old_v_t
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
-            # Drop rows whose behavior probability is <~ 3e-7. Trained nets emit
-            # astronomically negative logits on some (legal, often mirrored)
-            # actions — never supervised, weight_decay=0 — and PPO math there is
-            # numerical garbage: IS ratios underflow or explode, k3-KL spikes by
-            # thousands (fake "KL: 25661" batches, spurious early stops), and
-            # huge gradient spikes leak into shared heads. Such rows carry no
-            # usable policy-gradient signal, so they are excluded outright.
-            valid_rows = torch.nonzero(old_lp_t > -15.0).view(-1)
+            if az_on:
+                # Cross-entropy needs no importance ratio, so the PPO cutoff
+                # below does not apply. Applying it would discard exactly the
+                # states where search overrode an unlikely policy choice — the
+                # most informative rows AZ has — and when every row trips it the
+                # batch would perform zero optimizer steps while still advancing
+                # the LR schedule.
+                valid_rows = torch.arange(old_lp_t.shape[0], device=device)
+            else:
+                # Drop rows whose behavior probability is <~ 3e-7. Trained nets emit
+                # astronomically negative logits on some (legal, often mirrored)
+                # actions — never supervised, weight_decay=0 — and PPO math there is
+                # numerical garbage: IS ratios underflow or explode, k3-KL spikes by
+                # thousands (fake "KL: 25661" batches, spurious early stops), and
+                # huge gradient spikes leak into shared heads. Such rows carry no
+                # usable policy-gradient signal, so they are excluded outright.
+                valid_rows = torch.nonzero(old_lp_t > -15.0).view(-1)
 
             N = int(valid_rows.numel())
+            if N == 0:
+                # Never fail silently: a skipped update that still stepped the
+                # scheduler is indistinguishable from a normal batch in the log.
+                print(f"[Batch {batch+1}] {source} | no usable rows after filtering, "
+                      f"skipping update (scheduler NOT advanced)")
+                continue
             mb_size = max(1, min(int(ppo_minibatch_size), N))
 
             actor_loss_sum = critic_loss_sum = entropy_loss_sum = 0.0
@@ -1322,10 +1348,24 @@ def train_actor_critic(actor_critic_net,
                         # exploding term never has to be formed. When b == π_old
                         # (any unsearched batch) w == 1 and this reduces
                         # identically to the previous expression.
+                        if az_on:
+                            # The k3 estimator is unbiased only for a ~ pi_old.
+                            # Under AZ the action came from the search, so k3 is
+                            # meaningless here — and it used to gate early
+                            # stopping, halting runs after 2 of 4 epochs with
+                            # true policy drift near zero. Report the exact KL
+                            # of the thing actually being minimised instead:
+                            # KL(pi' || pi_new) over the target's support.
+                            approx_kl = float(
+                                (target * (log_b_topk_t[mb] - new_log_pi.gather(1, topk_idx_t[mb]))
+                                 ).sum(1).mean().item()
+                            )
+                        else:
+                            log_r_pi = new_lp - mb_pi_old_lp
+                            w = torch.exp((mb_pi_old_lp - mb_old_lp).clamp(max=30.0))
+                            approx_kl = ((ratios - w - w * log_r_pi).sum()
+                                         / w.sum().clamp(min=1e-8)).item()
                         log_r_pi = new_lp - mb_pi_old_lp
-                        w = torch.exp((mb_pi_old_lp - mb_old_lp).clamp(max=30.0))
-                        approx_kl = ((ratios - w - w * log_r_pi).sum()
-                                     / w.sum().clamp(min=1e-8)).item()
                         clip_frac = ((ratios - 1.0).abs() > ppo_clip_ratio).float().mean().item()
                         if os.environ.get("DEBUG_PPO_RATIOS") and (
                                 log_r_pi.max() > 3 or log_r_pi.min() < -5):
@@ -1346,7 +1386,9 @@ def train_actor_critic(actor_critic_net,
                     epoch_kl_sum += approx_kl
                     epoch_steps += 1
 
-                if epoch_kl_sum / max(1, epoch_steps) > 1.5 * target_kl:
+                # PPO trust-region stop only: AZ is a supervised fit to pi',
+                # with no ratio to keep inside a trust region.
+                if not az_on and epoch_kl_sum / max(1, epoch_steps) > 1.5 * target_kl:
                     early_stopped_at = epoch + 1
                     break
 
