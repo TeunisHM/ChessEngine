@@ -496,6 +496,12 @@ def generate_batch(actor_critic_net,
     stop early once fewer than that many games remain (dead-tail cutoff) —
     tail plies cost engine calls / TB probes per ply while producing almost
     no states. Timed-out games bootstrap from 0 and are WDL-masked.
+
+    The cutoff applies to self-play too. It used to be opponent-only, from when
+    self-play ran raw pi and was nearly free; under a per-ply search whose
+    forward batch IS the live-board count, the tail is the most expensive part
+    of the batch (measured: 40% of a self-play batch's wall clock below 16 live
+    boards, for 12% of its states).
     """
     boards = [_start_position(opening_prob) for _ in range(batch_size)]
     self_play = opponent_move_fn is None
@@ -541,8 +547,7 @@ def generate_batch(actor_critic_net,
         # Dead-tail cutoff: once only a few games remain, the per-ply overhead
         # (engine calls, TB probes, search) outweighs the data they produce.
         # Remaining games end as timeouts (bootstrap from 0, WDL-masked).
-        if (opponent_move_fn is not None and min_live_boards > 0
-                and ply > 0 and len(live_ids) < min_live_boards):
+        if (min_live_boards > 0 and ply > 0 and len(live_ids) < min_live_boards):
             break
 
         if tablebase is not None:
@@ -778,7 +783,22 @@ def generate_batch(actor_critic_net,
     # Trainee outcomes (W/D/L/T) for opponent batches. In self-play the trainee
     # plays both colors so per-game outcomes are ambiguous from its perspective;
     # we skip recording in that case.
-    if not self_play:
+    if self_play:
+        # Both sides are the trainee, so W/L is meaningless -- what matters for
+        # an AZ value target is the decisive/draw/unfinished split. All-draw or
+        # all-unfinished means z carries no discrimination and the value head
+        # will collapse to a constant.
+        sp_out = {"decisive": 0, "draw": 0, "unfinished": 0}
+        for gid in range(batch_size):
+            board = boards[gid]
+            if not board.is_game_over():
+                sp_out["unfinished"] += 1
+            elif board.result() == "1/2-1/2":
+                sp_out["draw"] += 1
+            else:
+                sp_out["decisive"] += 1
+        stats["selfplay_outcomes"] = sp_out
+    else:
         outcomes = {"W": 0, "D": 0, "L": 0, "T": 0}
         for gid in range(batch_size):
             board = boards[gid]
@@ -1111,7 +1131,7 @@ def train_actor_critic(actor_critic_net,
                 max_plies=(search_max_plies
                            if (trainee_search_now and opponent_fn is not None)
                            else rollout_max_plies),
-                min_live_boards=(min_live_boards if opponent_fn is not None else 0),
+                min_live_boards=min_live_boards,
                 progress_label=f"[Batch {batch+1}/{num_batches}] {source}",
             )
             t1 = perf_counter()
@@ -1437,6 +1457,13 @@ def train_actor_critic(actor_critic_net,
                 )
             wdl_info = f" WDLce: {avg_wdl:.4f}" if wdl_weight > 0 else ""
             outcome_info = ""
+            sp_out = rollout_stats.get("selfplay_outcomes")
+            if sp_out is not None:
+                n_sp = max(1, sum(sp_out.values()))
+                outcome_info = (
+                    f" | self-play: {sp_out['decisive']}dec/{sp_out['draw']}drw/"
+                    f"{sp_out['unfinished']}unf  z-signal {100*(sp_out['decisive']+sp_out['draw'])/n_sp:.0f}%"
+                )
             outcomes = rollout_stats.get("trainee_outcomes")
             if outcomes is not None:
                 if source == "engine":
