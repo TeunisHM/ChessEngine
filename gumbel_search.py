@@ -15,9 +15,7 @@ The return contract is identical to lookahead.select_moves_with_lookahead, so th
 two are drop-in interchangeable (see search_backends.select_moves).
 
 All boards are searched in lockstep: every simulation round contributes at most
-one frontier node per board and they are evaluated in a single forward. On this
-GPU a forward of 2-12 positions costs ~10x more per position than one of >=16,
-so lockstep batching across boards is what keeps the search affordable.
+one frontier node per board and they are evaluated in a single forward.
 """
 import math
 from typing import List, Optional, Sequence, Tuple
@@ -30,13 +28,7 @@ import torch.nn.functional as F
 from helper import board_to_tensor, legal_moves_mask, move_to_index
 
 # sigma(q) = (c_visit + max_b N(b)) * c_scale * q.
-#
-# The paper's c_visit is 50, calibrated for a value head co-trained through the
-# search. On these nets it is catastrophic: sigma's spread reaches 51 nats
-# against a 9.6-nat logit spread, so pi' collapses to value-greedy and the
-# search scores 0.062 vs SF where the raw policy scores 0.344 and the
-# quiescence search 0.500 (search_strength_gate.py, 256 games, pretrain seed).
-# The default here is therefore the value the gate actually cleared.
+# Keep the paper's setting separate from this implementation's default.
 PAPER_C_VISIT = 50.0
 C_VISIT = 1.0
 C_SCALE = 1.0
@@ -217,6 +209,7 @@ def select_moves_with_gumbel(
     temperature: float = 0.0,
     c_visit: float = C_VISIT,
     c_scale: float = C_SCALE,
+    deterministic_candidates: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pick a move per board with Gumbel top-k root sampling + Sequential Halving.
@@ -231,19 +224,20 @@ def select_moves_with_gumbel(
     can collapse its mass to ~0 when the searched actions all back up below
     v_mix.
 
-    WARNING: log_b_chosen is pi'(chosen), NOT the probability with which
-    Sequential Halving actually selects that action -- SH takes an argmax over
-    Gumbel-perturbed scores, whose induced distribution has no closed form. It
-    is therefore NOT a valid PPO importance-sampling denominator; train.py
-    refuses the gumbel + ppo combination for that reason. AZ uses pi' as a
-    target only.
+    log_b_chosen is log pi'(chosen). In Sequential Halving mode this is not
+    the action-selection log probability and cannot serve as a PPO denominator.
+    With deterministic_candidates and positive temperature, the action is
+    sampled from pi' instead. train.py rejects gumbel + ppo in either mode.
 
     temperature <= 0 disables the Gumbel perturbation entirely (deterministic
     play, matching the eval scripts' greedy default). Otherwise the logits are
     divided by the temperature before the noise is added, so the root sample is
-    drawn from softmax(logits / T).
+    drawn from softmax(logits / T). With deterministic_candidates, root
+    candidates use unperturbed logits at any temperature; positive temperature
+    enables sampling the played move from pi'. At zero temperature the flag
+    does not change the search or played move.
 
-c_visit / c_scale are what weigh the learned evaluation against the policy
+    c_visit / c_scale are what weigh the learned evaluation against the policy
     prior; sigma min-max rescales completedQ, so a uniform rescaling of the
     values themselves would leave the improved policy exactly unchanged.
     """
@@ -275,7 +269,10 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
         # raw -- that is the critic's output, not a search quantity.
         node.value = float(root_v_cpu[i])
         node.expanded = True
-        if temperature is None or temperature <= 1e-6:
+        if deterministic_candidates or temperature is None or temperature <= 1e-6:
+            # Unperturbed top-m candidates. Temperature zero already takes
+            # this path without the flag. Positive-temperature exploration
+            # with deterministic candidates samples pi' below.
             perturbed = node.logits.copy()
         else:
             perturbed = node.logits / float(temperature) + _gumbel(len(node.legal), device)
@@ -370,7 +367,14 @@ c_visit / c_scale are what weigh the learned evaluation against the policy
         topk_idx[i, :m_i] = torch.tensor(action_indices, dtype=torch.long)
         log_b_topk[i, :m_i] = torch.tensor(log_b, dtype=torch.float32)
 
-        pos = order.index(winner_local)
+        if deterministic_candidates and temperature is not None and temperature > 1e-6:
+            # Sample the completed-Q target over all legal actions. Use torch
+            # so the training seed also controls move sampling.
+            probs = torch.from_numpy(np.asarray(b / b.sum(), dtype=np.float64))
+            pos = int(torch.multinomial(probs, 1).item())
+            winner_local = order[pos]
+        else:
+            pos = order.index(winner_local)
         chosen[i] = root.legal[winner_local]
         log_b_chosen[i] = float(log_b[pos])
         pick_rank[i] = pos

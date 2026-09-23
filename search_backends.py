@@ -7,7 +7,7 @@ so call sites differ by one argument, not by a branch.
 
     quiescence : lookahead.select_moves_with_lookahead -- top-k(pi) widened with
                  captures/checks, scored by batched alpha-beta quiescence.
-                 The default; every result before 2026-09 was produced with it.
+                 The default backend.
     gumbel     : gumbel_search.select_moves_with_gumbel -- Gumbel AlphaZero
                  (Danihelka et al. 2022), fixed simulation budget.
 """
@@ -30,8 +30,7 @@ def add_search_args(parser):
     """
     parser.add_argument(
         "--search-backend", choices=BACKENDS, default=DEFAULT_BACKEND,
-        help="Which search produces moves. 'quiescence' is the historical "
-             "default and reproduces every pre-2026-09 result.",
+        help="Which search produces moves. Defaults to quiescence.",
     )
     parser.add_argument(
         "--opponent-search-backend", choices=("same",) + BACKENDS, default="same",
@@ -51,13 +50,18 @@ def add_search_args(parser):
     parser.add_argument(
         "--gumbel-c-visit", type=float, default=C_VISIT,
         help="Gumbel AZ: c_visit in sigma(q) = (c_visit + max N) * c_scale * q. "
-             "How far the search's Q outweighs the policy prior. The paper uses "
-             "50; on these nets that scores 0.062 vs SF against 0.344 for no "
-             "search at all, so the default here is the gate-cleared value.",
+             "Controls the weight of Q relative to the policy prior; "
+             f"default {C_VISIT:g}.",
     )
     parser.add_argument(
         "--gumbel-c-scale", type=float, default=C_SCALE,
         help="Gumbel AZ: c_scale in sigma(q).",
+    )
+    parser.add_argument(
+        "--gumbel-deterministic-candidates", action="store_true",
+        help="Gumbel AZ: use unperturbed top-m root candidates and, at positive "
+             "temperature, sample the played move from the completed-Q policy "
+             "target. At temperature zero this flag has no effect.",
     )
     return parser
 
@@ -70,6 +74,8 @@ def search_config(args) -> dict:
         "gumbel_sims": getattr(args, "gumbel_sims", 32),
         "c_visit": getattr(args, "gumbel_c_visit", C_VISIT),
         "c_scale": getattr(args, "gumbel_c_scale", C_SCALE),
+        "deterministic_candidates": getattr(
+            args, "gumbel_deterministic_candidates", False),
     }
 
 
@@ -100,11 +106,13 @@ def select_moves(
     gumbel_sims: int = 32,
     c_visit: float = C_VISIT,
     c_scale: float = C_SCALE,
+    deterministic_candidates: bool = False,
 ):
     if backend == "gumbel":
         return select_moves_with_gumbel(
             net, boards, device, m=gumbel_m, sims=gumbel_sims,
             temperature=temperature, c_visit=c_visit, c_scale=c_scale,
+            deterministic_candidates=deterministic_candidates,
         )
     if backend != "quiescence":
         raise ValueError(f"unknown search backend {backend!r}; expected one of {BACKENDS}")
