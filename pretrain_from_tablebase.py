@@ -15,8 +15,6 @@ if torch.version.hip is not None:
 
 from helper import (
     board_to_tensor,
-    mirror_action_index,
-    mirror_board_tensor,
     move_to_index,
 )
 from models import (
@@ -200,9 +198,6 @@ class TablebaseDataset(Dataset):
         state = board_to_tensor(board)
         action_idx = _random.choice(self.best_indices[idx])
         value = self.values[idx]
-        if _random.random() < 0.5:
-            state = mirror_board_tensor(state)
-            action_idx = mirror_action_index(action_idx)
         return state, action_idx, value
 
 

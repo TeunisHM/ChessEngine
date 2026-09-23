@@ -16,12 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
-from helper import (
-    OPENINGS,
-    MIRROR_ACTION_PERM,
-    index_to_move,
-    mirror_board_tensor_batch,
-)
+from helper import OPENINGS, index_to_move
 from lookahead import select_moves_from_policy
 from search_backends import (add_search_args, opponent_search_config,
                              search_config, select_moves)
@@ -950,7 +945,6 @@ def train_actor_critic(actor_critic_net,
     scheduler = LambdaLR(optimizer,
                          lr_lambda=_cosine_lr_lambda(num_batches, lr_min_ratio))
 
-    mirror_perm = MIRROR_ACTION_PERM.to(device)
     # Clip core (policy+critic+trunk) and WDL-head grads separately, so a large
     # WDL-head gradient cannot scale down the PPO update via a shared global norm.
     core_params = [p for n, p in actor_critic_net.named_parameters()
@@ -1189,22 +1183,6 @@ def train_actor_critic(actor_critic_net,
                 topk_idx_t = None
                 log_b_topk_t = None
 
-            # Mirror augmentation: file-flip the board and remap actions.
-            m_states = mirror_board_tensor_batch(states_t)
-            m_masks = masks_t[:, mirror_perm]
-            m_actions = mirror_perm[actions_t]
-            states_t = torch.cat([states_t, m_states], 0)
-            masks_t = torch.cat([masks_t, m_masks], 0)
-            actions_t = torch.cat([actions_t, m_actions], 0)
-            returns_t = torch.cat([returns_t, returns_t], 0)
-            if az_on:
-                m_topk_idx = mirror_perm[topk_idx_t]
-                topk_idx_t = torch.cat([topk_idx_t, m_topk_idx], 0)
-                log_b_topk_t = torch.cat([log_b_topk_t, log_b_topk_t], 0)
-            if wdl_on or az_on:
-                # Game outcome is invariant to the file-flip mirror.
-                outcome_target_t = torch.cat([outcome_target_t, outcome_target_t], 0)
-
             # pi_old_lp_t: log π at rollout time (== current weights, since no PPO
             # update has happened yet this batch). Used for the approx_kl /
             # early-stop diagnostic so it always measures *policy drift*.
@@ -1220,9 +1198,8 @@ def train_actor_critic(actor_critic_net,
             elif trainee_search_now and old_lps:
                 # IS ratio uses log b (the search behavior policy) as denominator,
                 # so the actor loss is π_new(a|s) / b(a|s) — correct under search
-                # rollouts. Mirror states inherit b by symmetry of the search.
-                behavior_lp = torch.stack(old_lps).to(device).float()
-                old_lp_t = torch.cat([behavior_lp, behavior_lp], 0)
+                # rollouts.
+                old_lp_t = torch.stack(old_lps).to(device).float()
             else:
                 old_lp_t = pi_old_lp_t
             advantages = returns_t - old_v_t
@@ -1238,8 +1215,8 @@ def train_actor_critic(actor_critic_net,
                 valid_rows = torch.arange(old_lp_t.shape[0], device=device)
             else:
                 # Drop rows whose behavior probability is <~ 3e-7. Trained nets emit
-                # astronomically negative logits on some (legal, often mirrored)
-                # actions — never supervised, weight_decay=0 — and PPO math there is
+                # astronomically negative logits on some legal actions — never
+                # supervised, weight_decay=0 — and PPO math there is
                 # numerical garbage: IS ratios underflow or explode, k3-KL spikes by
                 # thousands (fake "KL: 25661" batches, spurious early stops), and
                 # huge gradient spikes leak into shared heads. Such rows carry no
@@ -1393,8 +1370,7 @@ def train_actor_critic(actor_critic_net,
                             print(f"[DBG] r range [{log_r_pi.min():.1f}, {log_r_pi.max():.1f}] "
                                   f"| r<-5: {(log_r_pi < -5).sum().item()} r>3: {(log_r_pi > 3).sum().item()} "
                                   f"| worst old={mb_old_lp[bad]:.1f} pi_old={mb_pi_old_lp[bad]:.1f} "
-                                  f"new={new_lp[bad]:.1f} legal={mb_masks[bad][mb_actions[bad]].item()} "
-                                  f"is_mirror={int(mb[bad]) >= states_t.shape[0] // 2}")
+                                  f"new={new_lp[bad]:.1f} legal={mb_masks[bad][mb_actions[bad]].item()}")
 
                     actor_loss_sum += actor_loss.item()
                     critic_loss_sum += critic_loss.item()

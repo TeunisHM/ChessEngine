@@ -346,61 +346,6 @@ def legal_moves_mask(board: chess.Board) -> torch.Tensor:
             print(f"Could not encode legal move: {move.uci()} for board {board.fen()}. Error: {e}")
     return mask
 
-# --- Horizontal mirror augmentation ---------------------------------------
-# A horizontal (file) mirror of a chess position is strategically equivalent
-# except for castling rights (king-side <-> queen-side). We use this to
-# double training data. The mapping is precomputed at module load.
-
-_SLIDE_DIRECTION_MAP = {
-    0: (1, 0), 1: (1, 1), 2: (0, 1), 3: (-1, 1),
-    4: (-1, 0), 5: (-1, -1), 6: (0, -1), 7: (1, -1)
-}
-_SLIDE_DIR_REVERSE = {v: k for k, v in _SLIDE_DIRECTION_MAP.items()}
-_KNIGHT_MAP = {
-    0: (2, 1), 1: (1, 2), 2: (-1, 2), 3: (-2, 1),
-    4: (-2, -1), 5: (-1, -2), 6: (1, -2), 7: (2, -1)
-}
-_KNIGHT_REVERSE = {v: k for k, v in _KNIGHT_MAP.items()}
-
-
-def _mirror_plane(plane: int) -> int:
-    """Return the plane index for the horizontally-mirrored move."""
-    if plane < 56:
-        direction_idx = plane // 7
-        distance = plane % 7
-        dr, df = _SLIDE_DIRECTION_MAP[direction_idx]
-        new_dir_idx = _SLIDE_DIR_REVERSE[(dr, -df)]
-        return new_dir_idx * 7 + distance
-    if plane < 64:
-        dr, df = _KNIGHT_MAP[plane - 56]
-        new_idx = _KNIGHT_REVERSE[(dr, -df)]
-        return 56 + new_idx
-    # Underpromotions: base 64=capture-left, 67=forward, 70=capture-right
-    promo_offset = (plane - 64) % 3
-    base = ((plane - 64) // 3) * 3 + 64
-    if base == 64:
-        new_base = 70
-    elif base == 70:
-        new_base = 64
-    else:
-        new_base = 67
-    return new_base + promo_offset
-
-
-def _build_mirror_action_permutation() -> torch.Tensor:
-    perm = torch.zeros(ACTION_SPACE_SIZE, dtype=torch.long)
-    for idx in range(ACTION_SPACE_SIZE):
-        from_sq = idx // 73
-        plane = idx % 73
-        from_rank = chess.square_rank(from_sq)
-        from_file = chess.square_file(from_sq)
-        mirror_from_sq = chess.square(7 - from_file, from_rank)
-        perm[idx] = mirror_from_sq * 73 + _mirror_plane(plane)
-    return perm
-
-
-MIRROR_ACTION_PERM = _build_mirror_action_permutation()
-
 # --- Endgame starting positions (curriculum) ------------------------------
 # Random legal positions from simple endgame material classes. Used to expose
 # the value head to clean, ground-truth-winning positions.
@@ -414,27 +359,6 @@ _ENDGAME_MATERIAL = [
     ((chess.ROOK, chess.PAWN), ()),  # KRPvK
 ]
 
-
-def mirror_board_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Horizontal mirror of a canonical (C,8,8) board tensor.
-
-    Flips the file axis and swaps our KS<->QS and opp KS<->QS castling planes.
-    """
-    out = t.flip(-1).clone()
-    # planes 12=our_ks, 13=our_qs, 14=opp_ks, 15=opp_qs
-    out[[12, 13, 14, 15]] = out[[13, 12, 15, 14]]
-    return out
-
-
-def mirror_board_tensor_batch(batch: torch.Tensor) -> torch.Tensor:
-    """Horizontal mirror on a (B,C,8,8) tensor."""
-    out = batch.flip(-1).clone()
-    out[:, [12, 13, 14, 15]] = out[:, [13, 12, 15, 14]]
-    return out
-
-
-def mirror_action_index(idx: int) -> int:
-    return int(MIRROR_ACTION_PERM[idx].item())
 
 if __name__ == "__main__":
     import chess
