@@ -1,84 +1,66 @@
-# Chess Engine with PPO and Lookahead Search
+# ChessEngine
 
-This project implements a chess engine trained with PPO, supervised PGN pretraining,
-checkpoint/engine opponents, and value-guided quiescence search. It uses
-`python-chess` for board logic and PyTorch for the policy/value network.
+Chess policy/value networks in PyTorch, with PPO and supervised training,
+quiescence search, and a Gumbel search backend. Board rules and move generation
+use `python-chess`.
 
-## Project Structure
+The next experiment is **v50: Stockfish-supervised value learning from v26**,
+with a budget of about 24 hours on the current machine. Stockfish, PGNs, and
+Syzygy are permitted data sources. The experiment is planned, not implemented.
+See [NEXT_TRAINING_PLAN.md](NEXT_TRAINING_PLAN.md).
 
-- **`train.py`**: PPO training, rollout generation, and diagnostics.
-- **`models.py`**: Policy/value network definitions and checkpoint-compatible loading.
-- **`lookahead.py`**: Widened policy-candidate lookahead and quiescence search.
-- **`helper.py`**: Contains helper functions for converting the chess board to a tensor, encoding and decoding moves, and creating a legal moves mask.
-- **`test_helper.py`**: Unit tests for the functions in `helper.py` to ensure the board representation and move encoding/decoding are correct.
-- **`requirements.txt`**: A list of the Python packages required to run the project.
-- **`logs/`**: Evaluation, console, and H2H logs.
-- **`models/`**: Supervised seeds and PPO checkpoints.
+## Project map
 
-## Installation
+| Files | Purpose |
+|---|---|
+| `models.py`, `helper.py` | Network definitions, checkpoint loading, board/action encoding |
+| `train.py` | PPO and search-target training, rollouts, progress evaluation |
+| `pretrain_from_pgn.py`, `pretrain_from_puzzles.py`, `pretrain_from_tablebase.py` | Supervised training entry points |
+| `train_wdl_head.py`, `finetune_clean_value.py` | Existing value-training utilities; limitations in [IMPROVEMENTS.md](IMPROVEMENTS.md) |
+| `search_backends.py`, `lookahead.py`, `gumbel_search.py` | Search selection and implementations |
+| `evaluate_vs_engine.py`, `evaluate_vs_model.py`, `conversion_suite.py` | Playing-strength and endgame evaluation |
+| `search_strength_gate.py`, `diagnose_wdl.py`, `analyze_policy.py` | Diagnostics |
+| `handover.md` | Verified baseline and interpretation of retained measurements |
 
-1.  **Clone the repository:**
+Checkpoints, datasets, engine binaries, and run logs are local artifacts excluded
+from Git. Old shell launchers have been removed; use the Python entry points.
 
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
+## Environment and checks
 
-2.  **Create and activate a virtual environment:**
-
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-
-3.  **Install the required packages:**
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-## Training
-
-On the Radeon 8060S, use the isolated `venv-rocm` environment. The entry point
-selects MIOpen `FAST` fallback and keeps AMP off because FP16 gradients are not
-finite on the current gfx1151 stack. Specify the initializer and run identity
-explicitly:
+Install `requirements.txt` in a virtual environment with a PyTorch build suitable
+for the machine. The existing local ROCm environment is `venv-rocm`:
 
 ```bash
-MIOPEN_FIND_MODE=FAST venv-rocm/bin/python train.py \
-    --init-from models/ppo_search_v13_ppo_control_seed1301_checkpoint_99.pt \
-    --model-name ppo_search_v14 \
-    --num-batches 400 \
-    --eval-interval 50 \
-    --seed 1401
+venv-rocm/bin/python -m unittest test_helper.py
+venv-rocm/bin/python train.py --help
+venv-rocm/bin/python pretrain_from_pgn.py --help
 ```
 
-This loads model weights but starts a fresh optimizer and 400-batch cosine
-scheduler. The normal entrypoint uses raw-policy PPO rollouts, no distillation,
-and FP32. Use a distinct model name for every phase.
+The helper tests cover encoding and legal masks; they do not validate the entire
+training or search pipeline. Confirm GPU availability and benchmark throughput
+before scheduling the experiment. Use FP32 for the planned run.
 
-## Supervised Pretraining from PGNs
+## Baseline evaluation
 
-You can optionally warm-start the model on real games before reinforcement learning by running `pretrain_from_pgn.py`. Point it at one or more PGN files and it will optimize the policy head to mimic the human moves while teaching the value head to predict the eventual outcome from each position.
+The initializer and control checkpoint is
+`models/ppo_search_v26_checkpoint_299.pt`. With that local checkpoint and the
+bundled Stockfish executable available:
 
 ```bash
-python pretrain_from_pgn.py --pgn /path/to/games.pgn --max-games 5000 --epochs 5 --output-model pretrained.pt
+venv-rocm/bin/python evaluate_vs_engine.py \
+    --model models/ppo_search_v26_checkpoint_299.pt \
+    --engine-path ./stockfish/stockfish \
+    --games 128 --paired-openings \
+    --engine-skill-level 0 --engine-move-time 0.01 \
+    --search-backend quiescence --temperature 0 \
+    --lookahead-k 4 --lookahead-alpha 1.0 \
+    --max-qdepth 2 --check-budget 1
 ```
 
-Supply a resulting checkpoint to `train.py` with `--init-from` when starting a
-new run.
+This is a screening run. Promotion requires the independent comparisons specified
+in the experiment plan. `evaluate_vs_model.py --paired-openings` currently ignores
+`--games` and plays its built-in book once per color.
 
-### Monitoring Training
-
-Training prints rollout, PPO, and opponent outcome diagnostics to the console.
-Periodic evaluation summaries are written to CSV files under `logs/`.
-
-## Testing
-
-To ensure the core components of the project are working correctly, you can run the unit tests for the helper functions:
-
-```bash
-python -m unittest test_helper.py
-```
-
-These tests verify board/move encoding and legal masks.
+At temperature zero, `--gumbel-deterministic-candidates` does not change Gumbel
+search behavior. At positive temperature it selects candidates without Gumbel
+noise and samples the played move from the completed-Q policy target.
